@@ -106,10 +106,10 @@ def attention(
         q, k, v = qkv_or_q
         q: torch.Tensor = q
         qkv_or_q.clear()
-        del qkv_or_q
+        qkv_or_q = None
     else:
         q: torch.Tensor = qkv_or_q
-        del qkv_or_q
+        qkv_or_q = None
         assert k is not None and v is not None, "k and v must be provided if qkv_or_q is a tensor"
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
