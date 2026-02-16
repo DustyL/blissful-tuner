@@ -72,10 +72,27 @@ def get_current_version() -> str:
     return BLISSFUL_VERSION
 
 
+def _can_use_fp8_matmul() -> bool:
+    """Check if the current GPU and PyTorch build support FP8 tensor core math (SM >= 8.9, Ada+)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    if not ((major > 8) or (major == 8 and minor >= 9)):
+        return False
+    if not hasattr(torch, "float8_e4m3fn"):
+        return False
+    return True
+
+
 def blissful_prefunc(args: argparse.Namespace):
     """Simple function to print about version, environment, and things"""
     cuda_list = [f"Python: {sys.version.split(' ')[0]}"]
     gc.collect()
+    can_use_fp8 = _can_use_fp8_matmul()
+    allocator = "N/A"
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         allocator = torch.cuda.get_allocator_backend()
@@ -83,12 +100,12 @@ def blissful_prefunc(args: argparse.Namespace):
         cuda_list[0] += f", CUDA: {torch.version.cuda} CC: {cuda.major}.{cuda.minor}"
         cuda_list.append(f"Device: '{cuda.name}', VRAM: '{cuda.total_memory // 1024**2}MB'")
     logger.info(f"Blissful Tuner version {BLISSFUL_VERSION} extended from Musubi Tuner!")
-    logger.info(f"PyTorch: {torch.__version__}, Memory allocation: '{allocator}'")
+    logger.info(f"PyTorch: {torch.__version__}, Memory allocation: '{allocator}', FP8 math capable: '{can_use_fp8}'")
     for string in cuda_list:
         logger.info(string)
 
     if hasattr(args, "optimized") and args.optimized and MODE == "generate":
-        logger.info("Optimized arguments enabled!")
+        logger.info("Optimized arguments enabled! (Still may need to tune '--blocks_to_swap' etc if you OOM)")
         args.fp16_accumulation = True
         args.attn_mode = "sageattn"
         args.compile = True
@@ -97,12 +114,20 @@ def blissful_prefunc(args: argparse.Namespace):
             args.rope_func = "comfy"
             args.simple_modulation = True
         elif DIFFUSION_MODEL in ["hunyuan", "framepack"]:
-            args.fp16_accumulation = False  # Disable this for hunyuan and framepack b/c we enable fp8_fast which offsets it anyway and torch 2.7.0 has issues with compiling hunyuan sometimes
-            args.fp8_fast = True
+            if can_use_fp8:
+                args.fp16_accumulation = (
+                    False  # fp8_fast offsets fp16 accumulation and torch 2.7.0 has compile issues with hunyuan+fp16 accumulation
+                )
+                args.fp8_fast = True
         elif DIFFUSION_MODEL == "flux":
             args.compile = False
             args.fp16_accumulation = False
-            args.fp8_fast = True
+            if can_use_fp8:
+                args.fp8_fast = True
+
+    if hasattr(args, "fp8_fast") and args.fp8_fast and not can_use_fp8:
+        logger.warning("Requested fp8 math (--fp8_fast) but Torch/CUDA reports it's not available so you may encounter errors!")
+
     if hasattr(args, "fp16_accumulation") and args.fp16_accumulation and MODE == "generate":
         logger.info("Enabling FP16 accumulation")
         if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
