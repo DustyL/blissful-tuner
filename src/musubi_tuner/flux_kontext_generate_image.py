@@ -1,8 +1,6 @@
 import argparse
-from importlib.util import find_spec
 from contextlib import nullcontext
 import random
-import sys
 import os
 import time
 import copy
@@ -31,8 +29,9 @@ from blissful_tuner.utils import power_seed
 from blissful_tuner.blissful_core import add_blissful_flux_args, parse_blissful_args
 from blissful_tuner.blissful_logger import BlissfulLogger
 
+from musubi_tuner.utils.cli_compat import add_lycoris_arg, validate_lycoris_arg
+
 logger = BlissfulLogger(__name__, "green")
-lycoris_available = find_spec("lycoris") is not None
 
 
 class GenerationSettings:
@@ -128,13 +127,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument(
-        "--prefer_lycoris",
-        "--lycoris",
-        dest="prefer_lycoris",
-        action="store_true",
-        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). (--lycoris is deprecated)",
-    )
+    add_lycoris_arg(parser)
 
     setup_parser_compile(parser)
 
@@ -153,11 +146,7 @@ def parse_args() -> argparse.Namespace:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
 
-    if "--lycoris" in sys.argv:
-        logger.warning("--lycoris is deprecated; use --prefer_lycoris instead")
-
-    if args.prefer_lycoris and not lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
+    validate_lycoris_arg(args)
 
     return args
 

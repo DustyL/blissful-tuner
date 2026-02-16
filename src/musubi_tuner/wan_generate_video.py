@@ -1,10 +1,8 @@
 import argparse
 import gc
-from importlib.util import find_spec
 import random
 import os
 import re
-import sys
 import time
 import math
 import copy
@@ -56,7 +54,8 @@ from blissful_tuner.blissful_core import add_blissful_args, parse_blissful_args
 from blissful_tuner.common_extensions import save_media_advanced, prepare_v2v_noise, prepare_i2i_noise, prepare_metadata
 
 # blissful end
-lycoris_available = find_spec("lycoris") is not None
+from musubi_tuner.utils.cli_compat import add_lycoris_arg, lycoris_available, validate_lycoris_arg
+
 if lycoris_available:
     # LyCORIS 3.x doesn't export create_network_from_weights, use our adapter
     from musubi_tuner.networks.lycoris import create_network_from_weights
@@ -247,14 +246,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument(
-        "--prefer_lycoris",
-        "--lycoris",
-        dest="prefer_lycoris",
-        action="store_true",
-        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). "
-        "(--lycoris is a deprecated alias for --prefer_lycoris)",
-    )
+    add_lycoris_arg(parser)
     parser.add_argument(
         "--compile_args",
         nargs=4,
@@ -282,10 +274,7 @@ def parse_args() -> argparse.Namespace:
         args.output_type == "images" or args.output_type == "video"
     ), "latent_path is only supported for images or video output"
 
-    if "--lycoris" in sys.argv:
-        logger.warning("--lycoris is deprecated; use --prefer_lycoris instead")
-    if args.prefer_lycoris and not lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
+    validate_lycoris_arg(args)
 
     return args
 
