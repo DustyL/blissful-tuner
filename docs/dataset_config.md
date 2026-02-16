@@ -391,7 +391,8 @@ caption_extension = ".txt"
 
 **"Duplicate basenames detected" error:**
 - Multiple images share the same base name (e.g., `photo.jpg` and `photo.png`)
-- This causes cache file collisions (TE caches are named by basename only)
+- This causes cache file collisions (latent and TE caches are named by basename only)
+- The check uses Unicode case-folding to prevent cross-platform cache collisions (e.g., `Foo.png` and `foo.jpg` are treated as duplicates, matching macOS APFS and Windows NTFS behavior)
 - Fix: Rename files to have unique basenames
 
 **Stale TE caches after changing captions:**

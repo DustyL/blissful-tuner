@@ -1,0 +1,67 @@
+# ============================================================
+# Qwen-Image LoRA Training Dataset Configuration
+# ============================================================
+# This file defines where your training images and captions are located.
+#
+# DATASET FOLDER STRUCTURE:
+#
+# my_dataset/
+# ├── images/
+# │   ├── char001.png          # Training image 1
+# │   ├── char001.txt          # Caption file for char001.png
+# │   ├── char002.jpg          # Training image 2
+# │   ├── char002.txt          # Caption file for char002.jpg
+# │   └── ...
+# └── cache/
+#     └── (auto-generated cache files)
+#
+# CAPTION FILE FORMAT:
+# Each .txt file should contain a description of the corresponding image.
+# Example: "sks person wearing a blue jacket, standing in a forest"
+# Use a unique trigger word (like "sks") to represent your character.
+# ============================================================
+
+[general]
+# Image resolution [width, height]
+resolution = [1024, 1024]
+
+# Caption file extension
+caption_extension = ".txt"
+
+# Batch size (images per batch)
+batch_size = 1
+
+# Number of times to repeat the dataset (useful for small datasets)
+num_repeats = 1
+
+# Enable aspect ratio bucketing (groups images with similar aspect ratios)
+enable_bucket = true
+
+# Don't upscale images when bucketing
+bucket_no_upscale = false
+
+# ============================================================
+# DATASET DEFINITION
+# ============================================================
+# You can define multiple datasets. Each needs its own cache_directory.
+# ============================================================
+
+[[datasets]]
+# Path to directory containing your training images
+image_directory = "./my_dataset/images"
+
+# Path to cache directory (must be unique per dataset)
+# This will be auto-created during the caching step
+cache_directory = "./cache/my_dataset"
+
+# Number of times to repeat this specific dataset
+# Useful if you have multiple datasets with different sizes
+num_repeats = 1
+
+# ============================================================
+# OPTIONAL: Add more datasets by copying the [[datasets]] block
+# ============================================================
+# [[datasets]]
+# image_directory = "./another_dataset/images"
+# cache_directory = "./cache/another_dataset"
+# num_repeats = 2

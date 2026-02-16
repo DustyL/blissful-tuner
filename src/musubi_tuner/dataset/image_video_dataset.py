@@ -97,7 +97,13 @@ ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
 
 
-def glob_images(directory, base="*", caption_extension=None):
+def glob_images(directory, base="*"):
+    """Glob image files matching IMAGE_EXTENSIONS in a directory.
+
+    Note: The former ``caption_extension`` parameter was removed because its
+    splitext-based filtering was broken for multi-dot extensions (e.g. '.flux2.txt').
+    Caption filtering is now handled by :func:`_filter_paths_by_caption`.
+    """
     img_paths = []
     for ext in IMAGE_EXTENSIONS:
         if base == "*":
@@ -105,21 +111,6 @@ def glob_images(directory, base="*", caption_extension=None):
         else:
             img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
     img_paths = list(set(img_paths))  # remove duplicates
-
-    # check for caption files and only keep images with captions
-    if caption_extension is not None:
-        caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
-        caption_bases = set()
-        for caption_path in caption_paths:
-            caption_base = os.path.splitext(os.path.basename(caption_path))[0]
-            caption_bases.add(caption_base)
-        filtered_img_paths = []
-        for img_path in img_paths:
-            img_base = os.path.splitext(os.path.basename(img_path))[0]
-            if img_base in caption_bases:
-                filtered_img_paths.append(img_path)
-        img_paths = filtered_img_paths
-
     img_paths.sort()
     return img_paths
 
@@ -139,27 +130,32 @@ def glob_videos(directory, base="*"):
 def _check_duplicate_basenames(paths: list[str], kind: str = "image") -> None:
     """
     Check for duplicate basenames which would cause cache collisions.
+    Uses casefold() for comparison because macOS APFS (case-insensitive, the default)
+    performs ICU-based Unicode case folding — e.g. 'straße' and 'STRASSE' resolve to
+    the same file. This matches the actual filesystem collision behavior and is
+    conservative for cross-platform portability (Windows NTFS is also case-insensitive).
     Raises ValueError with examples if duplicates found.
     """
-    seen: dict[str, str] = {}  # basename -> first path
+    seen: dict[str, str] = {}  # casefolded basename -> first path
     duplicate_count = 0
     examples: list[tuple[str, str, str]] = []  # (basename, path1, path2) - bounded to 3
 
     for path in paths:
         basename = os.path.splitext(os.path.basename(path))[0]
-        if basename in seen:
+        key = basename.casefold()
+        if key in seen:
             duplicate_count += 1
             if len(examples) < 3:
-                examples.append((basename, seen[basename], path))
+                examples.append((basename, seen[key], path))
         else:
-            seen[basename] = path
+            seen[key] = path
 
     if duplicate_count:
         msg = "; ".join(f"'{b}' in both '{p1}' and '{p2}'" for b, p1, p2 in examples)
         more = f" (and {duplicate_count - len(examples)} more)" if duplicate_count > len(examples) else ""
         raise ValueError(
-            f"Duplicate {kind} basenames detected - this will cause cache file collisions "
-            f"(TE caches are named by basename only). "
+            f"Duplicate {kind} basenames detected (case-insensitive) - this will cause cache file collisions "
+            f"(latent and TE caches are named by basename only). "
             f"Examples: {msg}{more}. "
             f"Rename files to have unique basenames."
         )
@@ -186,7 +182,7 @@ def _filter_paths_by_caption(
 
     filtered = []
     missing_count = 0
-    missing_preview: list[str] = []  # Only keep first 20 for memory efficiency
+    missing_preview: list[str] = []  # Only keep first 5 for concise warnings
     caption_dir_resolved = os.path.abspath(caption_directory)
 
     for path in paths:
@@ -197,7 +193,7 @@ def _filter_paths_by_caption(
             filtered.append(path)
         else:
             missing_count += 1
-            if len(missing_preview) < 20:
+            if len(missing_preview) < 5:
                 missing_preview.append(basename_no_ext)
 
     filtered_count = len(filtered)
@@ -217,7 +213,7 @@ def _filter_paths_by_caption(
 
     # Case 3: Some items filtered - warn and continue
     if missing_count > 0:
-        suffix = f" and {missing_count - 20} more" if missing_count > 20 else ""
+        suffix = f" (and {missing_count - len(missing_preview)} more)" if missing_count > len(missing_preview) else ""
         example_expected = [os.path.join(caption_dir_resolved, b + caption_extension) for b in missing_preview[:3]]
 
         # Single warning with optional >50% smell folded in
@@ -233,6 +229,60 @@ def _filter_paths_by_caption(
         )
 
     return filtered
+
+
+def _validate_caption_config(
+    caption_extension: Optional[str],
+    caption_directory: Optional[str],
+    media_directory: str,
+    kind: str = "image",
+) -> tuple[str, str]:
+    """
+    Validate and normalize caption_extension and caption_directory.
+
+    Returns:
+        (validated_caption_extension, effective_caption_directory)
+
+    Raises:
+        ValueError: If caption_extension is None/empty or caption_directory is invalid.
+    """
+    jsonl_hint = f"Use {kind}_jsonl_file if you want to embed captions directly."
+
+    # 1. caption_extension is required for directory-based datasets
+    if caption_extension is None:
+        raise ValueError(f"caption_extension is required for directory-based datasets. {jsonl_hint}")
+
+    # 2. Validate caption_extension format
+    stripped = caption_extension.strip()
+    if stripped == "":
+        raise ValueError("caption_extension cannot be empty or whitespace")
+    if stripped != caption_extension:
+        logger.warning(
+            f"caption_extension '{caption_extension!r}' contains leading/trailing whitespace; using stripped value '{stripped}'"
+        )
+        caption_extension = stripped
+    if not caption_extension.startswith("."):
+        logger.warning(
+            f"caption_extension '{caption_extension}' does not start with '.'; "
+            f"this may cause unexpected behavior (e.g., 'txt' expects files like 'footxt')"
+        )
+
+    # 3. Validate caption_directory
+    effective_caption_dir = media_directory
+    if caption_directory is not None:
+        stripped_dir = caption_directory.strip()
+        if stripped_dir == "":
+            raise ValueError("caption_directory cannot be empty or whitespace")
+        if stripped_dir != caption_directory:
+            logger.warning(f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}")
+            caption_directory = stripped_dir
+        if not os.path.exists(caption_directory):
+            raise ValueError(f"caption_directory does not exist: {caption_directory}")
+        if not os.path.isdir(caption_directory):
+            raise ValueError(f"caption_directory is not a directory: {caption_directory}")
+        effective_caption_dir = caption_directory
+
+    return caption_extension, effective_caption_dir
 
 
 def divisible_by(num: int, divisor: int) -> int:
@@ -1330,50 +1380,14 @@ class ImageDirectoryDatasource(ImageDatasource):
         if not os.path.isdir(image_directory):
             raise ValueError(f"image_directory is not a directory: {image_directory}")
 
-        # 1. Fail-fast: caption_extension is required for directory datasets
-        if caption_extension is None:
-            raise ValueError(
-                "caption_extension is required for directory-based datasets. "
-                "Use image_jsonl_file if you want to embed captions directly."
-            )
-
-        # 1. Validate caption_extension format
-        stripped = caption_extension.strip()
-        if stripped == "":
-            raise ValueError("caption_extension cannot be empty or whitespace")
-        if stripped != caption_extension:
-            logger.warning(
-                f"caption_extension '{caption_extension!r}' contains leading/trailing whitespace; using stripped value '{stripped}'"
-            )
-            caption_extension = stripped
-        if not caption_extension.startswith("."):
-            logger.warning(
-                f"caption_extension '{caption_extension}' does not start with '.'; "
-                f"this may cause unexpected behavior (e.g., 'txt' expects files like 'footxt')"
-            )
-
-        self.caption_extension = caption_extension
-
-        # 2. Validate caption_directory
-        effective_caption_dir = image_directory
-        if caption_directory is not None:
-            stripped_dir = caption_directory.strip()
-            if stripped_dir == "":
-                raise ValueError("caption_directory cannot be empty or whitespace")
-            if stripped_dir != caption_directory:
-                logger.warning(f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}")
-                caption_directory = stripped_dir
-            if not os.path.exists(caption_directory):
-                raise ValueError(f"caption_directory does not exist: {caption_directory}")
-            if not os.path.isdir(caption_directory):
-                raise ValueError(f"caption_directory is not a directory: {caption_directory}")
-            effective_caption_dir = caption_directory
-
-        self.caption_directory = effective_caption_dir
+        # 1-2. Validate caption_extension and caption_directory
+        self.caption_extension, self.caption_directory = _validate_caption_config(
+            caption_extension, caption_directory, image_directory, kind="image"
+        )
 
         # 3. Glob media files (without caption filtering - we do that separately)
         logger.info(f"glob images in {self.image_directory}")
-        self.image_paths = glob_images(self.image_directory)  # No caption_extension here
+        self.image_paths = glob_images(self.image_directory)
         logger.info(f"found {len(self.image_paths)} images")
 
         # 4. Check duplicate basenames (before filtering, on all media files)
@@ -1809,46 +1823,10 @@ class VideoDirectoryDatasource(VideoDatasource):
         if not os.path.isdir(video_directory):
             raise ValueError(f"video_directory is not a directory: {video_directory}")
 
-        # 1. Fail-fast: caption_extension is required for directory datasets
-        if caption_extension is None:
-            raise ValueError(
-                "caption_extension is required for directory-based datasets. "
-                "Use video_jsonl_file if you want to embed captions directly."
-            )
-
-        # 1. Validate caption_extension format
-        stripped = caption_extension.strip()
-        if stripped == "":
-            raise ValueError("caption_extension cannot be empty or whitespace")
-        if stripped != caption_extension:
-            logger.warning(
-                f"caption_extension '{caption_extension!r}' contains leading/trailing whitespace; using stripped value '{stripped}'"
-            )
-            caption_extension = stripped
-        if not caption_extension.startswith("."):
-            logger.warning(
-                f"caption_extension '{caption_extension}' does not start with '.'; "
-                f"this may cause unexpected behavior (e.g., 'txt' expects files like 'footxt')"
-            )
-
-        self.caption_extension = caption_extension
-
-        # 2. Validate caption_directory
-        effective_caption_dir = video_directory
-        if caption_directory is not None:
-            stripped_dir = caption_directory.strip()
-            if stripped_dir == "":
-                raise ValueError("caption_directory cannot be empty or whitespace")
-            if stripped_dir != caption_directory:
-                logger.warning(f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}")
-                caption_directory = stripped_dir
-            if not os.path.exists(caption_directory):
-                raise ValueError(f"caption_directory does not exist: {caption_directory}")
-            if not os.path.isdir(caption_directory):
-                raise ValueError(f"caption_directory is not a directory: {caption_directory}")
-            effective_caption_dir = caption_directory
-
-        self.caption_directory = effective_caption_dir
+        # 1-2. Validate caption_extension and caption_directory
+        self.caption_extension, self.caption_directory = _validate_caption_config(
+            caption_extension, caption_directory, video_directory, kind="video"
+        )
 
         # 3. Glob media files
         logger.info(f"glob videos in {self.video_directory}")
@@ -1858,7 +1836,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         # 4. Check duplicate basenames (before filtering, on all media files)
         _check_duplicate_basenames(self.video_paths, kind="video")
 
-        # 5. Filter by caption existence (fixes the video caption filtering bug)
+        # 5. Filter by caption existence
         self.video_paths = _filter_paths_by_caption(
             self.video_paths,
             self.caption_extension,

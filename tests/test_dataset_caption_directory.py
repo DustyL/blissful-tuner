@@ -5,7 +5,8 @@ These tests verify:
 - Separate caption directory functionality
 - Multi-dot extension handling
 - Warning and error behaviors for caption filtering
-- Duplicate basename detection
+- Duplicate basename detection (including case-insensitive collisions)
+- Shared caption validation helper
 - Config schema validation
 """
 
@@ -21,6 +22,8 @@ from musubi_tuner.dataset.image_video_dataset import (
     VideoJsonlDatasource,
     _check_duplicate_basenames,
     _filter_paths_by_caption,
+    _validate_caption_config,
+    glob_images,
     logger,
 )
 
@@ -189,7 +192,7 @@ class TestImageDirectoryDatasource(unittest.TestCase):
 
         self.assertEqual(len(ds.image_paths), 5)
         self.assertWarningCount(1)
-        self.assertWarningContains("25/30", "caption_extension=", "caption_directory=", "and 5 more")
+        self.assertWarningContains("25/30", "caption_extension=", "caption_directory=", "and 20 more")
 
     def test_zero_matches_hard_error(self):
         """Hard error when images exist but no captions match."""
@@ -656,6 +659,298 @@ target_frames = [81]
             self.assertEqual(sanitized["datasets"][0]["caption_directory"], "/tmp/video_captions")
         finally:
             os.unlink(config_path)
+
+
+class TestCaseInsensitiveDuplicateBasenames(unittest.TestCase):
+    """Tests for case-insensitive duplicate basename detection."""
+
+    def test_case_only_difference_detected(self):
+        """Basenames differing only in case are caught as duplicates."""
+        paths = ["/dir/Foo.png", "/dir/foo.jpg"]
+        with self.assertRaises(ValueError) as ctx:
+            _check_duplicate_basenames(paths, kind="image")
+        self.assertIn("Duplicate", str(ctx.exception))
+        self.assertIn("case-insensitive", str(ctx.exception))
+
+    def test_mixed_case_across_directories(self):
+        """Case-only duplicates across subdirectories are caught."""
+        paths = ["/set1/Photo.png", "/set2/photo.jpg", "/set3/PHOTO.webp"]
+        with self.assertRaises(ValueError) as ctx:
+            _check_duplicate_basenames(paths, kind="image")
+        self.assertIn("Duplicate", str(ctx.exception))
+
+    def test_different_basenames_different_case_ok(self):
+        """Truly different basenames (not just case) are fine."""
+        paths = ["/dir/Foo.png", "/dir/Bar.jpg", "/dir/baz.webp"]
+        # Should not raise
+        _check_duplicate_basenames(paths, kind="image")
+
+    def test_unicode_casefold_collision(self):
+        """Unicode casefolding detects straße vs STRASSE as duplicates.
+
+        macOS APFS (case-insensitive) uses ICU-based Unicode case folding,
+        so 'straße' and 'STRASSE' resolve to the same filesystem path.
+        casefold() matches this behavior.
+        """
+        paths = ["/dir/straße.png", "/dir/STRASSE.jpg"]
+        with self.assertRaises(ValueError) as ctx:
+            _check_duplicate_basenames(paths, kind="image")
+        self.assertIn("Duplicate", str(ctx.exception))
+
+    def test_error_message_mentions_caches(self):
+        """Error message mentions both latent and TE caches."""
+        paths = ["/dir/a.png", "/dir/A.jpg"]
+        with self.assertRaises(ValueError) as ctx:
+            _check_duplicate_basenames(paths, kind="image")
+        self.assertIn("latent and TE caches", str(ctx.exception))
+
+
+class TestValidateCaptionConfig(unittest.TestCase):
+    """Tests for the shared _validate_caption_config helper."""
+
+    def setUp(self):
+        self.log_capture = LogCapture()
+        self.log_capture.setLevel(logging.DEBUG)
+        logger.logger.addHandler(self.log_capture)
+        self.temp_dirs = []
+
+    def tearDown(self):
+        logger.logger.removeHandler(self.log_capture)
+        import shutil
+
+        for d in self.temp_dirs:
+            if os.path.exists(d):
+                shutil.rmtree(d)
+
+    def create_temp_dir(self):
+        d = tempfile.mkdtemp()
+        self.temp_dirs.append(d)
+        return d
+
+    def test_returns_extension_and_dir(self):
+        """Returns validated caption_extension and effective directory."""
+        media_dir = self.create_temp_dir()
+        ext, dir_ = _validate_caption_config(".txt", None, media_dir, kind="image")
+        self.assertEqual(ext, ".txt")
+        self.assertEqual(dir_, media_dir)
+
+    def test_separate_caption_directory(self):
+        """Returns separate caption directory when provided."""
+        media_dir = self.create_temp_dir()
+        caption_dir = self.create_temp_dir()
+        ext, dir_ = _validate_caption_config(".txt", caption_dir, media_dir, kind="image")
+        self.assertEqual(ext, ".txt")
+        self.assertEqual(dir_, caption_dir)
+
+    def test_none_extension_raises(self):
+        """None caption_extension raises ValueError."""
+        media_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError) as ctx:
+            _validate_caption_config(None, None, media_dir, kind="image")
+        self.assertIn("caption_extension is required", str(ctx.exception))
+
+    def test_none_extension_mentions_jsonl_hint(self):
+        """Error for image mentions image_jsonl_file, for video mentions video_jsonl_file."""
+        media_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError) as ctx:
+            _validate_caption_config(None, None, media_dir, kind="image")
+        self.assertIn("image_jsonl_file", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            _validate_caption_config(None, None, media_dir, kind="video")
+        self.assertIn("video_jsonl_file", str(ctx.exception))
+
+    def test_empty_extension_raises(self):
+        """Empty caption_extension raises ValueError."""
+        media_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError):
+            _validate_caption_config("", None, media_dir)
+
+    def test_whitespace_extension_stripped(self):
+        """Leading/trailing whitespace in caption_extension is stripped."""
+        media_dir = self.create_temp_dir()
+        ext, _ = _validate_caption_config(" .txt ", None, media_dir)
+        self.assertEqual(ext, ".txt")
+
+    def test_nonexistent_caption_directory_raises(self):
+        """Non-existent caption_directory raises ValueError."""
+        media_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError) as ctx:
+            _validate_caption_config(".txt", "/nonexistent", media_dir)
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_caption_directory_is_file_raises(self):
+        """caption_directory pointing to a file raises ValueError."""
+        media_dir = self.create_temp_dir()
+        file_path = os.path.join(media_dir, "a_file.txt")
+        with open(file_path, "w") as f:
+            f.write("content")
+        with self.assertRaises(ValueError) as ctx:
+            _validate_caption_config(".txt", file_path, media_dir)
+        self.assertIn("not a directory", str(ctx.exception))
+
+
+class TestGlobImagesNoLegacyCaptionFilter(unittest.TestCase):
+    """Tests verifying glob_images no longer accepts caption_extension."""
+
+    def setUp(self):
+        self.temp_dirs = []
+
+    def tearDown(self):
+        import shutil
+
+        for d in self.temp_dirs:
+            if os.path.exists(d):
+                shutil.rmtree(d)
+
+    def create_temp_dir(self):
+        d = tempfile.mkdtemp()
+        self.temp_dirs.append(d)
+        return d
+
+    def create_image(self, directory, name):
+        from PIL import Image
+
+        img = Image.new("RGB", (1, 1), color="red")
+        path = os.path.join(directory, name)
+        img.save(path)
+        return path
+
+    def test_glob_images_rejects_caption_extension_kwarg(self):
+        """glob_images raises TypeError if caption_extension is passed."""
+        d = self.create_temp_dir()
+        self.create_image(d, "a.png")
+        with self.assertRaises(TypeError):
+            glob_images(d, caption_extension=".txt")
+
+    def test_glob_images_returns_all_images(self):
+        """glob_images returns all image files without filtering."""
+        d = self.create_temp_dir()
+        self.create_image(d, "a.png")
+        self.create_image(d, "b.jpg")
+        # No caption files created
+        result = glob_images(d)
+        self.assertEqual(len(result), 2)
+
+
+class TestVideoDirectoryDatasourceEdgeCases(unittest.TestCase):
+    """Additional edge-case tests for VideoDirectoryDatasource (L4 parity)."""
+
+    def setUp(self):
+        self.log_capture = LogCapture()
+        self.log_capture.setLevel(logging.DEBUG)
+        logger.logger.addHandler(self.log_capture)
+        self.temp_dirs = []
+
+    def tearDown(self):
+        logger.logger.removeHandler(self.log_capture)
+        import shutil
+
+        for d in self.temp_dirs:
+            if os.path.exists(d):
+                shutil.rmtree(d)
+
+    def create_temp_dir(self):
+        d = tempfile.mkdtemp()
+        self.temp_dirs.append(d)
+        return d
+
+    def create_video(self, directory, name):
+        path = os.path.join(directory, name)
+        with open(path, "wb") as f:
+            f.write(b"\x00\x00\x00\x14ftypisom\x00\x00\x00\x00")
+        return path
+
+    def create_caption(self, directory, name, content="test caption"):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_empty_caption_extension_raises(self):
+        """Error when caption_extension is empty."""
+        video_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension="")
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_caption_extension_none_raises(self):
+        """Error when caption_extension is None."""
+        video_dir = self.create_temp_dir()
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=None)
+        self.assertIn("caption_extension is required", str(ctx.exception))
+
+    def test_invalid_caption_directory(self):
+        """Error when caption_directory doesn't exist."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v.mp4")
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=".txt", caption_directory="/nonexistent/path")
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_caption_directory_is_file(self):
+        """Error when caption_directory points to a file."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v.mp4")
+        file_path = self.create_caption(video_dir, "not_a_dir.txt")
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=".txt", caption_directory=file_path)
+        self.assertIn("not a directory", str(ctx.exception))
+
+    def test_empty_caption_directory_raises(self):
+        """Error when caption_directory is empty string."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v.mp4")
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=".txt", caption_directory="")
+        self.assertIn("caption_directory cannot be empty", str(ctx.exception))
+
+    def test_whitespace_caption_extension_stripped(self):
+        """Whitespace in caption_extension is stripped."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v.mp4")
+        self.create_caption(video_dir, "v.txt", "caption")
+        ds = VideoDirectoryDatasource(video_dir, caption_extension=" .txt ")
+        self.assertEqual(len(ds.video_paths), 1)
+
+    def test_duplicate_video_basenames(self):
+        """Duplicate video basenames raise error."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "clip.mp4")
+        self.create_video(video_dir, "clip.webm")
+        self.create_caption(video_dir, "clip.txt", "caption")
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=".txt")
+        self.assertIn("Duplicate", str(ctx.exception))
+
+    def test_zero_matches_hard_error(self):
+        """Hard error when videos exist but no captions match."""
+        video_dir = self.create_temp_dir()
+        caption_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v1.mp4")
+        self.create_video(video_dir, "v2.mp4")
+        # No caption files
+        with self.assertRaises(ValueError) as ctx:
+            VideoDirectoryDatasource(video_dir, caption_extension=".txt", caption_directory=caption_dir)
+        self.assertIn("No videos with matching caption files found", str(ctx.exception))
+
+    def test_zero_media_no_error(self):
+        """Empty video directory doesn't cause caption-related error."""
+        video_dir = self.create_temp_dir()
+        caption_dir = self.create_temp_dir()
+        ds = VideoDirectoryDatasource(video_dir, caption_extension=".txt", caption_directory=caption_dir)
+        self.assertEqual(len(ds.video_paths), 0)
+
+    def test_caption_extension_no_dot_warning(self):
+        """Warning when caption_extension doesn't start with '.'."""
+        video_dir = self.create_temp_dir()
+        self.create_video(video_dir, "v.mp4")
+        self.create_caption(video_dir, "vtxt", "caption")
+        VideoDirectoryDatasource(video_dir, caption_extension="txt")
+        warnings = self.log_capture.get_messages(logging.WARNING)
+        combined = " ".join(warnings)
+        self.assertIn("does not start with '.'", combined)
 
 
 if __name__ == "__main__":

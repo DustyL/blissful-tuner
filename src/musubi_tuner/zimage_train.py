@@ -222,6 +222,16 @@ class ZImageTrainer(ZImageNetworkTrainer):
             args, params_to_optimize, param_name_map=param_name_map
         )
 
+        if blocks_to_swap > 0 and args.block_swap_optimizer_patch_params:
+            _COMPATIBLE_OPTIMIZERS = {"adamw", "adafactor", "muon", "muonwithadamw", "muonwithauxadam"}
+            opt_type = args.optimizer_type.lower().split(".")[-1]  # handle fully-qualified names like torch.optim.AdamW
+            if opt_type not in _COMPATIBLE_OPTIMIZERS:
+                logger.warning(
+                    f"block_swap_optimizer_patch is enabled with optimizer '{args.optimizer_type}' which has not been "
+                    f"tested. Known-compatible optimizers: {sorted(_COMPATIBLE_OPTIMIZERS)}. "
+                    "8-bit optimizers (e.g. AdamW8bit) may not work correctly with this patch."
+                )
+
         # prepare dataloader
 
         # num workers for data loader: if 0, persistent_workers is not available
@@ -549,10 +559,9 @@ class ZImageTrainer(ZImageNetworkTrainer):
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         if blocks_to_swap > 0 and args.block_swap_optimizer_patch_params:
-                            # Move grad to same device of parameter: workaround for optimizer step, working with AdamW and Adafactor for now.
-                            # AdamW8bit and other optimizers does not work with this patch because of their specific implementation.
-                            unwrapped_optimizer = accelerator.unwrap_model(optimizer)
-                            for group in unwrapped_optimizer.param_groups:
+                            # Move grad to same device of parameter: workaround for optimizer step.
+                            # Tested with AdamW, Adafactor, and Muon. 8-bit optimizers may not work.
+                            for group in optimizer.param_groups:
                                 for param in group["params"]:
                                     if param.grad is not None and param.device != param.grad.device:
                                         param.grad = param.grad.to(param.device, non_blocking=True)

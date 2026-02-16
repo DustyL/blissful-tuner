@@ -95,20 +95,20 @@ class FallbackSingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             if group.get("use_muon"):
                 for p in group["params"]:
-                    if p.grad is None:
-                        continue
+                    # Mirror official Muon: use zero grad when None so weight_decay still applies.
+                    grad = p.grad if p.grad is not None else torch.zeros_like(p)
 
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
 
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    update = muon_update(grad, state["momentum_buffer"], beta=group["momentum"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
             else:
                 for p in group["params"]:
-                    if p.grad is None:
-                        continue
+                    # Mirror official Muon: use zero grad when None so weight_decay still applies.
+                    grad = p.grad if p.grad is not None else torch.zeros_like(p)
 
                     state = self.state[p]
                     if len(state) == 0:
@@ -117,9 +117,7 @@ class FallbackSingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                         state["step"] = 0
 
                     state["step"] += 1
-                    update = _adam_update(
-                        p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"], group["eps"]
-                    )
+                    update = _adam_update(grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"], group["eps"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 

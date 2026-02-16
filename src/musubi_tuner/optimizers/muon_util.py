@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Model-specific default patterns for "hidden" layers (where Muon is typically beneficial).
 #
@@ -105,12 +108,25 @@ def split_param_groups_for_muon(
     Returned groups are compatible with the official Muon optimizer classes:
     - Muon group keys:  {"params","lr","momentum","weight_decay","use_muon"}
     - Adam group keys:  {"params","lr","betas","eps","weight_decay","use_muon"}
+
+    Adam LR precedence:
+    - Single group or uniform-LR groups: Adam subsets use ``adam_lr``.
+    - Multiple incoming groups with distinct LRs (LoRA+ multi-group):
+      Adam subsets inherit their group's LR to preserve per-group ratios.
     """
     user_supplied_patterns = hidden_layer_patterns is not None
     patterns = list(hidden_layer_patterns) if hidden_layer_patterns is not None else get_default_patterns(model_type)
     patterns = [p for p in (p.strip() for p in patterns) if p]
 
     filters = [LayerFilter(p) for p in patterns]
+
+    # Detect LoRA+ multi-group intent: multiple incoming groups with differing LRs.
+    # When present, Adam subgroups preserve their group's LR to maintain the per-group ratio.
+    # When absent (single group or uniform LRs), Adam subgroups always use adam_lr,
+    # since the incoming group LR may be in Muon-scale (e.g. --learning_rate default 2e-6).
+    incoming_lrs = {g.get("lr") for g in trainable_params if isinstance(g, dict)}
+    incoming_lrs.discard(None)
+    has_multi_lr_groups = len(incoming_lrs) > 1
 
     all_muon_params: List[torch.nn.Parameter] = []
     all_adam_params: List[torch.nn.Parameter] = []
@@ -159,15 +175,19 @@ def split_param_groups_for_muon(
             )
 
         if adam_params:
+            # Preserve the incoming group LR for Adam subsets only when there is clear LoRA+
+            # multi-group intent (multiple incoming groups with differing LRs). Otherwise use
+            # the explicit adam_lr, since the incoming group LR may be a framework default
+            # (e.g. --learning_rate 2e-6) that is not appropriate for Adam-side params.
+            group_adam_lr = base_lr if (has_multi_lr_groups and base_lr is not None) else adam_lr
             result_groups.append(
                 {
                     "params": adam_params,
                     "use_muon": False,
-                    # Adam LR must be in Adam units (NOT the Muon group's LR units).
-                    "lr": adam_lr,
-                    "betas": adam_betas,
-                    "eps": adam_eps,
-                    "weight_decay": adam_weight_decay,
+                    "lr": group_adam_lr,
+                    "betas": group.get("betas", adam_betas),
+                    "eps": group.get("eps", adam_eps),
+                    "weight_decay": group.get("weight_decay", adam_weight_decay),
                 }
             )
 
@@ -200,13 +220,17 @@ def print_muon_summary(stats: MuonParamStats) -> None:
     total_params = stats.muon_params_total + stats.adam_params_total
     muon_pct = 100 * stats.muon_params_total / total_params if total_params > 0 else 0.0
 
-    print("\n" + "=" * 60)
-    print("Muon Parameter Assignment Summary")
-    print("=" * 60)
-    print(f"  Muon parameters:  {stats.muon_count:,} tensors ({stats.muon_params_total:,} params, {muon_pct:.1f}%)")
-    print(f"  Adam parameters:  {stats.adam_count:,} tensors ({stats.adam_params_total:,} params, {100 - muon_pct:.1f}%)")
+    lines = [
+        "",
+        "=" * 60,
+        "Muon Parameter Assignment Summary",
+        "=" * 60,
+        f"  Muon parameters:  {stats.muon_count:,} tensors ({stats.muon_params_total:,} params, {muon_pct:.1f}%)",
+        f"  Adam parameters:  {stats.adam_count:,} tensors ({stats.adam_params_total:,} params, {100 - muon_pct:.1f}%)",
+    ]
     if stats.matched_patterns:
-        print(f"  Matched patterns: {stats.matched_patterns}")
+        lines.append(f"  Matched patterns: {stats.matched_patterns}")
     if stats.unmatched_patterns:
-        print(f"  Unmatched patterns: {stats.unmatched_patterns}")
-    print("=" * 60 + "\n")
+        lines.append(f"  Unmatched patterns: {stats.unmatched_patterns}")
+    lines.append("=" * 60)
+    logger.info("\n".join(lines))

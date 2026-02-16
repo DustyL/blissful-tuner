@@ -1,0 +1,117 @@
+# =============================================================================
+# DLAY Persona LoRA - OPTIMAL AdamW + Cosine with Min LR
+# =============================================================================
+# Wan2.2-T2V-A14B | The RECOMMENDED scheduler configuration
+#
+# Why cosine_with_min_lr is OPTIMAL:
+#
+# 1. WARMUP: Prevents early training instability
+#    - Linear ramp from 0 to max_lr over warmup_steps
+#
+# 2. COSINE DECAY: Smooth, gradual LR reduction
+#    - Matches natural training dynamics
+#    - Proven effective for LoRA fine-tuning
+#
+# 3. MIN LR FLOOR: Prevents undertraining late epochs
+#    - Standard cosine decays to ~0, wasting final 20% of training
+#    - With min_lr_ratio=0.1, LR never drops below 10% of initial
+#    - Keeps learning active throughout training
+#
+# LR Curve:
+#    __/‾‾‾‾‾‾‾‾\__________
+#    warmup    cosine to min_lr (not 0!)
+#
+# Run:
+#   accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 \
+#     src/musubi_tuner/wan_train_network.py \
+#     --config_file configs/DLAY/dlay_wan22_OPTIMAL_adamw_cosine_minlr.toml
+# =============================================================================
+
+[model]
+task = "t2v-A14B"
+dit = "/root/models/WAN/Wan-2.2-T2V-Low-Noise-BF16.safetensors"
+dit_high_noise = "/root/models/WAN/Wan-2.2-T2V-High-Noise-BF16.safetensors"
+t5 = "/root/models/WAN/umt5-xxl-enc-bf16.safetensors"
+vae = "/root/models/WAN/Wan2_1_VAE_bf16.safetensors"
+
+[dataset]
+dataset_config = "/root/blissful-tuner/configs/DLAY/dlay_wan22_ULTIMATE_dataset.toml"
+
+[network]
+network_module = "musubi_tuner.networks.lora_wan"
+network_dim = 64
+network_alpha = 32
+network_args = [
+    "loraplus_lr_ratio=4",
+]
+
+[optimizer]
+optimizer_type = "adamw"
+learning_rate = 2e-5
+
+optimizer_args = [
+    "betas=(0.9, 0.99)",
+    "weight_decay=0.0",
+    "eps=1e-8",
+]
+
+# OPTIMAL SCHEDULER: Cosine with Min LR Floor
+lr_scheduler = "cosine_with_min_lr"
+
+# Warmup: ~2% of training (250 / 12000)
+lr_warmup_steps = 250
+
+# MIN LR RATIO: The key improvement over standard cosine!
+# 0.1 = LR never drops below 10% of initial (2e-6 minimum)
+# This keeps learning active in late training
+lr_scheduler_min_lr_ratio = 0.1
+
+max_grad_norm = 1.0
+
+[training]
+mixed_precision = "bf16"
+gradient_accumulation_steps = 1
+seed = 42
+
+max_train_steps = 12000
+
+save_every_n_steps = 500
+save_state = true
+save_last_n_steps = 2000
+save_last_n_steps_state = 2000
+
+timestep_sampling = "sigmoid"
+sigmoid_scale = 2.0
+discrete_flow_shift = 12.0
+timestep_boundary = 875
+
+gradient_checkpointing = false
+
+use_mask_loss = false
+mask_loss_scale = 1.0
+mask_min_weight = 0.1
+
+scale_weight_norms = 4.0
+
+flash_attn = true
+rope_func = "comfy"
+
+log_with = "tensorboard"
+
+[sampling]
+sample_prompts = "/root/blissful-tuner/configs/SYDNY/sample_prompts_sydny_seeded.txt"
+sample_every_n_steps = 500
+sample_at_first = false
+
+[output]
+output_dir = "/root/output/dlay_wan22_OPTIMAL_adamw_cosine_minlr"
+output_name = "dlay_wan22_adamw_cosine_minlr"
+logging_dir = "/root/output/dlay_wan22_OPTIMAL_adamw_cosine_minlr/logs"
+log_prefix = "dlay_OPTIMAL_cosine_minlr_"
+
+[advanced]
+compile = true
+compile_mode = "max-autotune-no-cudagraphs"
+compile_cache_size_limit = 64
+cuda_allow_tf32 = true
+cuda_cudnn_benchmark = true

@@ -145,8 +145,17 @@ class ZImageNetworkTrainer(NetworkTrainer):
         embed = sample_parameter["cap_feats"].to(device=device, dtype=torch.bfloat16)
         mask = sample_parameter["cap_mask"].to(device=device, dtype=torch.bool)
 
+        # L3 compat: if user specified --g but not --l, map guidance_scale to cfg_scale with a warning
+        if cfg_scale is None and "guidance_scale" in sample_parameter and guidance_scale > 1.0:
+            logger.warning(
+                "Z-Image: `--g` maps to guidance_scale; use `--l` for cfg_scale. "
+                "Treating guidance_scale as cfg_scale for compatibility."
+            )
+            cfg_scale = guidance_scale
+
         if cfg_scale is None:
-            cfg_scale = 4.0  # default for Base model
+            cfg_scale = 4.0
+            logger.info(f"cfg_scale not specified, using default: {cfg_scale}")
         do_cfg = cfg_scale > 1.0
         if do_cfg:
             negative_embed = sample_parameter["negative_cap_feats"].to(device=device, dtype=torch.bfloat16)
