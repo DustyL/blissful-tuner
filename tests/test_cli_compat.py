@@ -57,7 +57,9 @@ class TestValidateLycorisArg(unittest.TestCase):
             with patch("musubi_tuner.utils.cli_compat.lycoris_available", True):
                 validate_lycoris_arg(args, argv=["script", "--lycoris"])
             mock_logger.warning.assert_called_once()
-            self.assertIn("deprecated", mock_logger.warning.call_args[0][0])
+            msg = mock_logger.warning.call_args[0][0]
+            self.assertIn("deprecated", msg)
+            self.assertIn("v0.14.0", msg)
 
     def test_no_warning_on_prefer_lycoris(self):
         args = argparse.Namespace(prefer_lycoris=True)

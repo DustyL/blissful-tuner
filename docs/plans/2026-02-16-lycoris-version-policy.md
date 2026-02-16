@@ -1,13 +1,11 @@
 # Simplify LyCORIS Adapter Fallback: Define Minimum Version Policy
 
-> **Status:** Deferred — needs policy decision
+> **Status:** Deferred — policy decided, waiting for implementation slot
 > **Tracks:** Post-LoKr cleanup PR 4
 
 ## Summary
 
 The LyCORIS integration in `lora_utils.py` contains a fallback reconstruction path (`_reconstruct_lokr_weight`) that manually rebuilds LoKr weights when the LyCORIS library's own merge API is unavailable or incompatible. This adds maintenance burden and duplicates upstream logic.
-
-**Blocked on:** Defining a minimum supported `lycoris-lora` version and deciding behavior when the version is below minimum.
 
 ## Background
 
@@ -15,32 +13,28 @@ The LyCORIS integration in `lora_utils.py` contains a fallback reconstruction pa
 - If LyCORIS is not installed or the API doesn't exist, it falls back to a manual reconstruction path
 - The manual path works but is fragile: it must track any upstream changes to LoKr/LoHa weight decomposition
 
-## Policy Decisions Needed
+## Policy Decisions (Decided)
 
-### 1. Minimum supported `lycoris-lora` version
+### 1. Minimum supported `lycoris-lora` version: `>= 3.4.0`
 
-- **Options:**
-  - `>= 2.3.0` (first version with stable `lycoris.utils.merge` API)
-  - `>= 3.0.0` (if targeting latest API surface)
-  - No minimum (keep fallback indefinitely)
-- **Recommendation:** `>= 2.3.0` — covers the merge API we actually use
+Rationale: PR 4 depends on `lycoris.kohya.create_network_from_weights` being reliably present. Version 3.4.0 is the threshold where this helper path is stable.
+
+**While fallback still exists:** broader compatibility is fine (no version floor).
+**Once PR 4 lands:** enforce `>= 3.4.0` (or capability check + hard error if missing).
 
 ### 2. Behavior when version is below minimum
 
-- **Options:**
-  - **Hard error:** `raise ImportError("lycoris-lora >= 2.3.0 required")`
-  - **Warning + fallback:** Warn but use reconstruction path
-  - **Silent fallback:** Current behavior
-- **Recommendation:** Warning + fallback for one release, then hard error
+- **Phase 1 (v0.13.x):** Warning + fallback. Emit deprecation warning but continue using reconstruction path.
+- **Phase 2 (v0.14.0):** Hard error. `raise ImportError("lycoris-lora >= 3.4.0 required for LoHa/LoKr support")`
 
 ### 3. Behavior when LyCORIS is not installed but LoHa/LoKr weights detected
 
 - **Current:** Falls through to reconstruction path
-- **Recommended:** Hard error with install instructions (already partially implemented via `format_unknown_network_type_error`)
+- **Target:** Hard error with install instructions (already partially implemented via `format_unknown_network_type_error`)
 
 ## Entry Criteria
 
-- [ ] Minimum version policy decided (owner sign-off)
+- [x] Minimum version policy decided (owner sign-off: >= 3.4.0)
 - [ ] Behavior matrix documented (installed+new, installed+old, not installed)
 
 ## Exit Criteria (Acceptance Checklist)
@@ -50,7 +44,7 @@ The LyCORIS integration in `lora_utils.py` contains a fallback reconstruction pa
   - Removed (if hard error on old versions), OR
   - Guarded behind explicit version check with deprecation warning
 - [ ] `pyproject.toml` updated if minimum version becomes a hard dependency
-- [ ] Test added: mock `lycoris.__version__` below minimum → expected behavior
+- [ ] Test added: mock `lycoris.__version__` below 3.4.0 → expected behavior
 - [ ] Test added: LyCORIS not installed + LoHa/LoKr weights → clean error message
 - [ ] Full test suite passes
 - [ ] `ruff check` and `ruff format --check` pass
@@ -59,5 +53,5 @@ The LyCORIS integration in `lora_utils.py` contains a fallback reconstruction pa
 
 | Phase | Version | Action |
 |-------|---------|--------|
-| 1 | v0.13.x | Add version check, warn if < minimum, keep fallback |
-| 2 | v0.14.0 | Hard error if < minimum, remove fallback reconstruction |
+| 1 | v0.13.x | Add version check, warn if < 3.4.0, keep fallback |
+| 2 | v0.14.0 | Hard error if < 3.4.0, remove fallback reconstruction |

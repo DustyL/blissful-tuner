@@ -32,6 +32,6 @@ def validate_lycoris_arg(args: argparse.Namespace, argv=None) -> None:
     if argv is None:
         argv = sys.argv
     if "--lycoris" in argv:
-        logger.warning("--lycoris is deprecated; use --prefer_lycoris instead")
+        logger.warning("--lycoris is deprecated; use --prefer_lycoris instead. --lycoris will be removed in v0.14.0.")
     if getattr(args, "prefer_lycoris", False) and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")

@@ -459,7 +459,7 @@ def main():
     if args.vae_dtype is None:
         args.vae_dtype = "float32"  # match upstream / AE float32 default
     if getattr(args, "fp8_te", False):
-        logger.warning("--fp8_te is deprecated; use --fp8_text_encoder instead")
+        logger.warning("--fp8_te is deprecated; use --fp8_text_encoder instead. --fp8_te will be removed in v0.14.0.")
         args.fp8_text_encoder = True
 
     trainer = Flux2NetworkTrainer()
