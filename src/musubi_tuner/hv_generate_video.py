@@ -1,10 +1,8 @@
 import argparse
 from datetime import datetime
 import gc
-from importlib.util import find_spec
 import random
 import os
-import sys
 import time
 import numpy as np
 import torch
@@ -46,8 +44,9 @@ from blissful_tuner.guidance import apply_zerostar_scaling, perpendicular_negati
 from blissful_tuner.advanced_rope import get_rotary_pos_embed_riflex
 from blissful_tuner.prompt_management import rescale_text_encoders_hunyuan
 
+from musubi_tuner.utils.cli_compat import add_lycoris_arg, lycoris_available, validate_lycoris_arg
+
 logger = BlissfulLogger(__name__, "green")
-lycoris_available = find_spec("lycoris") is not None
 if lycoris_available:
     # LyCORIS 3.x doesn't export create_network_from_weights, use our adapter
     from musubi_tuner.networks.lycoris import create_network_from_weights
@@ -513,14 +512,7 @@ def parse_args():
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument(
-        "--prefer_lycoris",
-        "--lycoris",
-        dest="prefer_lycoris",
-        action="store_true",
-        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). "
-        "(--lycoris is a deprecated alias for --prefer_lycoris)",
-    )
+    add_lycoris_arg(parser)
     parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arthimetic(RTX 4XXX+)")
     parser.add_argument(
         "--compile_args",
@@ -540,10 +532,7 @@ def parse_args():
 
     # update dit_weight based on model_base if not exists
 
-    if "--lycoris" in sys.argv:
-        logger.warning("--lycoris is deprecated; use --prefer_lycoris instead")
-    if args.prefer_lycoris and not lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
+    validate_lycoris_arg(args)
 
     return args
 
