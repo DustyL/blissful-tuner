@@ -754,12 +754,14 @@ def load_dit_model(
         # make sure the model is on the right device
         model.to(device)
 
+    if args.compile_args is not None:
+        logger.warning(
+            "--compile_args is deprecated; use --compile_backend/--compile_mode/--compile_dynamic/--compile_fullgraph instead."
+            " --compile_args will be removed in v0.14.0."
+        )
+
     if args.compile:
         if args.compile_args is not None:
-            logger.warning(
-                "--compile_args is deprecated; use --compile_backend/--compile_mode/--compile_dynamic/--compile_fullgraph instead."
-                " --compile_args will be removed in v0.14.0."
-            )
             args.compile_backend, args.compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
             args.compile_dynamic = compile_dynamic.lower()
             args.compile_fullgraph = compile_fullgraph.lower() in "true"
