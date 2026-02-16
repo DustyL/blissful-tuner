@@ -173,6 +173,13 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
         self.handle_model_specific_args(args)
         validate_mask_loss_args(args)
 
+        # Prior preservation requires disabling LoRA for teacher forward pass — not possible in full fine-tuning
+        if float(getattr(args, "prior_preservation_weight", 0.0)) > 0:
+            raise ValueError(
+                "--prior_preservation_weight is not supported for full fine-tuning (no LoRA to disable for teacher forward pass). "
+                "Use LoRA training (qwen_image_train_network.py) with --prior_preservation_weight instead."
+            )
+
         # QwenImageNetworkTrainer forces dit_dtype to bfloat16, so we set it here
         args.dit_dtype = "bfloat16" if args.full_bf16 else "float32"
 

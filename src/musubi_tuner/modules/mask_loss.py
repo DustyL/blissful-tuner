@@ -90,11 +90,11 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     if prior_preservation_weight < 0:
         raise ValueError("--prior_preservation_weight must be >= 0")
 
-    if prior_preservation_weight > 0:
-        if not use_mask_loss:
-            _logger.warning(
-                "--prior_preservation_weight > 0 but --use_mask_loss is not enabled. Prior preservation requires masked training."
-            )
+    if prior_preservation_weight > 0 and not use_mask_loss:
+        raise ValueError(
+            "--prior_preservation_weight > 0 requires --use_mask_loss. "
+            "Prior preservation uses mask-based region splitting and has no effect without masks."
+        )
 
     prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
     if prior_mask_threshold is not None:
@@ -190,79 +190,11 @@ def apply_masked_loss(
     drop_base_frame: bool = False,
     accelerator: Any | None = None,
 ) -> torch.Tensor:
+    """Apply mask-weighted loss (no prior preservation). Thin wrapper around apply_masked_loss_with_prior."""
     del accelerator  # reserved for future global reduction support
-
-    if mask_weights is None or not getattr(args, "use_mask_loss", False):
-        # Return fp32 for consistency with masked path (avoids dtype depending on --use_mask_loss)
-        return loss.float().mean()
-
-    # Handle both 4D (FLUX.2 images) and 5D (video) loss tensors
-    if loss.ndim == 4:
-        # FLUX.2 produces per-image loss (B, C, H, W); treat it as F=1 for layout='video'
-        if layout != "video":
-            raise ValueError("4D loss is only supported for layout='video'")
-        loss = loss.unsqueeze(2)  # (B, C, H, W) -> (B, C, 1, H, W)
-    elif loss.ndim != 5:
-        raise ValueError(f"Expected loss to be 4D or 5D, got {loss.ndim}D: {tuple(loss.shape)}")
-
-    if drop_base_frame and layout != "layered":
-        raise ValueError("drop_base_frame=True is only valid with layout='layered'")
-
-    if mask_weights.ndim == 4:
-        # (B, F, H, W) -> (B, 1, F, H, W)
-        mask_weights = mask_weights.unsqueeze(1)
-    elif mask_weights.ndim != 5:
-        raise ValueError(f"Unexpected mask_weights shape: {tuple(mask_weights.shape)}")
-
-    mask_weights = mask_weights.to(loss.device, dtype=loss.dtype)
-
-    if layout == "video":
-        # loss: (B, C, F, H, W), mask: (B, 1, F, H, W)
-        if mask_weights.shape[0] != loss.shape[0] or mask_weights.shape[2:] != loss.shape[2:]:
-            raise ValueError(
-                "mask_weights shape does not match loss shape for layout='video': "
-                f"mask={tuple(mask_weights.shape)} loss={tuple(loss.shape)}"
-            )
-        mask_weights = mask_weights.expand_as(loss)
-    elif layout == "layered":
-        # loss: (B, L, C, H, W), mask: (B, 1, F, H, W) where F == (base + layers) or F == L
-        if drop_base_frame:
-            mask_weights = mask_weights[:, :, 1:, :, :]
-        if (
-            mask_weights.shape[0] != loss.shape[0]
-            or mask_weights.shape[2] != loss.shape[1]
-            or mask_weights.shape[3:] != loss.shape[3:]
-        ):
-            raise ValueError(
-                "mask_weights shape does not match loss shape for layout='layered': "
-                f"mask={tuple(mask_weights.shape)} loss={tuple(loss.shape)} drop_base_frame={drop_base_frame}"
-            )
-        mask_weights = mask_weights.permute(0, 2, 1, 3, 4)  # (B, L, 1, H, W)
-        mask_weights = mask_weights.expand_as(loss)
-    else:
-        raise ValueError(f"Unknown layout: {layout}")
-
-    mask_gamma = float(getattr(args, "mask_gamma", 1.0))
-    mask_min_weight = float(getattr(args, "mask_min_weight", 0.0))
-    if mask_gamma <= 0:
-        raise ValueError("--mask_gamma must be > 0")
-    if mask_min_weight < 0 or mask_min_weight >= 1.0:
-        raise ValueError("--mask_min_weight must be in range [0, 1)")
-
-    # Ensure numeric stability before pow. Masks are expected to be [0, 1], but interpolation/IO can introduce tiny drift.
-    mask_weights = mask_weights.clamp(0.0, 1.0)
-    if mask_gamma != 1.0:
-        mask_weights = mask_weights**mask_gamma
-    if mask_min_weight > 0:
-        mask_weights = mask_weights * (1.0 - mask_min_weight) + mask_min_weight
-
-    weighted_loss = loss * mask_weights
-
-    # Compute sums in float32 for numerical stability (1e-8 rounds to 0 in fp16)
-    # Return float32 loss to avoid precision loss in the scalar result
-    loss_sum = weighted_loss.sum(dtype=torch.float32)
-    weight_sum = mask_weights.sum(dtype=torch.float32).clamp_min(1e-8)
-    return loss_sum / weight_sum
+    return apply_masked_loss_with_prior(
+        loss, mask_weights, prior_loss_unreduced=None, args=args, layout=layout, drop_base_frame=drop_base_frame
+    )
 
 
 def _prepare_tensors(
@@ -282,7 +214,8 @@ def _prepare_tensors(
         drop_base_frame: Whether to drop base frame for layered layout
 
     Returns:
-        Tuple of (loss, mask_weights) both as 5D tensors expanded to match
+        Tuple of (loss, mask_weights) as 5D tensors. Mask is in compact (unexpanded)
+        form: (B,1,F,H,W) for video or (B,L,1,H,W) for layered, broadcast-compatible with loss.
     """
     # Handle 4D vs 5D loss
     if loss.ndim == 4:
@@ -311,7 +244,7 @@ def _prepare_tensors(
                 "mask_weights shape does not match loss shape for layout='video': "
                 f"mask={tuple(mask_weights.shape)} loss={tuple(loss.shape)}"
             )
-        mask_weights = mask_weights.expand_as(loss)
+        # mask stays (B, 1, F, H, W) — broadcast-compatible with (B, C, F, H, W)
     elif layout == "layered":
         # loss: (B, L, C, H, W), mask: (B, 1, F, H, W) where F == (base + layers) or F == L
         if drop_base_frame:
@@ -326,7 +259,6 @@ def _prepare_tensors(
                 f"mask={tuple(mask_weights.shape)} loss={tuple(loss.shape)} drop_base_frame={drop_base_frame}"
             )
         mask_weights = mask_weights.permute(0, 2, 1, 3, 4)  # (B, L, 1, H, W)
-        mask_weights = mask_weights.expand_as(loss)
     else:
         raise ValueError(f"Unknown layout: {layout}")
 
@@ -371,10 +303,23 @@ def apply_masked_loss_with_prior(
     if mask_weights is None or not getattr(args, "use_mask_loss", False):
         return loss.float().mean()
 
-    # Handle tensor shapes
+    # Guard: prior preservation not yet implemented for layered layout
+    if prior_preservation_weight > 0 and layout == "layered":
+        raise NotImplementedError(
+            "Prior preservation is not yet supported with layout='layered'. "
+            "Use layout='video' or disable --prior_preservation_weight."
+        )
+
+    # Handle tensor shapes — mask returned in compact form (B,1,F,H,W) or (B,L,1,H,W)
     loss, mask_weights = _prepare_tensors(loss, mask_weights, layout, drop_base_frame)
 
-    # Keep raw mask for thresholding (before gamma/min_weight)
+    # Compact mask is broadcast-compatible with loss; compute channel factor for weight sums.
+    # Video: mask (B,1,F,H,W), loss (B,C,F,H,W) → C = loss.shape[1]
+    # Layered: mask (B,L,1,H,W), loss (B,L,C,H,W) → C = loss.shape[2]
+    num_channels = loss.shape[1] if layout == "video" else loss.shape[2]
+
+    # Keep raw mask for thresholding (before gamma/min_weight).
+    # All mask processing stays on compact tensor to save VRAM.
     mask_raw = mask_weights.clamp(0.0, 1.0)
 
     # Apply gamma and min_weight to get processed mask for target loss
@@ -386,7 +331,7 @@ def apply_masked_loss_with_prior(
     if mask_min_weight < 0 or mask_min_weight >= 1.0:
         raise ValueError("--mask_min_weight must be in range [0, 1)")
 
-    mask_processed = mask_raw.clone()
+    mask_processed = mask_raw
     if mask_gamma != 1.0:
         mask_processed = mask_processed**mask_gamma
     if mask_min_weight > 0:
@@ -404,22 +349,22 @@ def apply_masked_loss_with_prior(
         mask_processed = mask_processed * (1 - prior_mask)
 
     # === Target Loss (inside mask) ===
+    # Broadcasting: loss (B,C,F,H,W) * compact mask (B,1,F,H,W) → (B,C,F,H,W)
     target_loss_weighted = loss * mask_processed
-    # All sums in float32 for numerical stability (1e-8 meaningless in fp16)
-    target_weight_sum = mask_processed.sum(dtype=torch.float32)
 
     if normalize_per_sample:
         # Per-sample weighted mean, then average over batch
         # Reduce over C, F, H, W dimensions (keep batch)
         reduce_dims = tuple(range(1, loss.ndim))
         target_sum = target_loss_weighted.sum(dim=reduce_dims, dtype=torch.float32)
-        target_weight = mask_processed.sum(dim=reduce_dims, dtype=torch.float32)
+        target_weight = mask_processed.sum(dim=reduce_dims, dtype=torch.float32) * num_channels
         # Handle samples with zero target weight: treat as 0 contribution
         valid_target = target_weight > 1e-8
         per_sample_target = torch.where(valid_target, target_sum / target_weight.clamp_min(1e-8), torch.zeros_like(target_sum))
         L_target = per_sample_target.mean()
     else:
-        # Global weighted mean
+        # Global weighted mean; weight sum scaled by channels (compact mask has 1 where loss has C)
+        target_weight_sum = mask_processed.sum(dtype=torch.float32) * num_channels
         if target_weight_sum < 1e-8:
             L_target = loss.new_zeros((), dtype=torch.float32)
         else:
@@ -429,7 +374,7 @@ def apply_masked_loss_with_prior(
     if prior_preservation_weight > 0 and prior_loss_unreduced is not None:
         # Check if prior mask is effectively all zeros (skip computation)
         # Use float32 for the sum so clamp_min(1e-8) is meaningful under fp16/bf16
-        prior_mask_sum = prior_mask.sum(dtype=torch.float32)
+        prior_mask_sum = prior_mask.sum(dtype=torch.float32) * num_channels
         if prior_mask_sum < 1e-8:
             # No prior loss contribution (e.g., unmasked step or mask=1 everywhere)
             L_prior = loss.new_zeros((), dtype=torch.float32)
@@ -439,12 +384,18 @@ def apply_masked_loss_with_prior(
             if prior_loss_unreduced.ndim == 4:
                 prior_loss_unreduced = prior_loss_unreduced.unsqueeze(2)
 
+            if prior_loss_unreduced.shape != loss.shape:
+                raise ValueError(
+                    f"prior_loss_unreduced shape {tuple(prior_loss_unreduced.shape)} does not match "
+                    f"loss shape {tuple(loss.shape)} after dimension normalization"
+                )
+
             prior_loss_weighted = prior_loss_unreduced * prior_mask
 
             if normalize_per_sample:
                 reduce_dims = tuple(range(1, loss.ndim))
                 prior_sum = prior_loss_weighted.sum(dim=reduce_dims, dtype=torch.float32)
-                prior_weight = prior_mask.sum(dim=reduce_dims, dtype=torch.float32)
+                prior_weight = prior_mask.sum(dim=reduce_dims, dtype=torch.float32) * num_channels
                 # Handle samples with zero prior weight: treat as 0 contribution
                 valid_prior = prior_weight > 1e-8
                 per_sample_prior = torch.where(valid_prior, prior_sum / prior_weight.clamp_min(1e-8), torch.zeros_like(prior_sum))
