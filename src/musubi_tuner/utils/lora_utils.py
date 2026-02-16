@@ -70,7 +70,7 @@ def _make_lora_name_from_model_key(model_weight_key: str) -> str:
     lora_name = model_weight_key.rsplit(".", 1)[0]  # remove trailing ".weight"
     for pfx in _MODEL_KEY_PREFIXES:
         if lora_name.startswith(pfx):
-            lora_name = lora_name[len(pfx):]
+            lora_name = lora_name[len(pfx) :]
             break
     return "lora_unet_" + lora_name.replace(".", "_")
 

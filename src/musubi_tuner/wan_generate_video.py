@@ -864,9 +864,7 @@ def merge_lora_weights(
             elif net_type == "unknown":
                 raise ValueError(format_unknown_network_type_error(lora_weight))
             else:
-                network = lora_module.create_arch_network_from_weights(
-                    lora_multiplier, weights_sd, unet=model, for_inference=True
-                )
+                network = lora_module.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
                 network.merge_to(None, model, weights_sd, device=device, non_blocking=True)
 
         synchronize_device(device)

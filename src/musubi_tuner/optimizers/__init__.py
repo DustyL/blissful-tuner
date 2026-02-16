@@ -22,4 +22,3 @@ __all__ = [
     "print_muon_summary",
     "split_param_groups_for_muon",
 ]
-

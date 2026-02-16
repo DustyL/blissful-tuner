@@ -93,8 +93,7 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     if prior_preservation_weight > 0:
         if not use_mask_loss:
             _logger.warning(
-                "--prior_preservation_weight > 0 but --use_mask_loss is not enabled. "
-                "Prior preservation requires masked training."
+                "--prior_preservation_weight > 0 but --use_mask_loss is not enabled. Prior preservation requires masked training."
             )
 
     prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
@@ -102,9 +101,7 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
         if prior_mask_threshold <= 0 or prior_mask_threshold >= 1:
             raise ValueError("--prior_mask_threshold must be in range (0, 1)")
         if prior_preservation_weight <= 0:
-            _logger.warning(
-                f"--prior_mask_threshold={prior_mask_threshold} has no effect without --prior_preservation_weight > 0"
-            )
+            _logger.warning(f"--prior_mask_threshold={prior_mask_threshold} has no effect without --prior_preservation_weight > 0")
 
     if not use_mask_loss:
         return

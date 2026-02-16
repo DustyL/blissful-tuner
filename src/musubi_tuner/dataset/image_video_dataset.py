@@ -1361,9 +1361,7 @@ class ImageDirectoryDatasource(ImageDatasource):
             if stripped_dir == "":
                 raise ValueError("caption_directory cannot be empty or whitespace")
             if stripped_dir != caption_directory:
-                logger.warning(
-                    f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}"
-                )
+                logger.warning(f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}")
                 caption_directory = stripped_dir
             if not os.path.exists(caption_directory):
                 raise ValueError(f"caption_directory does not exist: {caption_directory}")
@@ -1608,9 +1606,7 @@ class ImageJsonlDatasource(ImageDatasource):
                 # Validate required image_path key
                 image_path = data.get("image_path", data.get("image_path_0"))
                 if not image_path:
-                    raise ValueError(
-                        f"Missing 'image_path' (or 'image_path_0') at line {line_num} in {self.image_jsonl_file}"
-                    )
+                    raise ValueError(f"Missing 'image_path' (or 'image_path_0') at line {line_num} in {self.image_jsonl_file}")
 
                 self.data.append(data)
         logger.info(f"loaded {len(self.data)} images")
@@ -1844,9 +1840,7 @@ class VideoDirectoryDatasource(VideoDatasource):
             if stripped_dir == "":
                 raise ValueError("caption_directory cannot be empty or whitespace")
             if stripped_dir != caption_directory:
-                logger.warning(
-                    f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}"
-                )
+                logger.warning(f"caption_directory contains leading/trailing whitespace: {caption_directory!r} -> {stripped_dir!r}")
                 caption_directory = stripped_dir
             if not os.path.exists(caption_directory):
                 raise ValueError(f"caption_directory does not exist: {caption_directory}")

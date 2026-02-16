@@ -29,7 +29,12 @@ from rich_argparse import RichHelpFormatter
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.device_utils import clean_memory_on_device, synchronize_device
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type, format_unknown_network_type_error, merge_nonlora_to_model
+from musubi_tuner.utils.lora_utils import (
+    convert_diffusers_if_needed,
+    detect_network_type,
+    format_unknown_network_type_error,
+    merge_nonlora_to_model,
+)
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 from musubi_tuner.dataset.image_video_dataset import load_video, resize_image_to_bucket
 from blissful_tuner.fp8_optimization import convert_fp8_linear

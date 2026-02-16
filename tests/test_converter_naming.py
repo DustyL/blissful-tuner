@@ -102,7 +102,19 @@ class TestConverterNamingParity(unittest.TestCase):
             # Module name is everything between diffusers_prefix and param key
             if parts[0] == "diffusion_model":
                 # Find where the param part starts (lora_A, lora_B, hada_*, lokr_*, alpha)
-                param_starts = {"lora_A", "lora_B", "hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b", "lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b", "alpha"}
+                param_starts = {
+                    "lora_A",
+                    "lora_B",
+                    "hada_w1_a",
+                    "hada_w1_b",
+                    "hada_w2_a",
+                    "hada_w2_b",
+                    "lokr_w1",
+                    "lokr_w2",
+                    "lokr_w2_a",
+                    "lokr_w2_b",
+                    "alpha",
+                }
                 for i, part in enumerate(parts[1:], 1):
                     if part in param_starts:
                         module_names.add(".".join(parts[1:i]))

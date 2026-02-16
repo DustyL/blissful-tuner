@@ -26,7 +26,12 @@ from musubi_tuner.frame_pack.clip_vision import hf_clip_vision_encode
 from musubi_tuner.frame_pack.k_diffusion_hunyuan import sample_hunyuan
 from musubi_tuner.dataset import image_video_dataset
 from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type, filter_lora_state_dict, format_unknown_network_type_error
+from musubi_tuner.utils.lora_utils import (
+    convert_diffusers_if_needed,
+    detect_network_type,
+    filter_lora_state_dict,
+    format_unknown_network_type_error,
+)
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import (
     get_time_flag,
@@ -279,8 +284,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
     parser.add_argument(
-        "--prefer_lycoris", "--lycoris", dest="prefer_lycoris", action="store_true",
-        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). (--lycoris is deprecated)"
+        "--prefer_lycoris",
+        "--lycoris",
+        dest="prefer_lycoris",
+        action="store_true",
+        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). (--lycoris is deprecated)",
     )
 
     setup_parser_compile(parser)

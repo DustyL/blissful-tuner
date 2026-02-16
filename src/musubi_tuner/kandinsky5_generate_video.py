@@ -20,7 +20,12 @@ from musubi_tuner.kandinsky5.models.text_embedders import get_text_embedder
 from musubi_tuner.kandinsky5_train_network import Kandinsky5NetworkTrainer
 from musubi_tuner.hv_train_network import clean_memory_on_device
 from musubi_tuner.networks import lora_kandinsky
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type, format_unknown_network_type_error, merge_nonlora_to_model
+from musubi_tuner.utils.lora_utils import (
+    convert_diffusers_if_needed,
+    detect_network_type,
+    format_unknown_network_type_error,
+    merge_nonlora_to_model,
+)
 
 from blissful_tuner.utils import ensure_dtype_form
 from blissful_tuner.blissful_core import add_blissful_k5_args, parse_blissful_args

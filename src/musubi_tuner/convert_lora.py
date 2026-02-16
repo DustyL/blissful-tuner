@@ -106,7 +106,7 @@ def _normalize_module_name(lora_name: str, prefix: str) -> str:
     Applies architecture-specific fixups for WAN, Z-Image, and HunyuanVideo module names
     where naive underscore-to-dot replacement would be lossy.
     """
-    module_name = lora_name[len(prefix):]  # remove "lora_unet_"
+    module_name = lora_name[len(prefix) :]  # remove "lora_unet_"
     module_name = module_name.replace("_", ".")  # replace "_" with "."
     if ".cross.attn." in module_name or ".self.attn." in module_name:
         # Wan2.1 lora name to module name

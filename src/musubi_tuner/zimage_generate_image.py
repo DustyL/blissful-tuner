@@ -14,7 +14,12 @@ from safetensors import safe_open
 from tqdm import tqdm
 
 from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type, filter_lora_state_dict, format_unknown_network_type_error
+from musubi_tuner.utils.lora_utils import (
+    convert_diffusers_if_needed,
+    detect_network_type,
+    filter_lora_state_dict,
+    format_unknown_network_type_error,
+)
 from musubi_tuner.zimage import zimage_config, zimage_model, zimage_utils
 from musubi_tuner.zimage import zimage_autoencoder
 from musubi_tuner.zimage.zimage_autoencoder import AutoencoderKL
@@ -125,8 +130,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
     parser.add_argument(
-        "--prefer_lycoris", "--lycoris", dest="prefer_lycoris", action="store_true",
-        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). (--lycoris is deprecated)"
+        "--prefer_lycoris",
+        "--lycoris",
+        dest="prefer_lycoris",
+        action="store_true",
+        help="Force LyCORIS backend for all LoRA weight merging (requires lycoris installed). (--lycoris is deprecated)",
     )
     setup_parser_compile(parser)
 

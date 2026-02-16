@@ -210,4 +210,3 @@ def print_muon_summary(stats: MuonParamStats) -> None:
     if stats.unmatched_patterns:
         print(f"  Unmatched patterns: {stats.unmatched_patterns}")
     print("=" * 60 + "\n")
-

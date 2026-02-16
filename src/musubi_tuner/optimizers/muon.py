@@ -38,7 +38,9 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, *, steps: int = 5) -> torch.Ten
     return X
 
 
-def muon_update(grad: torch.Tensor, momentum: torch.Tensor, *, beta: float = 0.95, ns_steps: int = 5, nesterov: bool = True) -> torch.Tensor:
+def muon_update(
+    grad: torch.Tensor, momentum: torch.Tensor, *, beta: float = 0.95, ns_steps: int = 5, nesterov: bool = True
+) -> torch.Tensor:
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4:
@@ -48,7 +50,9 @@ def muon_update(grad: torch.Tensor, momentum: torch.Tensor, *, beta: float = 0.9
     return update
 
 
-def _adam_update(grad: torch.Tensor, buf1: torch.Tensor, buf2: torch.Tensor, step: int, betas: tuple[float, float], eps: float) -> torch.Tensor:
+def _adam_update(
+    grad: torch.Tensor, buf1: torch.Tensor, buf2: torch.Tensor, step: int, betas: tuple[float, float], eps: float
+) -> torch.Tensor:
     buf1.lerp_(grad, 1 - betas[0])
     buf2.lerp_(grad.square(), 1 - betas[1])
     buf1c = buf1 / (1 - betas[0] ** step)
@@ -113,7 +117,9 @@ class FallbackSingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                         state["step"] = 0
 
                     state["step"] += 1
-                    update = _adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"], group["eps"])
+                    update = _adam_update(
+                        p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"], group["eps"]
+                    )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
 

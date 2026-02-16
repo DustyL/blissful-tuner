@@ -614,9 +614,7 @@ class NetworkTrainer:
             muon_adam_lr = optimizer_kwargs.get("muon_adam_lr", getattr(args, "muon_adam_lr", 3e-4))
             muon_adam_betas = optimizer_kwargs.get("muon_adam_betas", optimizer_kwargs.get("adam_betas", (0.9, 0.95)))
             muon_adam_eps = optimizer_kwargs.get("muon_adam_eps", optimizer_kwargs.get("adam_eps", 1e-8))
-            muon_adam_weight_decay = optimizer_kwargs.get(
-                "muon_adam_weight_decay", optimizer_kwargs.get("adam_weight_decay", 0.0)
-            )
+            muon_adam_weight_decay = optimizer_kwargs.get("muon_adam_weight_decay", optimizer_kwargs.get("adam_weight_decay", 0.0))
 
             prefer_official = optimizer_kwargs.get("muon_prefer_official", True)
             verbose = optimizer_kwargs.get("muon_verbose", True)
@@ -1981,8 +1979,7 @@ class NetworkTrainer:
                 if ss_lokr_factor is not None:
                     call_kwargs["metadata_factor"] = int(ss_lokr_factor)
                 module = network_module.create_arch_network_from_weights(
-                    multiplier, weights_sd, unet=transformer, for_inference=True,
-                    architecture=self.architecture, **call_kwargs
+                    multiplier, weights_sd, unet=transformer, for_inference=True, architecture=self.architecture, **call_kwargs
                 )
                 module.merge_to(None, transformer, weights_sd, weight_dtype, "cpu")
 
@@ -2437,9 +2434,7 @@ class NetworkTrainer:
                     mask_weights = batch.get("mask_weights")
 
                     need_prior = (
-                        prior_preservation_weight > 0
-                        and getattr(args, "use_mask_loss", False)
-                        and mask_weights is not None
+                        prior_preservation_weight > 0 and getattr(args, "use_mask_loss", False) and mask_weights is not None
                     )
 
                     if need_prior:
@@ -2462,7 +2457,15 @@ class NetworkTrainer:
                             with self.prior_model_context(accelerator.unwrap_model(network)):
                                 # Use exact same inputs (noisy_model_input, timesteps, etc.)
                                 prior_pred_raw, _ = self.call_dit(
-                                    args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    latents,
+                                    batch,
+                                    noise,
+                                    noisy_model_input,
+                                    timesteps,
+                                    network_dtype,
                                 )
                         prior_pred = prior_pred_raw.detach()
 
@@ -2488,9 +2491,7 @@ class NetworkTrainer:
                             prior_loss_unreduced = prior_loss_unreduced * weighting
 
                     layout = "layered" if getattr(args, "is_layered", False) else "video"
-                    drop_base_frame = (
-                        bool(getattr(args, "remove_first_image_from_target", False)) if layout == "layered" else False
-                    )
+                    drop_base_frame = bool(getattr(args, "remove_first_image_from_target", False)) if layout == "layered" else False
                     loss = apply_masked_loss_with_prior(
                         loss,
                         mask_weights,
