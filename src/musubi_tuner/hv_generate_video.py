@@ -446,7 +446,7 @@ def parse_args():
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument(
         "--save_merged_model",
         type=str,
@@ -699,7 +699,6 @@ def main():
                         file=None,
                         weights_sd=weights_sd,
                         unet=transformer,
-                        text_encoder=None,
                         vae=None,
                         for_inference=True,
                     )

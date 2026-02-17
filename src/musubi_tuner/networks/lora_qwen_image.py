@@ -44,7 +44,7 @@ def create_arch_network(
     if isinstance(exclude_mod, str):
         exclude_mod = ast.literal_eval(exclude_mod)
     if exclude_mod:
-        exclude_patterns.append(r".*(_mod_).*")
+        exclude_patterns.append(r".*\.(img_mod|txt_mod)\..*")
 
     kwargs["exclude_patterns"] = exclude_patterns
 

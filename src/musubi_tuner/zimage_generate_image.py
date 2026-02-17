@@ -25,7 +25,7 @@ from musubi_tuner.zimage.zimage_autoencoder import AutoencoderKL
 
 from musubi_tuner.utils.cli_compat import add_lycoris_arg, validate_lycoris_arg
 
-from musubi_tuner.networks import lora_qwen_image
+from musubi_tuner.networks import lora_zimage
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, setup_parser_compile, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
@@ -42,6 +42,46 @@ class GenerationSettings:
         self.dit_weight_dtype = dit_weight_dtype  # not used currently because model may be optimized
 
 
+def apply_cfg_normalization(pos_pred: torch.Tensor, guided_pred: torch.Tensor, cfg_normalization: float) -> torch.Tensor:
+    """Apply CFG normalization by rescaling guided prediction to not exceed the positive prediction norm.
+
+    This matches the common "CFG normalization/rescale" behavior in official pipelines:
+    - Compute norms of pos_pred and guided_pred (per-sample).
+    - If guided norm exceeds (pos norm * cfg_normalization), rescale guided to that max norm.
+    """
+    if cfg_normalization <= 0:
+        raise ValueError("cfg_normalization must be > 0")
+
+    # Compute norms in float32 for numerical stability (avoid fp16/bf16 overflow/underflow).
+    pos_f = pos_pred.float()
+    guided_f = guided_pred.float()
+
+    reduce_dims = tuple(range(1, guided_f.ndim))
+    pos_norm = torch.linalg.vector_norm(pos_f, dim=reduce_dims, keepdim=True)
+    guided_norm = torch.linalg.vector_norm(guided_f, dim=reduce_dims, keepdim=True)
+
+    max_guided_norm = pos_norm * float(cfg_normalization)
+    eps = 1e-6
+    scale = torch.minimum(torch.ones_like(guided_norm), max_guided_norm / (guided_norm + eps))
+
+    return guided_pred * scale.to(dtype=guided_pred.dtype)
+
+
+def resolve_text_encoder_weight_dtype(args: argparse.Namespace, llm_device: torch.device) -> torch.dtype:
+    """Resolve text encoder weight dtype from CLI args.
+
+    Notes:
+    - FP8 LLM weights are only meaningful on CUDA; if the text encoder runs on CPU, fall back to bf16.
+    - Z-Image text encoder inference defaults to bf16 for parity with official code.
+    """
+    use_fp8 = bool(getattr(args, "fp8_llm", False))
+    if use_fp8 and llm_device.type != "cuda":
+        logger.warning("--fp8_llm requested but text encoder is not running on CUDA; falling back to bfloat16.")
+        use_fp8 = False
+
+    return torch.float8_e4m3fn if use_fp8 else torch.bfloat16
+
+
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="Z-Image inference script")
@@ -55,7 +95,7 @@ def parse_args() -> argparse.Namespace:
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -75,14 +115,45 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Guidance scale for classifier free guidance. Default is 0.0 (no guidance).",
     )
+    parser.add_argument(
+        "--cfg_truncation",
+        type=float,
+        default=zimage_config.DEFAULT_CFG_TRUNCATION,
+        help=(
+            "CFG truncation threshold in [0, 1]. When the normalized noise level (sigma) is greater than this value, "
+            "CFG is disabled for that step (effective guidance scale becomes 0). "
+            f"Default is {zimage_config.DEFAULT_CFG_TRUNCATION} (CFG at all steps)."
+        ),
+    )
+    parser.add_argument(
+        "--cfg_normalization",
+        type=float,
+        nargs="?",
+        const=1.0,
+        default=None,
+        help=(
+            "Enable CFG normalization (rescale guided prediction norm to match positive prediction norm). "
+            "Pass an optional multiplier (e.g., 1.0). If specified without a value, defaults to 1.0. "
+            "Default is disabled."
+        ),
+    )
     parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
     parser.add_argument("--negative_prompt", type=str, default=None, help="negative prompt for generation")
-    parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="image size, height and width")
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        default=[zimage_config.DEFAULT_HEIGHT, zimage_config.DEFAULT_WIDTH],
+        help=f"image size as height width, must be divisible by 16 (default: {zimage_config.DEFAULT_HEIGHT} {zimage_config.DEFAULT_WIDTH})",
+    )
     parser.add_argument("--infer_steps", type=int, default=25, help="number of inference steps, default is 25")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated image(s)")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
-        "--embedded_cfg_scale", type=float, default=2.5, help="Embedded CFG scale (distilled CFG Scale), default is 2.5"
+        "--embedded_cfg_scale",
+        type=float,
+        default=None,
+        help="DEPRECATED: no effect for Z-Image (accepted for CLI compatibility only).",
     )
 
     # Flow Matching
@@ -148,6 +219,14 @@ def parse_args() -> argparse.Namespace:
     if args.latent_path is None or len(args.latent_path) == 0:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
+
+    if args.cfg_truncation < 0.0 or args.cfg_truncation > 1.0:
+        raise ValueError("--cfg_truncation must be in range [0, 1]")
+    if args.cfg_normalization is not None and args.cfg_normalization <= 0:
+        raise ValueError("--cfg_normalization must be > 0")
+
+    if args.embedded_cfg_scale is not None:
+        logger.warning("--embedded_cfg_scale is deprecated for Z-Image and is ignored.")
 
     validate_lycoris_arg(args)
 
@@ -301,7 +380,7 @@ def load_dit_model(
     if args.prefer_lycoris:
         if args.lora_weight is not None and len(args.lora_weight) > 0:
             merge_lora_weights(
-                lora_qwen_image,
+                lora_zimage,
                 model,
                 args.lora_weight,
                 args.lora_multiplier,
@@ -310,6 +389,7 @@ def load_dit_model(
                 device,
                 lycoris=True,
                 save_merged_model=args.save_merged_model,
+                extra_unet_targets=["ZImageTransformerBlock"],
             )
 
         if args.fp8_scaled:
@@ -337,6 +417,13 @@ def load_dit_model(
 
     # if we only want to save the model, we can skip the rest
     if args.save_merged_model:
+        if not args.prefer_lycoris:
+            # Non-LyCORIS path: save was not handled by merge_lora_weights
+            from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
+
+            logger.info(f"Saving merged model to {args.save_merged_model}")
+            mem_eff_save_file(model.state_dict(), args.save_merged_model)
+            logger.info("Merged model saved")
         return None
 
     if not args.fp8_scaled:
@@ -412,8 +499,10 @@ def prepare_text_inputs(
 
         # text_encoder is on device (batched inference) or CPU (interactive inference)
     else:  # Load if not in shared_models
-        vl_dtype = torch.bfloat16 if not args.fp8_llm else torch.float8_e4m3fn
-        tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=vl_dtype, device=llm_device, disable_mmap=True)
+        llm_weight_dtype = resolve_text_encoder_weight_dtype(args, llm_device)
+        tokenizer, text_encoder = zimage_utils.load_qwen3(
+            args.text_encoder, dtype=llm_weight_dtype, device=llm_device, disable_mmap=True
+        )
 
     # Store original devices to move back later if they were shared. This does nothing if shared_models is None
     text_encoder_original_device = text_encoder.device if text_encoder else None
@@ -590,7 +679,14 @@ def generate(
 
     with tqdm(total=num_inference_steps, desc="Denoising steps") as pbar:
         for i, t in enumerate(timesteps):
-            # cfg_truncation is not supported currently
+            # CFG truncation: disable CFG at the noisiest steps based on sigma in [0, 1], where 1 is max noise.
+            # Default cfg_truncation=1.0 means CFG is applied at all steps.
+            effective_guidance_scale = args.guidance_scale
+            if do_cfg and args.cfg_truncation < 1.0:
+                t_normalized = sigmas[i]  # 1 -> 0
+                if bool((t_normalized > args.cfg_truncation).item()):
+                    effective_guidance_scale = 0.0
+
             timestep = t.expand(latents.shape[0])  # No effect since batch size is 1
             timestep = (1000 - timestep) / 1000  # Reverse timestep for z-image
 
@@ -601,11 +697,14 @@ def generate(
             with torch.no_grad():
                 model_out = model(latent_model_input, timestep, embed, mask)
 
-            if do_cfg:
+            if do_cfg and effective_guidance_scale > 0.0:
                 # with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True), torch.no_grad():
                 with torch.no_grad():
                     neg_model_out = model(latent_model_input, timestep, negative_embed, negative_mask)
-                noise_pred = model_out + args.guidance_scale * (model_out - neg_model_out)
+                noise_pred = model_out + effective_guidance_scale * (model_out - neg_model_out)
+
+                if args.cfg_normalization is not None:
+                    noise_pred = apply_cfg_normalization(model_out, noise_pred, args.cfg_normalization)
             else:
                 noise_pred = model_out
 
@@ -659,9 +758,12 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
             "height": f"{height}",
             "width": f"{width}",
             "infer_steps": f"{args.infer_steps}",
-            "embedded_cfg_scale": f"{args.embedded_cfg_scale}",
             "guidance_scale": f"{args.guidance_scale}",
+            "cfg_truncation": f"{args.cfg_truncation}",
+            "cfg_normalization": f"{args.cfg_normalization}",
         }
+        if args.embedded_cfg_scale is not None:
+            metadata["embedded_cfg_scale"] = f"{args.embedded_cfg_scale}"
         if args.negative_prompt is not None:
             metadata["negative_prompt"] = f"{args.negative_prompt}"
 
@@ -776,9 +878,10 @@ def load_shared_models(args: argparse.Namespace) -> Dict:
     """
     shared_models = {}
     # Load text encoders to CPU
-    # vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
-    vl_dtype = torch.bfloat16  # Default dtype for Text Encoder
-    tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=vl_dtype, device="cpu", disable_mmap=True)
+    device = torch.device(args.device)
+    llm_device = torch.device("cpu") if args.text_encoder_cpu else device
+    llm_weight_dtype = resolve_text_encoder_weight_dtype(args, llm_device)
+    tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=llm_weight_dtype, device="cpu", disable_mmap=True)
     shared_models["tokenizer"] = tokenizer
     shared_models["text_encoder"] = text_encoder
     return shared_models
@@ -811,15 +914,14 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     # 2. Precompute Text Data (Text Encoder)
     logger.info("Loading Text Encoder for batch text preprocessing...")
 
-    # Text Encoder loaded to CPU by load_text_encoder
-    # vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
-    vl_dtype = torch.bfloat16  # Default dtype for Text Encoder
+    # Text Encoder loaded to CPU then moved to llm_device for encoding.
+    llm_device = torch.device("cpu") if args.text_encoder_cpu else device
+    vl_dtype = resolve_text_encoder_weight_dtype(args, llm_device)
     tokenizer_batch, text_encoder_batch = zimage_utils.load_qwen3(
         args.text_encoder, dtype=vl_dtype, device="cpu", disable_mmap=True
     )
 
     # Text Encoder to device for this phase
-    llm_device = torch.device("cpu") if args.text_encoder_cpu else device
     text_encoder_batch.to(llm_device)  # Moved into prepare_text_inputs logic
 
     all_precomputed_text_data = []
@@ -853,6 +955,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
     if first_prompt_args.save_merged_model:
         logger.info("Merged DiT model saved. Skipping generation.")
+        return
 
     shared_models_for_generate = {"model": dit_model}  # Pass DiT via shared_models
 
@@ -1099,6 +1202,11 @@ def main():
         # For single mode, precomputed data is None, shared_models is None.
         # generate will load all necessary models (VAE, Text/Image Encoder, DiT).
         latent = generate(args, gen_settings)
+
+        if latent is None:
+            # --save_merged_model path: model already saved in load_dit_model, nothing else to do
+            logger.info("Done!")
+            return
 
         # Save latent and video
         vae = zimage_autoencoder.load_autoencoder_kl(args.vae, device, disable_mmap=True)

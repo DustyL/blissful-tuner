@@ -100,7 +100,7 @@ def convert_from_diffusers(prefix, weights_sd):
     return new_weights_sd
 
 
-def _normalize_module_name(lora_name: str, prefix: str) -> str:
+def _normalize_module_name(lora_name: str, prefix: str, arch: str | None = None) -> str:
     """Convert a lora_name (e.g. 'lora_unet_blocks_0_cross_attn_k_img') to a Diffusers module name.
 
     Applies architecture-specific fixups for WAN, Z-Image, and HunyuanVideo module names
@@ -122,19 +122,67 @@ def _normalize_module_name(lora_name: str, prefix: str) -> str:
         module_name = module_name.replace("to.out", "to_out")
         module_name = module_name.replace("feed.forward", "feed_forward")
     else:
-        # HunyuanVideo lora name to module name
+        # HunyuanVideo / Flux-style lora name to module name
         module_name = module_name.replace("double.blocks.", "double_blocks.")
         module_name = module_name.replace("single.blocks.", "single_blocks.")
         module_name = module_name.replace("img.", "img_")
         module_name = module_name.replace("txt.", "txt_")
-        module_name = module_name.replace("attn.", "attn_")
+        if arch not in ("flux", "flux2", "flux_kontext", "qwen_image"):
+            # HunyuanVideo uses flat attributes like `img_attn_qkv`, while FLUX uses nested modules like `img_attn.qkv`.
+            module_name = module_name.replace("attn.", "attn_")
     return module_name
 
 
-def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
+def _resolve_arch_from_metadata(metadata: dict[str, str] | None, cli_arch: str | None) -> str | None:
+    """Resolve architecture style for lossy LoRA key normalization.
+
+    This only affects ambiguous key families that share `double_blocks`/`single_blocks` naming,
+    such as FLUX.* and HunyuanVideo. For other architectures, normalization is handled by
+    specific pattern branches (WAN, Z-Image) and is not affected by this value.
+    """
+    if cli_arch is not None and cli_arch != "auto":
+        return cli_arch
+
+    if not metadata:
+        return None
+
+    network_module = metadata.get("ss_network_module")
+    if not network_module:
+        return None
+
+    # FLUX variants have nested attention modules like `img_attn.qkv`.
+    if "lora_flux_2" in network_module:
+        return "flux2"
+    if "lora_flux" in network_module:
+        return "flux_kontext"
+
+    # Qwen-Image also uses nested modules (e.g. `attn.to_q`) rather than flat `attn_to_q`.
+    if "lora_qwen_image" in network_module:
+        return "qwen_image"
+
+    # HunyuanVideo uses flat attention attributes like `img_attn_qkv`.
+    if network_module == "networks.lora":
+        return "hv"
+
+    return None
+
+
+def convert_to_diffusers(prefix, diffusers_prefix, weights_sd, metadata: dict[str, str] | None = None, arch: str | None = None):
     # convert from default LoRA/LoHa/LoKr to diffusers
     if diffusers_prefix is None:
         diffusers_prefix = "diffusion_model"
+
+    arch = _resolve_arch_from_metadata(metadata, arch)
+    if arch is None:
+        has_ambiguous_block_keys = any(("double_blocks" in k or "single_blocks" in k) for k in weights_sd.keys())
+        if has_ambiguous_block_keys:
+            logger.warning(
+                "LoRA metadata missing or unrecognized (ss_network_module). "
+                "Ambiguous FLUX vs HunyuanVideo keys may convert incorrectly. "
+                "Pass --arch flux2/flux_kontext/hv for deterministic conversion."
+            )
+    else:
+        logger.info(f"Architecture style for key normalization: {arch}")
 
     # Detect network type for logging
     from musubi_tuner.utils.lora_utils import detect_network_type
@@ -180,7 +228,7 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
         if lora_name in lora_name_to_module_name:
             module_name = lora_name_to_module_name[lora_name]
         else:
-            module_name = _normalize_module_name(lora_name, prefix)
+            module_name = _normalize_module_name(lora_name, prefix, arch=arch)
 
         # LoHa/LoKr keys: pass through with Diffusers-style key renaming
         if ".hada_" in key or ".lokr_" in key:
@@ -219,7 +267,7 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
     return new_weights_sd
 
 
-def convert(input_file, output_file, target_format, diffusers_prefix):
+def convert(input_file, output_file, target_format, diffusers_prefix, arch: str | None = None):
     logger.info(f"loading {input_file}")
     weights_sd = load_file(input_file)
 
@@ -232,7 +280,7 @@ def convert(input_file, output_file, target_format, diffusers_prefix):
     if target_format == "default":
         new_weights_sd = convert_from_diffusers(prefix, weights_sd)
     elif target_format == "other":
-        new_weights_sd = convert_to_diffusers(prefix, diffusers_prefix, weights_sd)
+        new_weights_sd = convert_to_diffusers(prefix, diffusers_prefix, weights_sd, metadata=metadata, arch=arch)
     else:
         raise ValueError(f"unknown target format: {target_format}")
 
@@ -255,13 +303,20 @@ def parse_args():
     parser.add_argument(
         "--diffusers_prefix", type=str, default=None, help="prefix for Diffusers weights, default is None (use `diffusion_model`)"
     )
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="auto",
+        choices=["auto", "hv", "flux", "flux2", "flux_kontext", "qwen_image"],
+        help="Architecture style for ambiguous key normalization (default: auto, inferred from metadata when possible).",
+    )
     args = parser.parse_args()
     return args
 
 
 def main():
     args = parse_args()
-    convert(args.input, args.output, args.target, args.diffusers_prefix)
+    convert(args.input, args.output, args.target, args.diffusers_prefix, arch=args.arch)
 
 
 if __name__ == "__main__":

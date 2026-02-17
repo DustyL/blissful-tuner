@@ -31,6 +31,43 @@ VAE_SCALE_FACTOR = 8  # Qwen Image uses 8x compression
 
 # endregion constants
 
+# region cfg
+
+CFG_NORM_EPS = 1e-6
+
+
+def apply_cfg_norm(conditional_pred: torch.Tensor, combined_pred: torch.Tensor, eps: float = CFG_NORM_EPS) -> torch.Tensor:
+    """Apply Qwen-Image CFG normalization with a division-by-zero guard.
+
+    Qwen-Image uses a "CFG normalization" step:
+        combined_pred *= ||conditional|| / ||combined||
+
+    If `combined_pred` becomes all zeros for some token(s), `||combined||` becomes zero which would otherwise yield
+    `0 * inf = NaN`. Clamping the denominator avoids NaNs while preserving the original behavior when norms are non-zero.
+    """
+    cond_norm = torch.norm(conditional_pred.float(), dim=-1, keepdim=True)
+    combined_norm = torch.norm(combined_pred.float(), dim=-1, keepdim=True)
+    denom = torch.clamp(combined_norm, min=float(eps))
+    scale = cond_norm / denom
+    return combined_pred * scale.to(dtype=combined_pred.dtype)
+
+
+def resolve_cfg_normalize(args: argparse.Namespace) -> bool:
+    """Resolve `cfg_normalize` defaults in a model-version-aware way.
+
+    Official Qwen-Image-Layered defaults `cfg_normalize=False`, while other Qwen-Image variants typically apply
+    CFG-normalization. We keep backwards-compatible behavior (enabled for non-layered) while allowing the user
+    to override via `--cfg_normalize` / `--no_cfg_normalize`.
+    """
+    cfg_normalize = getattr(args, "cfg_normalize", None)
+    if cfg_normalize is None:
+        cfg_normalize = not bool(getattr(args, "is_layered", False))
+    args.cfg_normalize = bool(cfg_normalize)
+    return args.cfg_normalize
+
+
+# endregion cfg
+
 # region text encoder
 QWEN_IMAGE_ID = "Qwen/Qwen-Image"
 QWEN_IMAGE_EDIT_ID = "Qwen/Qwen-Image-Edit"

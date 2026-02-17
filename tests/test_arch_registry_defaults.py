@@ -1,4 +1,5 @@
 import unittest
+import re
 
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_2_DEV,
@@ -8,6 +9,8 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_QWEN_IMAGE,
+    ARCHITECTURE_QWEN_IMAGE_EDIT,
+    ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_WAN,
     ARCHITECTURE_Z_IMAGE,
 )
@@ -50,6 +53,21 @@ class TestArchRegistryDefaults(unittest.TestCase):
         for arch in [ARCHITECTURE_QWEN_IMAGE]:
             self.assertIn("exclude_mod_patterns", ARCH_CONFIGS[arch])
 
+    def test_qwen_exclude_mod_patterns_match_actual_module_names(self):
+        """Qwen exclude_mod patterns must match real module paths (checked via fullmatch)."""
+        samples = [
+            "transformer_blocks.0.img_mod.1",
+            "transformer_blocks.0.txt_mod.1",
+        ]
+
+        for arch in [ARCHITECTURE_QWEN_IMAGE, ARCHITECTURE_QWEN_IMAGE_EDIT, ARCHITECTURE_QWEN_IMAGE_LAYERED]:
+            with self.subTest(arch=arch):
+                patterns = ARCH_CONFIGS[arch]["exclude_mod_patterns"]
+                for sample in samples:
+                    with self.subTest(sample=sample):
+                        matches_any = any(re.compile(p).fullmatch(sample) is not None for p in patterns)
+                        self.assertTrue(matches_any, f"Expected exclude_mod_patterns to match {sample!r} for {arch}")
+
     def test_kandinsky_has_include_patterns(self):
         self.assertIn("include_patterns", ARCH_CONFIGS[ARCHITECTURE_KANDINSKY5])
         self.assertTrue(len(ARCH_CONFIGS[ARCHITECTURE_KANDINSKY5]["include_patterns"]) > 0)
@@ -64,7 +82,7 @@ class TestArchRegistryDefaults(unittest.TestCase):
             (ARCHITECTURE_HUNYUAN_VIDEO, "img_mod", "HunyuanVideo must exclude img_mod layers"),
             (ARCHITECTURE_FLUX_KONTEXT, "modulation", "Flux Kontext must exclude modulation layers"),
             (ARCHITECTURE_FLUX_KONTEXT, "norm", "Flux Kontext must exclude norm layers"),
-            (ARCHITECTURE_FLUX_2_DEV, "modulation", "Flux 2 must exclude modulation layers"),
+            (ARCHITECTURE_FLUX_2_DEV, "norm", "Flux 2 must exclude norm layers"),
             (ARCHITECTURE_Z_IMAGE, "modulation", "Z-Image must exclude modulation layers"),
             (ARCHITECTURE_Z_IMAGE, "refiner", "Z-Image must exclude refiner layers"),
             (ARCHITECTURE_KANDINSKY5, "modulation", "Kandinsky must exclude modulation layers"),

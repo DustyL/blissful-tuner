@@ -13,6 +13,7 @@ from typing import List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from musubi_tuner.dataset import config_utils
@@ -155,6 +156,7 @@ def encode_and_save_batch(
 
         control_latents = None
         siglip_features = None
+        mask_weights = None
 
         # OmniBase: Process control images if present
         if item.control_content is not None:
@@ -183,11 +185,22 @@ def encode_and_save_batch(
                     sig_feat = extract_siglip_features(vision_model, processor, ctrl_array, vae.device)
                     siglip_features.append(sig_feat)
 
+        # Mask weights (optional): downsample mask to latent space for mask-weighted loss training.
+        # item.mask_content is (H, W) uint8 in [0,255] and is already bucket-resized in ImageDataset.
+        if item.mask_content is not None:
+            mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask = mask.float() / 255.0
+
+            lat_h, lat_w = latent.shape[-2:]
+            mask = F.interpolate(mask, size=(lat_h, lat_w), mode="area")  # (1, 1, lat_h, lat_w)
+            mask_weights = mask  # keep shape for layout="video" with F=1 when stacked
+
         logger.debug(
             f"Saving cache for item {item.item_key} at {item.latent_cache_path}. "
             f"Latent shape: {latent.shape}, "
             f"Control latents: {len(control_latents) if control_latents else 0}, "
-            f"SigLIP features: {len(siglip_features) if siglip_features else 0}"
+            f"SigLIP features: {len(siglip_features) if siglip_features else 0}, "
+            f"Mask: {tuple(mask_weights.shape) if mask_weights is not None else None}"
         )
 
         save_latent_cache_z_image(
@@ -195,6 +208,7 @@ def encode_and_save_batch(
             latent=latent,
             control_latents=control_latents,
             siglip_features=siglip_features,
+            mask_weights=mask_weights,
         )
 
 

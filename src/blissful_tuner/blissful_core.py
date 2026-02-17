@@ -462,21 +462,24 @@ def add_blissful_flux_args(
 
 
 def add_blissful_qwen_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
-    parser.add_argument(
-        "--compile_args",
-        nargs=4,
-        metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-        default=["inductor", "default", None, "False"],
-        help="Torch.compile settings",
-    )
-    parser.add_argument(
-        "--prompt_wildcards",
-        type=str,
-        default=None,
-        help="Path to a directory of wildcard.txt files to enable wildcards in prompts and negative prompts. For instance __color__ will look for wildcards in color.txt in that directory. "
-        "Wildcard files should have one possible replacement per line, optionally with a relative weight attached like red:2.0 or yellow:0.5, and wildcards can be nested.",
-    )
+    if "--compile" not in parser._option_string_actions:
+        parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    if "--compile_args" not in parser._option_string_actions:
+        parser.add_argument(
+            "--compile_args",
+            nargs=4,
+            metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
+            default=["inductor", "default", None, "False"],
+            help="Torch.compile settings",
+        )
+    if "--prompt_wildcards" not in parser._option_string_actions:
+        parser.add_argument(
+            "--prompt_wildcards",
+            type=str,
+            default=None,
+            help="Path to a directory of wildcard.txt files to enable wildcards in prompts and negative prompts. For instance __color__ will look for wildcards in color.txt in that directory. "
+            "Wildcard files should have one possible replacement per line, optionally with a relative weight attached like red:2.0 or yellow:0.5, and wildcards can be nested.",
+        )
     return parser
 
 

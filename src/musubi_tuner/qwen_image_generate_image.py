@@ -1,4 +1,5 @@
 import argparse
+import sys
 import gc
 import random
 import os
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -81,10 +82,26 @@ def parse_args() -> argparse.Namespace:
 
     # inference
     parser.add_argument(
-        "--guidance_scale", type=float, default=4.0, help="Guidance scale for classifier free guidance. Default is 4.0."
+        "--guidance_scale",
+        type=float,
+        default=4.0,
+        help=(
+            "Legacy true-CFG scale (two-pass). If --true_cfg_scale is not set, this value is used for CFG. Default is 4.0."
+        ),
+    )
+    parser.add_argument(
+        "--true_cfg_scale",
+        type=float,
+        default=None,
+        help=(
+            "True CFG scale (two-pass). If set, overrides --guidance_scale for CFG. "
+            "Defaults are model-version dependent (Edit-2509/2511: 4.0)."
+        ),
     )
     parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
-    parser.add_argument("--negative_prompt", type=str, default=None, help="negative prompt for generation")
+    # Qwen-Image pipelines (including non-CFG runs) always encode the negative prompt, so this
+    # must be a string to avoid crashes. Official examples commonly use a single space.
+    parser.add_argument("--negative_prompt", type=str, default=" ", help="negative prompt for generation (default: ' ')")
     parser.add_argument(
         "--automatic_prompt_lang_for_layered",
         type=str,
@@ -92,8 +109,19 @@ def parse_args() -> argparse.Namespace:
         choices=["en", "cn"],
         help="Automatic prompt language for layered images. Enabled only when prompt is not provided and model is layered.",
     )
-    # CFG normalization is always enabled for Musubi Tuner
-    # parser.add_argument("--cfg_normalize", action="store_true", help="normalize cfg scale by number of layers")
+    parser.add_argument(
+        "--cfg_normalize",
+        dest="cfg_normalize",
+        action="store_true",
+        default=None,
+        help="Enable CFG normalization. Default is model-version dependent (Layered: disabled; others: enabled).",
+    )
+    parser.add_argument(
+        "--no_cfg_normalize",
+        dest="cfg_normalize",
+        action="store_false",
+        help="Disable CFG normalization (use raw CFG combined prediction).",
+    )
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="image size, height and width")
     parser.add_argument("--output_layers", type=int, default=4, help="number of output layers for layered model, default is 4")
     parser.add_argument(
@@ -201,6 +229,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args = parse_blissful_args(args)
     qwen_image_utils.resolve_model_version_args(args)
+    qwen_image_utils.resolve_cfg_normalize(args)
+    guidance_scale_was_set = "--guidance_scale" in sys.argv
+    true_cfg_scale_was_set = "--true_cfg_scale" in sys.argv
+    resolve_true_cfg_scales(
+        args,
+        guidance_scale_was_set=guidance_scale_was_set,
+        true_cfg_scale_was_set=true_cfg_scale_was_set,
+    )
+    args._guidance_scale_was_set = guidance_scale_was_set
+    args._true_cfg_scale_was_set = true_cfg_scale_was_set
 
     # Validate arguments
     if args.from_file and args.interactive:
@@ -256,8 +294,17 @@ def parse_prompt_line(line: str, prompt_wildcards: Optional[str] = None) -> Dict
             overrides["seed"] = power_seed(value)
         elif option == "s":
             overrides["infer_steps"] = int(value)
-        elif option == "g" or option == "l":
+        elif option in {"g", "l", "guidance_scale"}:
             overrides["guidance_scale"] = float(value)
+        elif option in {"tcfg", "true_cfg", "true_cfg_scale"}:
+            overrides["true_cfg_scale"] = float(value)
+        elif option == "cfg_normalize":
+            if value == "":
+                overrides["cfg_normalize"] = True
+            else:
+                overrides["cfg_normalize"] = value.lower() in ("1", "true", "yes", "on")
+        elif option == "no_cfg_normalize":
+            overrides["cfg_normalize"] = False
         elif option == "fs":
             overrides["flow_shift"] = float(value)
         elif option == "m":
@@ -305,7 +352,49 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
         else:
             setattr(args_copy, key, value)
 
+    guidance_scale_was_set = getattr(args, "_guidance_scale_was_set", False) or ("guidance_scale" in overrides)
+    true_cfg_scale_was_set = getattr(args, "_true_cfg_scale_was_set", False) or ("true_cfg_scale" in overrides)
+    resolve_true_cfg_scales(
+        args_copy,
+        guidance_scale_was_set=guidance_scale_was_set,
+        true_cfg_scale_was_set=true_cfg_scale_was_set,
+    )
+    args_copy._guidance_scale_was_set = guidance_scale_was_set
+    args_copy._true_cfg_scale_was_set = true_cfg_scale_was_set
+
     return args_copy
+
+
+def resolve_true_cfg_scales(
+    args: argparse.Namespace, *, guidance_scale_was_set: bool, true_cfg_scale_was_set: bool
+) -> argparse.Namespace:
+    """Resolve dual-CFG args in a backwards-compatible way.
+
+    Musubi Tuner historically used `--guidance_scale` as the true-CFG (two-pass) scale.
+    Official Qwen-Image Edit-2509/2511 pipelines expose a second knob `true_cfg_scale`, with
+    defaults `guidance_scale=1.0` and `true_cfg_scale=4.0`.
+
+    Rules:
+    - If `--true_cfg_scale` is provided, it always wins for the CFG combine step.
+    - If `--true_cfg_scale` is not provided, fall back to `--guidance_scale` for compatibility.
+    - For Edit-2509/2511, if neither knob is explicitly set, default to (1.0, 4.0).
+    """
+    is_edit_plus = args.model_version in {"edit-2509", "edit-2511"}
+
+    if is_edit_plus and not guidance_scale_was_set and not true_cfg_scale_was_set:
+        args.guidance_scale = 1.0
+        args.true_cfg_scale = 4.0
+        return args
+
+    # Match official defaults for edit-plus models when the user hasn't explicitly opted into legacy behavior.
+    if is_edit_plus and not guidance_scale_was_set:
+        args.guidance_scale = 1.0
+
+    # Backwards compatibility: if the user didn't explicitly set true_cfg_scale, treat guidance_scale as the CFG scale.
+    if not true_cfg_scale_was_set:
+        args.true_cfg_scale = args.guidance_scale
+
+    return args
 
 
 def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
@@ -627,9 +716,23 @@ def prepare_text_inputs(
         prompt = qwen_image_utils.get_image_caption(vl_processor, text_encoder, images, use_en_prompt=use_en)
         logger.info(f"Generated automatic prompt for layered images: {prompt}")
 
-    # cache_key includes this because embed may be changed if resize_control_to_image_size is True
+    # Embed cache key must include any arg that can change the text encoder output:
+    # - model_version changes edit-vs-t2i behavior in get_qwen_prompt_embeds_with_image
+    # - resize flags can change control image preprocessing (and thus VL conditioning)
     height, width = check_inputs(args)
-    cache_key = (prompt, tuple(args.control_image_path) if args.control_image_path is not None else None, (width, height))
+    control_image_paths = tuple(args.control_image_path) if args.control_image_path is not None else None
+
+    def embeds_cache_key(text: str) -> tuple[Any, ...]:
+        return (
+            args.model_version,
+            text,
+            control_image_paths,
+            (width, height),
+            args.resize_control_to_image_size,
+            args.resize_control_to_official_size,
+        )
+
+    cache_key = embeds_cache_key(prompt)
 
     if cache_key in conds_cache:
         embed, mask = conds_cache[cache_key]
@@ -643,7 +746,7 @@ def prepare_text_inputs(
         conds_cache[cache_key] = (embed, mask)
 
     negative_prompt = args.negative_prompt
-    cache_key = (negative_prompt, tuple(args.control_image_path) if args.control_image_path is not None else None, (width, height))
+    cache_key = embeds_cache_key(negative_prompt)
     if cache_key in conds_cache:
         negative_embed, negative_mask = conds_cache[cache_key]
     else:
@@ -863,7 +966,8 @@ def generate(
         control_latent_1st = None
 
     # 6. Denoising loop
-    do_cfg = args.guidance_scale != 1.0
+    true_cfg_scale = args.true_cfg_scale if args.true_cfg_scale is not None else args.guidance_scale
+    do_cfg = true_cfg_scale > 1.0
     scheduler.set_begin_index(0)
     is_rgb = None if not args.is_layered else torch.zeros(1, dtype=torch.long, device=device)  # batch size 1
     with tqdm(total=num_inference_steps, desc="Denoising steps") as pbar:
@@ -903,11 +1007,8 @@ def generate(
                 if args.is_edit or args.is_layered:
                     neg_noise_pred = neg_noise_pred[:, : latents.shape[1], :]  # trim to latents shape
 
-                comb_pred = neg_noise_pred + args.guidance_scale * (noise_pred - neg_noise_pred)
-
-                cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                noise_pred = comb_pred * (cond_norm / noise_norm)
+                comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                noise_pred = qwen_image_utils.apply_cfg_norm(noise_pred, comb_pred) if args.cfg_normalize else comb_pred
 
             # Reference Consistency Mask (RCM) or inpainting
             if rcm_enabled and i > 0 or inpainting_mask is not None:
@@ -1030,6 +1131,8 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
             "infer_steps": f"{args.infer_steps}",
             "embedded_cfg_scale": f"{args.embedded_cfg_scale}",
             "guidance_scale": f"{args.guidance_scale}",
+            "true_cfg_scale": f"{args.true_cfg_scale}",
+            "cfg_normalize": f"{args.cfg_normalize}",
         }
         if args.negative_prompt is not None:
             metadata["negative_prompt"] = f"{args.negative_prompt}"

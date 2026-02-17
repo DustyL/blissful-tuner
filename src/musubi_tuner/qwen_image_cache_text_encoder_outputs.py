@@ -42,9 +42,12 @@ def encode_and_save_batch(
         for item in batch:
             # item.control_content: list of images (H, W, C), optional (but should be provided for Qwen-Image-Edit)
             if item.control_content is None or len(item.control_content) == 0:
-                # all item should have same number of control images
-                logger.warning(f"Item {item.item_key} has no control content for Qwen-Image-Edit, saving without control images.")
-                continue
+                # All items must have control images in Edit mode. Skipping here would desync prompts/images
+                # and either crash or silently corrupt cache alignment.
+                raise ValueError(
+                    f"Item {item.item_key} has no control content for Qwen-Image-Edit "
+                    f"(model_version={model_version!r}). Ensure control images are configured for every item."
+                )
 
             # item.control_content, list of np.ndarray, 0-255
             control_content = []
@@ -60,8 +63,6 @@ def encode_and_save_batch(
 
             images.append(control_content)  # vl_processor accepts PIL.Image and np.ndarray
 
-        if len(images) == 0:
-            images = None
     else:
         images = None
 

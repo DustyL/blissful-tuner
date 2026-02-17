@@ -332,10 +332,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
                     if is_edit or args.is_layered:
                         neg_noise_pred = neg_noise_pred[:, :image_seq_len]
                     comb_pred = neg_noise_pred + cfg_scale * (noise_pred - neg_noise_pred)
-
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
+                    noise_pred = qwen_image_utils.apply_cfg_norm(noise_pred, comb_pred) if args.cfg_normalize else comb_pred
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -472,7 +469,20 @@ class QwenImageNetworkTrainer(NetworkTrainer):
                 else:
                     break
             if num_control_images == 0:
-                is_edit = False  # no control images found, treat as text-to-image
+                if getattr(args, "allow_edit_fallback_to_t2i", False):
+                    logger.warning(
+                        f"Qwen-Image Edit batch has no control latents (missing 'latents_control_0'); "
+                        f"falling back to text-to-image for this step because --allow_edit_fallback_to_t2i is set. "
+                        f"This usually indicates a caching/config mismatch (model_version={args.model_version!r})."
+                    )
+                    is_edit = False  # no control images found, treat as text-to-image
+                else:
+                    raise ValueError(
+                        "Qwen-Image Edit training requires control images, but none were found in the batch "
+                        "(missing key 'latents_control_0'). This would silently degrade to text-to-image. "
+                        "Fix your dataset/caches (ensure control images are configured and latents were cached with an Edit model_version), "
+                        "or pass --allow_edit_fallback_to_t2i to allow mixed batches."
+                    )
 
         if is_edit:
             latents_control = []
@@ -588,6 +598,25 @@ def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--fp8_vl", action="store_true", help="use fp8 for Text Encoder model")
     parser.add_argument("--num_layers", type=int, default=None, help="Number of layers in the DiT model, default is None (60)")
     parser.add_argument(
+        "--cfg_normalize",
+        dest="cfg_normalize",
+        action="store_true",
+        default=None,
+        help="Enable CFG normalization for sampling. Default is model-version dependent (Layered: disabled; others: enabled).",
+    )
+    parser.add_argument(
+        "--no_cfg_normalize",
+        dest="cfg_normalize",
+        action="store_false",
+        help="Disable CFG normalization for sampling.",
+    )
+    parser.add_argument(
+        "--allow_edit_fallback_to_t2i",
+        action="store_true",
+        help="Allow Qwen-Image Edit batches without control latents to fall back to text-to-image. "
+        "By default this is an error to prevent silent misconfigured edit training.",
+    )
+    parser.add_argument(
         "--remove_first_image_from_target",
         action="store_true",
         help="Remove the first image from the target images for layered model. / レイヤードモデルでターゲット画像から最初の画像を削除する。",
@@ -608,6 +637,7 @@ def main():
         args.vae_dtype = "bfloat16"  # make bfloat16 as default for VAE, this should be checked
 
     qwen_image_utils.resolve_model_version_args(args)
+    qwen_image_utils.resolve_cfg_normalize(args)
 
     trainer = QwenImageNetworkTrainer()
     trainer.train(args)

@@ -128,7 +128,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x, apply_fp16_downscale=False):
         if self.training and self.gradient_checkpointing:
-            return checkpoint(self._forward, x, use_reentrant=False)
+            return checkpoint(self._forward, x, apply_fp16_downscale, use_reentrant=False)
         else:
             return self._forward(x, apply_fp16_downscale)
 
@@ -193,9 +193,11 @@ class ZImageAttention(nn.Module):
 
         # Call attention
         qkv = [query, key, value]
-        del query, key, value
+        if not torch.compiler.is_compiling():
+            del query, key, value
         hidden_states = attention(qkv, attn_params=attn_params)
-        del qkv
+        if not torch.compiler.is_compiling():
+            del qkv
 
         hidden_states = hidden_states.to(dtype)
 
@@ -248,8 +250,9 @@ class ZImageTransformerBlock(nn.Module):
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
         self.activation_cpu_offloading = activation_cpu_offloading
-        self.feed_forward.enable_gradient_checkpointing()
-        self.attention.enable_gradient_checkpointing()
+        # Avoid nested checkpointing: block-level checkpoint covers attention + FFN.
+        self.feed_forward.disable_gradient_checkpointing()
+        self.attention.disable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -267,18 +270,22 @@ class ZImageTransformerBlock(nn.Module):
         if self.modulation:
             assert adaln_input is not None
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation[0](adaln_input).unsqueeze(1).chunk(4, dim=2)
-            del adaln_input
+            if not torch.compiler.is_compiling():
+                del adaln_input
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
             attn_out = self.attention(self.attention_norm1(x) * scale_msa, freqs_cis=freqs_cis, attn_params=attn_params)
-            del scale_msa
+            if not torch.compiler.is_compiling():
+                del scale_msa
             x = x + gate_msa * self.attention_norm2(clamp_fp16(attn_out))
-            del gate_msa
+            if not torch.compiler.is_compiling():
+                del gate_msa
             x = x + gate_mlp * self.ffn_norm2(
                 clamp_fp16(self.feed_forward(self.ffn_norm1(x) * scale_mlp, apply_fp16_downscale=True))
             )
-            del scale_mlp, gate_mlp
+            if not torch.compiler.is_compiling():
+                del scale_mlp, gate_mlp
         else:
             attn_out = self.attention(self.attention_norm1(x), freqs_cis=freqs_cis, attn_params=attn_params)
             x = x + self.attention_norm2(clamp_fp16(attn_out))
@@ -339,19 +346,26 @@ class RopeEmbedder:
                 freqs_cis.append(freqs_cis_i)
             return freqs_cis
 
+    @torch.compiler.disable()
+    def _ensure_cache_device(self, device: torch.device) -> None:
+        if self.freqs_cis is None:
+            # [torch.Size([1536, 16]), torch.Size([512, 24]), torch.Size([512, 24])]
+            self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)  # keep on cpu
+
+        if self.freqs_cis[0].device != device:
+            self.freqs_cis = [fc.to(device) for fc in self.freqs_cis]
+
     def __call__(self, ids: torch.Tensor):
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
-        if self.freqs_cis is None:
-            # [torch.Size([1536, 16]), torch.Size([512, 24]), torch.Size([512, 24])]
-            self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)  # keep on cpu
+        self._ensure_cache_device(device)
 
         result = []
         for i in range(len(self.axes_dims)):
             index = ids[:, i]
-            result.append(self.freqs_cis[i].to(device)[index])
+            result.append(self.freqs_cis[i][index])
         return torch.cat(result, dim=-1)
 
 
@@ -465,7 +479,7 @@ class ZImageTransformer2DModel(nn.Module):
         for block in self.noise_refiner + self.context_refiner + self.layers:
             block.enable_gradient_checkpointing(activation_cpu_offloading=cpu_offload)
 
-        print(f"Z-Image: Gradient checkpointing enabled. CPU offload: {cpu_offload}")
+        logger.info(f"Z-Image: Gradient checkpointing enabled. CPU offload: {cpu_offload}")
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -474,7 +488,7 @@ class ZImageTransformer2DModel(nn.Module):
         for block in self.noise_refiner + self.context_refiner + self.layers:
             block.disable_gradient_checkpointing()
 
-        print("Z-Image: Gradient checkpointing disabled.")
+        logger.info("Z-Image: Gradient checkpointing disabled.")
 
     def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = num_blocks
@@ -486,7 +500,7 @@ class ZImageTransformer2DModel(nn.Module):
         self.offloader = ModelOffloader(
             "double", self.layers, len(self.layers), self.blocks_to_swap, supports_backward, device, use_pinned_memory
         )
-        print(
+        logger.info(
             f"Z-Image: Block swap enabled. Swapping {num_blocks} of {self.num_blocks} blocks to device {device}. Supports backward: {supports_backward}"
         )
 
@@ -494,13 +508,13 @@ class ZImageTransformer2DModel(nn.Module):
         if self.blocks_to_swap:
             self.offloader.set_forward_only(True)
             self.prepare_block_swap_before_forward()
-            print("Z-Image: Block swap set to forward only.")
+            logger.info("Z-Image: Block swap set to forward only.")
 
     def switch_block_swap_for_training(self):
         if self.blocks_to_swap:
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
-            print("Z-Image: Block swap set to forward and backward.")
+            logger.info("Z-Image: Block swap set to forward and backward.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
@@ -661,7 +675,8 @@ class ZImageTransformer2DModel(nn.Module):
         # Create position IDs and RoPE for x (same for all samples since images have same size)
         x_pos_ids = self.create_image_position_ids(F_tokens, H_tokens, W_tokens, cap_seq_len, device)
         x_freqs_cis = self.rope_embedder(x_pos_ids)  # [x_seq_len, head_dim]
-        del x_pos_ids
+        if not torch.compiler.is_compiling():
+            del x_pos_ids
         x_freqs_cis = x_freqs_cis.unsqueeze(0).expand(B, -1, -1)  # [B, x_seq_len, head_dim]
 
         # Apply noise refiner
@@ -681,7 +696,8 @@ class ZImageTransformer2DModel(nn.Module):
         # Create position IDs and RoPE for captions
         cap_pos_ids = self.create_caption_position_ids(cap_seq_len, device)
         cap_freqs_cis = self.rope_embedder(cap_pos_ids)  # [cap_seq_len, head_dim]
-        del cap_pos_ids
+        if not torch.compiler.is_compiling():
+            del cap_pos_ids
         cap_freqs_cis = cap_freqs_cis.unsqueeze(0).expand(B, -1, -1)  # [B, cap_seq_len, head_dim]
 
         # Apply context refiner
@@ -694,9 +710,11 @@ class ZImageTransformer2DModel(nn.Module):
         # Concatenate x and cap_feats for unified processing
         # Order: [x tokens, caption tokens]
         unified = torch.cat([x, cap_feats], dim=1)  # [B, x_seq_len + cap_seq_len, dim]
-        del x, cap_feats
+        if not torch.compiler.is_compiling():
+            del x, cap_feats
         unified_freqs_cis = torch.cat([x_freqs_cis, cap_freqs_cis], dim=1)  # [B, x_seq_len + cap_seq_len, head_dim]
-        del x_freqs_cis, cap_freqs_cis
+        if not torch.compiler.is_compiling():
+            del x_freqs_cis, cap_freqs_cis
 
         # Apply main transformer layers
         attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, x_seq_len, cap_mask)

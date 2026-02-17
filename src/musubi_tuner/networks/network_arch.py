@@ -62,30 +62,30 @@ ARCH_CONFIGS = {
     },
     ARCHITECTURE_FLUX_2_DEV: {
         "target_modules": FLUX_2_TARGET_REPLACE_MODULES,
-        "exclude_patterns": [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*", r".*(norm).*"],
+        "exclude_patterns": [r".*(norm).*"],
     },
     ARCHITECTURE_FLUX_2_KLEIN_4B: {
         "target_modules": FLUX_2_TARGET_REPLACE_MODULES,
-        "exclude_patterns": [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*", r".*(norm).*"],
+        "exclude_patterns": [r".*(norm).*"],
     },
     ARCHITECTURE_FLUX_2_KLEIN_9B: {
         "target_modules": FLUX_2_TARGET_REPLACE_MODULES,
-        "exclude_patterns": [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*", r".*(norm).*"],
+        "exclude_patterns": [r".*(norm).*"],
     },
     ARCHITECTURE_QWEN_IMAGE: {
         "target_modules": QWEN_IMAGE_TARGET_REPLACE_MODULES,
         "exclude_patterns": [],
-        "exclude_mod_patterns": [r".*(_mod_).*"],
+        "exclude_mod_patterns": [r".*\.(img_mod|txt_mod)\..*"],
     },
     ARCHITECTURE_QWEN_IMAGE_EDIT: {
         "target_modules": QWEN_IMAGE_TARGET_REPLACE_MODULES,
         "exclude_patterns": [],
-        "exclude_mod_patterns": [r".*(_mod_).*"],
+        "exclude_mod_patterns": [r".*\.(img_mod|txt_mod)\..*"],
     },
     ARCHITECTURE_QWEN_IMAGE_LAYERED: {
         "target_modules": QWEN_IMAGE_TARGET_REPLACE_MODULES,
         "exclude_patterns": [],
-        "exclude_mod_patterns": [r".*(_mod_).*"],
+        "exclude_mod_patterns": [r".*\.(img_mod|txt_mod)\..*"],
     },
     ARCHITECTURE_Z_IMAGE: {
         "target_modules": ZIMAGE_TARGET_REPLACE_MODULES,

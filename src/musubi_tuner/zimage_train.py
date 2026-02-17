@@ -180,7 +180,8 @@ class ZImageTrainer(ZImageNetworkTrainer):
         elif args.xformers:
             attn_mode = "xformers"
         elif args.flash3:
-            attn_mode = "flash3"
+            logger.warning("flash3 is not separately supported for Z-Image, falling back to flash")
+            attn_mode = "flash"
         else:
             raise ValueError(
                 "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"

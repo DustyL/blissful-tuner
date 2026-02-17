@@ -26,14 +26,16 @@ def create_arch_network(
     neuron_dropout: Optional[float] = None,
     **kwargs,
 ):
-    # add default exclude patterns
-    exclude_patterns = kwargs.get("exclude_patterns", None)
-    if exclude_patterns is None:
-        exclude_patterns = [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*"]
+    # Exclude patterns are additive: merge user-supplied patterns with defaults.
+    # NOTE: FLUX.2 modulation layers are not inside the LoRA target blocks, so we only exclude norms by default.
+    exclude_patterns_arg = kwargs.get("exclude_patterns", None)
+    if exclude_patterns_arg is None:
+        exclude_patterns = []
+    elif isinstance(exclude_patterns_arg, str):
+        exclude_patterns = ast.literal_eval(exclude_patterns_arg)
     else:
-        exclude_patterns = ast.literal_eval(exclude_patterns)
+        exclude_patterns = list(exclude_patterns_arg)
 
-    # exclude if 'norm' in the name of the module
     exclude_patterns.append(r".*(norm).*")
 
     kwargs["exclude_patterns"] = exclude_patterns

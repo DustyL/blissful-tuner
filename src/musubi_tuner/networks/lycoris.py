@@ -218,11 +218,24 @@ def create_network_from_weights(
       considered (e.g. ``["WanAttentionBlock"]`` for Wan DiT).
     """
 
-    # Auto-detect extra targets if not provided and the UNet includes WanAttentionBlock
+    # Auto-detect extra targets if not provided by scanning for known architecture blocks
     if extra_unet_targets is None and unet is not None:
         module_names = {m.__class__.__name__ for m in unet.modules()}
-        if "WanAttentionBlock" in module_names:
-            extra_unet_targets = ["WanAttentionBlock"]
+        _KNOWN_TARGETS = [
+            "WanAttentionBlock",
+            "ZImageTransformerBlock",
+            "QwenImageTransformerBlock",
+            "DoubleStreamBlock",
+            "SingleStreamBlock",
+            "MMDoubleStreamBlock",
+            "HunyuanVideoTransformerBlock",
+            "TransformerEncoderBlock",
+            "TransformerDecoderBlock",
+        ]
+        detected = [t for t in _KNOWN_TARGETS if t in module_names]
+        if detected:
+            extra_unet_targets = detected
+            logger.info(f"Auto-detected LyCORIS extra_unet_targets: {detected}")
 
     try:
         from lycoris.kohya import create_network_from_weights as lyco_create

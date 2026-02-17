@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from musubi_tuner.convert_lora import _normalize_module_name, convert_from_diffusers, convert_to_diffusers
+from musubi_tuner.convert_lora import _normalize_module_name, _resolve_arch_from_metadata, convert_from_diffusers, convert_to_diffusers
 
 
 class TestNormalizeModuleName(unittest.TestCase):
@@ -59,6 +59,30 @@ class TestNormalizeModuleName(unittest.TestCase):
         name = "lora_unet_single_blocks_0_txt_attn_qkv"
         result = _normalize_module_name(name, self.PREFIX)
         self.assertEqual(result, "single_blocks.0.txt_attn_qkv")
+
+    def test_flux2_double_blocks_nested_attn(self):
+        """FLUX.2 uses nested attention modules like img_attn.qkv (not flat img_attn_qkv)."""
+        name = "lora_unet_double_blocks_0_img_attn_qkv"
+        result = _normalize_module_name(name, self.PREFIX, arch="flux2")
+        self.assertEqual(result, "double_blocks.0.img_attn.qkv")
+
+    def test_flux2_single_blocks_nested_attn(self):
+        """FLUX.2 uses nested attention modules like txt_attn.qkv (not flat txt_attn_qkv)."""
+        name = "lora_unet_single_blocks_0_txt_attn_qkv"
+        result = _normalize_module_name(name, self.PREFIX, arch="flux2")
+        self.assertEqual(result, "single_blocks.0.txt_attn.qkv")
+
+    def test_qwen_image_double_blocks_nested_attn(self):
+        """Qwen-Image should preserve nested attention modules like FLUX (not flatten attn.*)."""
+        name = "lora_unet_double_blocks_0_img_attn_qkv"
+        result = _normalize_module_name(name, self.PREFIX, arch="qwen_image")
+        self.assertEqual(result, "double_blocks.0.img_attn.qkv")
+
+
+class TestResolveArchFromMetadata(unittest.TestCase):
+    def test_qwen_image_detected_from_metadata(self):
+        arch = _resolve_arch_from_metadata({"ss_network_module": "networks.lora_qwen_image"}, cli_arch="auto")
+        self.assertEqual(arch, "qwen_image")
 
 
 class TestConverterNamingParity(unittest.TestCase):
@@ -217,6 +241,15 @@ class TestConverterNamingParity(unittest.TestCase):
         self.assertIn(f"{lora_name}.lokr_w2_a", roundtrip_keys)
         self.assertIn(f"{lora_name}.lokr_w2_b", roundtrip_keys)
         self.assertIn(f"{lora_name}.alpha", roundtrip_keys)
+
+    def test_convert_to_diffusers_flux2_uses_metadata(self):
+        """FLUX.2: metadata-driven arch dispatch must preserve nested attention module paths."""
+        lora_name = "lora_unet_double_blocks_0_img_attn_qkv"
+        sd = self._make_lora_sd(lora_name)
+        metadata = {"ss_network_module": "networks.lora_flux_2"}
+
+        converted = convert_to_diffusers(self.PREFIX, "diffusion_model", sd, metadata=metadata)
+        self.assertIn("diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight", converted)
 
 
 if __name__ == "__main__":

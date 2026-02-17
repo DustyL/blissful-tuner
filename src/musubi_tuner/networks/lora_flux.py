@@ -22,14 +22,17 @@ def create_arch_network(
     neuron_dropout: Optional[float] = None,
     **kwargs,
 ):
-    # add default exclude patterns
-    exclude_patterns = kwargs.get("exclude_patterns", None)
-    if exclude_patterns is None:
-        exclude_patterns = [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*"]
-    else:
-        exclude_patterns = ast.literal_eval(exclude_patterns)
+    # Exclude patterns are additive: merge user-supplied patterns with defaults.
+    exclude_patterns = [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*"]
 
-    # exclude if 'norm' in the name of the module
+    exclude_patterns_arg = kwargs.get("exclude_patterns", None)
+    if exclude_patterns_arg is None:
+        pass
+    elif isinstance(exclude_patterns_arg, str):
+        exclude_patterns.extend(ast.literal_eval(exclude_patterns_arg))
+    else:
+        exclude_patterns.extend(list(exclude_patterns_arg))
+
     exclude_patterns.append(r".*(norm).*")
 
     kwargs["exclude_patterns"] = exclude_patterns

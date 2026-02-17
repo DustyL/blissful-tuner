@@ -241,7 +241,10 @@ class ZImageNetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
-        # zimage_model.load_zimage_model
+        if attn_mode == "flash3":
+            logger.warning("flash3 is not separately supported for Z-Image, falling back to flash")
+            attn_mode = "flash"
+
         model = zimage_model.load_zimage_model(
             device=loading_device,
             dit_path=dit_path,
