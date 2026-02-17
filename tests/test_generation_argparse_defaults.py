@@ -112,6 +112,22 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
         self.assertIsInstance(args.negative_prompt, str)
         self.assertNotEqual(args.negative_prompt, "")
 
+    def test_qwen_infer_steps_defaults_by_model_version(self):
+        """I5: infer_steps defaults are model-version dependent (50 for T2I, 40 for Edit)."""
+        base = ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"]
+
+        # T2I (original) → 50
+        args = self._parse(qwen_image_generate_image, base)
+        self.assertEqual(args.infer_steps, 50)
+
+        # Edit-2511 → 40
+        args = self._parse(qwen_image_generate_image, base + ["--model_version", "edit-2511"])
+        self.assertEqual(args.infer_steps, 40)
+
+        # Explicit override is preserved
+        args = self._parse(qwen_image_generate_image, base + ["--infer_steps", "20"])
+        self.assertEqual(args.infer_steps, 20)
+
 
 class TestFlux2ArgDefaultsAndEnforcement(unittest.TestCase):
     def _parse_flux2(self, argv):

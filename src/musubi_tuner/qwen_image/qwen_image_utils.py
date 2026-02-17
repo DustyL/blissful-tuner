@@ -66,6 +66,24 @@ def resolve_cfg_normalize(args: argparse.Namespace) -> bool:
     return args.cfg_normalize
 
 
+# Official default inference steps per model version.
+_DEFAULT_INFER_STEPS: dict[str, int] = {
+    "original": 50,
+    "layered": 50,
+    "edit": 40,
+    "edit-2509": 40,
+    "edit-2511": 40,
+}
+
+
+def resolve_infer_steps(args: argparse.Namespace) -> int:
+    """Fill ``infer_steps`` with model-version-aware defaults when the user did not set it."""
+    if args.infer_steps is not None:
+        return args.infer_steps
+    args.infer_steps = _DEFAULT_INFER_STEPS.get(getattr(args, "model_version", "original"), 50)
+    return args.infer_steps
+
+
 # endregion cfg
 
 # region text encoder

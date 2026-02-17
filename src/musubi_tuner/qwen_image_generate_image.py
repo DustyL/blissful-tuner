@@ -141,7 +141,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="resize control image to match official size (1M pixels keeping aspect ratio)",
     )
-    parser.add_argument("--infer_steps", type=int, default=25, help="number of inference steps, default is 25")
+    parser.add_argument(
+        "--infer_steps",
+        type=int,
+        default=None,
+        help="number of inference steps (default: model-version dependent — 50 for T2I/Layered, 40 for Edit)",
+    )
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
@@ -228,6 +233,7 @@ def parse_args() -> argparse.Namespace:
     args = parse_blissful_args(args)
     qwen_image_utils.resolve_model_version_args(args)
     qwen_image_utils.resolve_cfg_normalize(args)
+    qwen_image_utils.resolve_infer_steps(args)
     guidance_scale_was_set = "--guidance_scale" in sys.argv
     true_cfg_scale_was_set = "--true_cfg_scale" in sys.argv
     resolve_true_cfg_scales(
