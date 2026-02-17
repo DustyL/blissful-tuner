@@ -23,6 +23,46 @@ Qwen-Image-Edit-2509/2511は、複数枚の制御画像を同時に使用でき�
 
 </details>
 
+## Architecture Notes for Training
+
+> For full architectural details, see [Qwen-Image Architecture Reference](./qwen_image_architecture.md).
+
+All Qwen-Image variants share the same core **60-layer MMDiT transformer** (`QwenImageTransformer2DModel`) with a **Qwen2.5-VL-7B** text encoder and a **16-channel VAE**. Understanding a few key architectural points helps when configuring training:
+
+### How Control Images Work (Edit Models)
+
+Edit models use a **dual-path** mechanism for reference images — **not** extra input channels:
+
+1. **Semantic path**: The reference image is processed by Qwen2.5-VL alongside the text prompt, producing joint text+vision embeddings that condition the transformer's cross-attention.
+2. **Appearance path**: The reference image is VAE-encoded to latent tokens and **concatenated along the sequence dimension** with the noise tokens. During loss computation, only the target portion is used.
+
+This means `in_channels=64` is constant across all variants. The transformer never "knows" about control images through its channel dimension.
+
+### Variant Config Differences
+
+| Flag | Original/2512 | Edit/2509 | Edit-2511 | Layered |
+|------|:-------------:|:---------:|:---------:|:-------:|
+| `zero_cond_t` | -- | -- | **true** | -- |
+| `use_additional_t_cond` | -- | -- | -- | **true** |
+| `use_layer3d_rope` | -- | -- | -- | **true** |
+| VAE channels | 3 (RGB) | 3 (RGB) | 3 (RGB) | **4 (RGBA)** |
+
+- **`zero_cond_t`** (Edit-2511 only): Uses zero-timestep modulation for the control-token segment of the image stream (not the CFG-unconditional pass), reducing drift during editing.
+- **`use_additional_t_cond`** (Layered only): Adds layer-index conditioning to the timestep embedding.
+- **`use_layer3d_rope`** (Layered only): Extends 2D spatial RoPE to 3D to encode layer position.
+
+### LoRA Compatibility
+
+All variants target the same module: `QwenImageTransformerBlock`. Because the transformer architecture is structurally identical across all variants, a LoRA weight file is **structurally loadable** on any variant (though behavior will differ due to different base weights).
+
+The default LoRA configuration excludes modulation layers (`_mod_` pattern) which control timestep conditioning.
+
+---
+
+## Prerequisites
+
+- **transformers >= 4.51.3** is required for Qwen2.5-VL text encoder support.
+
 ## Download the model / モデルのダウンロード
 
 You need to download the DiT, VAE, and Text Encoder (Qwen2.5-VL) models.
@@ -462,6 +502,10 @@ VRAMが限られている環境（例：48GB以下）の場合は、`--full_bf16
 
 Inference uses a dedicated script `qwen_image_generate_image.py`.
 
+> **Note on inference steps**: The default in this framework is 25 steps. The official Qwen-Image examples use **50 steps** for T2I and **40 steps** for Edit-2509/2511. Higher step counts generally produce better quality at the cost of slower generation. Adjust `--infer_steps` based on your quality/speed tradeoff.
+
+> **Note on guidance for Edit-2509/2511**: The official Edit-2509/2511 pipeline uses `guidance_scale=1.0` (disabling standard CFG) combined with `true_cfg_scale=4.0` (using true CFG with a separate unconditional pass). In this framework, `--guidance_scale 4.0` is used as the primary guidance parameter.
+
 **Standard Qwen-Image Inference:**
 
 ```bash
@@ -522,6 +566,10 @@ Please specify `--model_version layered` for Qwen-Image-Layered inference. Note 
 You can specify the discrete flow shift using `--flow_shift`. If omitted, the default value (dynamic shifting based on the image size) will be used.
 
 `xformers`, `flash` and `sageattn` are also available as attention modes. However `sageattn` is not confirmed to work yet.
+
+> **Prompt rewriting for Edit models**: The official Qwen-Image documentation warns that editing results may become **unstable without prompt rewriting**. If you are getting poor results with Edit models, consider using more detailed, descriptive prompts that specify exactly what should change and what should be preserved.
+
+> **Edit-2509 ControlNet support**: Edit-2509 and later variants natively support ControlNet-style inputs including depth maps, edge maps, and keypoint maps as control images.
 
 <details>
 <summary>日本語</summary>

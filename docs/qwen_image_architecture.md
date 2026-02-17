@@ -1,10 +1,11 @@
-# Qwen-Image-2512 Architecture Reference
+# Qwen-Image Architecture Reference
 
-This document provides a comprehensive reference for the Qwen-Image-2512 model architecture, extracted directly from the official HuggingFace model configuration files. This information is intended to aid debugging, optimization, and development work on the Qwen-Image training pipeline.
+This document provides a comprehensive reference for the Qwen-Image model family architecture, covering all variants (Original, Edit, Edit-2509, Edit-2511, 2512, and Layered). Configuration details are extracted directly from the official HuggingFace model configuration files. This information is intended to aid debugging, optimization, and development work on the Qwen-Image training pipeline.
 
-**Source**: [Qwen/Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512)
+**Primary Source**: [Qwen/Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512)
+**Edit Source**: [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
 **Diffusers Version**: 0.36.0.dev0
-**Pipeline Class**: `QwenImagePipeline`
+**Base Pipeline Class**: `QwenImagePipeline` (T2I) / `QwenImageEditPlusPipeline` (Edit) / `QwenImageLayeredPipeline` (Layered)
 
 ---
 
@@ -19,6 +20,58 @@ This document provides a comprehensive reference for the Qwen-Image-2512 model a
 | Tokenizer | `Qwen2Tokenizer` | 152k vocab | BPE tokenizer |
 
 **Total Model Size**: ~38GB (bf16), ~40.8GB raw weights
+
+---
+
+## Model Variant Comparison
+
+The Qwen-Image family consists of several model variants built on the same core MMDiT architecture. All share the same `QwenImageTransformer2DModel` class and weight structure — the differences lie in config flags, pipeline classes, and specialized training.
+
+### Variant Overview
+
+| Model | Release | Purpose | Pipeline Class |
+|-------|---------|---------|----------------|
+| Qwen-Image | Aug 2025 | Text-to-image generation | `QwenImagePipeline` |
+| Qwen-Image-Edit | Aug 2025 | Single-image editing | `QwenImageEditPipeline` |
+| Qwen-Image-Edit-2509 | Sep 2025 | Multi-image editing + ControlNet | `QwenImageEditPlusPipeline` |
+| Qwen-Image-Edit-2511 | Nov 2025 | Improved multi-image editing | `QwenImageEditPlusPipeline` |
+| Qwen-Image-2512 | Dec 2025 | Improved T2I (updated weights) | `QwenImagePipeline` |
+| Qwen-Image-Layered | Dec 2025 | RGBA layer decomposition | `QwenImageLayeredPipeline` |
+
+### Transformer Config Flags by Variant
+
+All variants use `in_channels=64`, `out_channels=16`, 60 layers, 24 heads, and `axes_dims_rope=[16,56,56]`. The differences are:
+
+| Config Flag | Original/2512 | Edit/Edit-2509 | Edit-2511 | Layered |
+|-------------|:-------------:|:--------------:|:---------:|:-------:|
+| `guidance_embeds` | false | false | false | false |
+| `zero_cond_t` | -- | -- | **true** | false |
+| `use_additional_t_cond` | -- | -- | -- | **true** |
+| `use_layer3d_rope` | -- | -- | -- | **true** |
+
+### VAE and Pipeline Differences
+
+| Aspect | Original/2512 | Edit/Edit-2509/Edit-2511 | Layered |
+|--------|:-------------:|:------------------------:|:-------:|
+| VAE input channels | 3 (RGB) | 3 (RGB) | **4 (RGBA)** |
+| VAE class | AutoencoderKLQwenImage | AutoencoderKLQwenImage | AutoencoderKLQwenImage |
+| VAE z_dim | 16 | 16 | 16 |
+| Processor component | No | **Yes** (Qwen2VLProcessor) | **Yes** (Qwen2VLProcessor) |
+| Control images | None | 1+ reference images | Input image for decomposition |
+| Output | Single RGB image | Single RGB image | **Multiple RGBA layers** |
+
+### Model Weight Sizes
+
+| Component | Size (raw safetensors) | Shards |
+|-----------|----------------------|--------|
+| Transformer (2512) | ~40.86 GB | 9 files |
+| Transformer (Edit-2511) | ~40.86 GB | 5 files |
+| Text Encoder (all variants) | ~16.58 GB | 4 files |
+| VAE (all variants) | ~1 GB | 1 file |
+
+### Key Insight: Structural Compatibility
+
+Because all variants share the same transformer architecture (`QwenImageTransformer2DModel` with identical layer structure), a LoRA trained on one variant is **structurally loadable** on any other variant — though semantic behavior will differ due to different base weights and config flags.
 
 ---
 
@@ -174,6 +227,18 @@ The text encoder includes an integrated vision transformer for processing image 
 }
 ```
 
+### System Prompts for Feature Extraction
+
+The text encoder uses distinct system prompts depending on the task, which directly affect the embeddings produced:
+
+**Text-to-Image (T2I) System Prompt:**
+> "Describe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background"
+
+**Text-Image-to-Image (TI2I / Edit) System Prompt:**
+> "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate."
+
+The last layer hidden state from the Qwen2.5-VL language model backbone (`h = ϕ(S)`) is extracted as the conditioning representation for the MMDiT transformer. This is crucial for training: the system prompt affects what information the text encoder emphasizes in its embeddings.
+
 ### Weight Tensor Patterns (Text Encoder)
 
 ```
@@ -238,7 +303,7 @@ The core diffusion transformer uses a Multi-Modal DiT architecture with joint im
 | Input Channels | 64 | After patchify (16 latent × 2×2 patch) |
 | Output Channels | 16 | Matches VAE latent channels |
 | Patch Size | 2×2 | Patchifies latent space |
-| Guidance Embeds | false | No CFG embedding in model |
+| Guidance Embeds | false | No CFG embedding in model (unused; may be removed in future diffusers) |
 
 ### MSRoPE Configuration (Transformer)
 
@@ -255,6 +320,28 @@ axes_dims_rope = [16, 56, 56]  # [temporal/batch, height, width]
 
 This design allows the model to encode 2D spatial positions separately, critical for maintaining spatial coherence in generated images.
 
+#### Symmetric Frequency Indices (`scale_rope=True`)
+
+Qwen-Image uses `scale_rope=True` (hardcoded), which creates **symmetric (negative + positive) frequency indices** centered at zero rather than starting from 0. This means positions are encoded relative to the image center:
+
+```python
+# With scale_rope=True:
+freqs_height = torch.cat([
+    freqs_neg[1][-(height - height // 2):],  # Negative frequencies (top half)
+    freqs_pos[1][:height // 2]                # Positive frequencies (bottom half)
+], dim=0)
+freqs_width = torch.cat([
+    freqs_neg[2][-(width - width // 2):],     # Negative frequencies (left half)
+    freqs_pos[2][:width // 2]                  # Positive frequencies (right half)
+], dim=0)
+```
+
+**Implications**:
+- Spatial positions are relative to image center (negative = top-left, positive = bottom-right)
+- Text tokens are positioned at offset `max(height // 2, width // 2)` from center along the diagonal
+- The symmetric design improves resolution generalization by keeping center-relative semantics consistent
+- Frequency computation uses LRU caching (maxsize=128) for efficiency across inference steps
+
 ### Transformer Block Structure
 
 Each of the 60 transformer blocks contains:
@@ -270,12 +357,12 @@ TransformerBlock
 │   ├── norm_added_q, norm_added_k  # Text QK normalization
 │   ├── to_out                      # Image output projection
 │   └── to_add_out                  # Text output projection
-├── img_mlp          # Image FFN
-│   ├── net.0.proj   # Gated linear unit
+├── img_mlp          # Image FFN (activation: gelu-approximate → GEGLU structure)
+│   ├── net.0.proj   # Gated projection (splits into gate + value, applies GELU)
 │   └── net.2        # Output projection
-└── txt_mlp          # Text FFN
-    ├── net.0.proj
-    └── net.2
+└── txt_mlp          # Text FFN (activation: gelu-approximate → GEGLU structure)
+    ├── net.0.proj   # Gated projection
+    └── net.2        # Output projection
 ```
 
 ### Weight Tensor Patterns (Transformer)
@@ -321,9 +408,133 @@ With 60 layers, the transformer is a prime target for memory optimization:
 
 ---
 
+## Control Image Architecture (Edit Models)
+
+Qwen-Image-Edit models handle reference/control images through a **dual-path conditioning mechanism** — not through extra input channels. This is a critical architectural distinction.
+
+### Dual-Path Overview
+
+```
+Reference Image (H × W × 3)
+         │
+         ├─────────────────────────────────┐
+         │                                 │
+         ▼ (Semantic Path)                 ▼ (Appearance Path)
+┌─────────────────────────┐    ┌─────────────────────────────┐
+│  Qwen2.5-VL Encoder     │    │  VAE Encoder                │
+│  Resolution: ~384×384    │    │  Resolution: ~1024×1024     │
+│  Processes image + text  │    │  Encodes to 16-ch latent    │
+│  jointly as VL input     │    │  Patchified to tokens       │
+│  Output: text+vision     │    │  Output: latent token seq   │
+│  embeddings (3584-dim)   │    │                             │
+└─────────────────────────┘    └─────────────────────────────┘
+         │                                 │
+         ▼                                 ▼
+┌─────────────────────────┐    ┌─────────────────────────────┐
+│  Cross-Attention Path    │    │  Sequence Concatenation      │
+│  → txt stream of MMDiT   │    │  [noise_tokens, ref_tokens]  │
+│  (joint_attention_dim)   │    │  along sequence dimension    │
+└─────────────────────────┘    └─────────────────────────────┘
+         │                                 │
+         └──────────┬──────────────────────┘
+                    │
+                    ▼
+         ┌─────────────────────┐
+         │  MMDiT Transformer   │
+         │  (60 layers)         │
+         │  Attends to both     │
+         │  streams jointly     │
+         └─────────────────────┘
+                    │
+                    ▼
+         model_pred[:, :img_seq_len]
+         (only target portion used for loss)
+```
+
+### Key Design Decisions
+
+1. **Sequence concatenation, NOT channel concatenation**: Reference image latents are appended along the token sequence dimension, not stacked as extra channels. This keeps `in_channels=64` constant across all variants.
+
+2. **Two resolutions for the reference image**:
+   - **~384×384 pixels** for the semantic path through Qwen2.5-VL (controlled by `CONDITION_IMAGE_SIZE`)
+   - **~1024×1024 pixels** for the appearance path through the VAE (controlled by `VAE_IMAGE_SIZE`)
+
+3. **Loss computation**: During training, only the target portion of the output sequence is used for loss calculation: `model_pred[:, :img_seq_len]`. The reference token predictions are discarded.
+
+4. **Multi-image support** (Edit-2509, Edit-2511): Multiple reference images are each VAE-encoded and their latent tokens are concatenated sequentially: `[target_seq, ref1_seq, ref2_seq, ...]`
+
+### Comparison with Other Architectures
+
+| Architecture | Reference Image Method | Input Channels Change? |
+|-------------|----------------------|----------------------|
+| **Qwen-Image-Edit** | Sequence concatenation + VL encoder | No (always 64) |
+| FLUX.1 Kontext | Sequence concatenation | No |
+| WAN 2.2 I2V | Channel concatenation | Yes (+extra channels) |
+| SD Inpainting | Channel concatenation (mask+image) | Yes (+5 channels) |
+
+### Processor Component (Qwen2VLProcessor)
+
+Edit and Layered models include a `Qwen2VLProcessor` component for preparing image+text inputs for the Qwen2.5-VL text encoder:
+
+```json
+{
+  "image_processor_type": "Qwen2VLImageProcessorFast",
+  "image_mean": [0.48145466, 0.4578275, 0.40821073],
+  "image_std": [0.26862954, 0.26130258, 0.27577711],
+  "patch_size": 14,
+  "merge_size": 2,
+  "max_pixels": 12845056,
+  "min_pixels": 3136,
+  "resample": "bicubic"
+}
+```
+
+The processor handles:
+- Image normalization with ImageNet-like statistics
+- Patch extraction at 14×14 resolution
+- Spatial merging (2×2 patches → 1 token)
+- Multi-image batching for Edit-2509/2511
+
+### Prompt Templates by Version
+
+The text encoder uses different prompt templates depending on the model version:
+
+| Version | Prompt Template |
+|---------|----------------|
+| `edit` | `<\|vision_start\|><\|image_pad\|><\|vision_end\|>{prompt}` |
+| `edit-2509` / `edit-2511` | `Picture 1: <\|vision_start\|><\|image_pad\|><\|vision_end\|>\n{prompt}` |
+| `layered` | Same as original, but can auto-caption via Qwen2.5-VL |
+
+### Prompt Template Token Indices
+
+Each pipeline has a `prompt_template_encode_start_idx` that determines how many system/template tokens to skip when extracting the user's actual prompt embeddings:
+
+| Pipeline | `prompt_template_encode_start_idx` | Full Template |
+|----------|:----------------------------------:|---------------|
+| T2I | **34** | `<\|im_start\|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<\|im_end\|>\n<\|im_start\|>user\n{}<\|im_end\|>\n<\|im_start\|>assistant\n` |
+| Edit | **64** | Longer template including `<\|vision_start\|><\|image_pad\|><\|vision_end\|>` tokens |
+
+The tokenizer max length is **1024** tokens, but the default `max_sequence_length` in the T2I pipeline's `__call__` is **512**. These indices are important for understanding how text encoder outputs map to the transformer's `encoder_hidden_states_mask`.
+
+---
+
 ## VAE: AutoencoderKLQwenImage
 
-The VAE handles encoding images to latent space and decoding back to pixel space.
+The VAE handles encoding images to latent space and decoding back to pixel space. It uses a **single-encoder, dual-decoder** architecture designed for both image and video, built on the Wan-2.1-VAE foundation.
+
+### Training Origin
+
+The VAE encoder is **frozen** (inherited directly from Wan-2.1-VAE). Only the **decoder** was fine-tuned, specifically on text-rich images:
+
+| Aspect | Detail |
+|--------|--------|
+| Encoder | **Frozen** from Wan-2.1-VAE (19M params for images) |
+| Decoder | **Fine-tuned** on text-rich images (25M params for images) |
+| Fine-tuning data | In-house corpus: PDFs, PowerPoint slides, posters |
+| Languages | Alphabetic (English) + logographic (Chinese) |
+| Loss | Reconstruction + perceptual loss (dynamically adjusted ratio) |
+
+The decoder fine-tuning on text-rich images is what enables Qwen-Image's exceptional text rendering quality. Adversarial loss was found ineffective as reconstruction quality increased.
 
 ### Configuration
 
@@ -348,7 +559,7 @@ The VAE handles encoding images to latent space and decoding back to pixel space
 | Base Dimension | 96 | Initial conv channels |
 | Dimension Multipliers | [1, 2, 4, 4] | Channel scaling per stage |
 | Stages | 4 | Encoder/decoder depth |
-| Spatial Compression | 8× | 2× per stage (2^3) |
+| Spatial Compression | 8× | 3 downsample ops across 4 stages (2³) |
 | Res Blocks per Stage | 2 | Standard depth |
 | Temporal Downsampling | [F, T, T] | For video (stages 1, 2 only) |
 
@@ -377,7 +588,7 @@ latents_std = [
     2.8184, 1.4541, 2.3275, 2.6558,
     1.2196, 1.7708, 2.6052, 2.0743,
     3.2687, 2.1526, 2.8652, 1.5579,
-    1.6382, 1.1253, 2.8251, 1.9160
+    1.6382, 1.1253, 2.8251, 1.916
 ]
 ```
 
@@ -389,6 +600,136 @@ For an input image of size H × W:
 
 - **Latent Size**: (H/8) × (W/8) × 16
 - **Example** (1664×928 image): 208 × 116 × 16 = 386,048 latent values
+
+### Layered VAE Variant
+
+The Qwen-Image-Layered model uses a **modified VAE** with 4-channel (RGBA) input instead of the standard 3-channel (RGB) VAE. The alpha channel encodes layer transparency for compositing.
+
+| Parameter | Standard VAE | Layered VAE |
+|-----------|:-----------:|:-----------:|
+| Input Channels | 3 (RGB) | **4 (RGBA)** |
+| z_dim | 16 | 16 |
+| Architecture | Identical | Identical |
+| Latent Stats | Identical | Identical |
+| Weight File | `qwen_image_vae.safetensors` | `qwen_image_layered_vae.safetensors` |
+
+**Important**: Edit models (all versions) use the **standard 3-channel RGB VAE** — NOT a 4-channel VAE. Only the Layered variant requires the RGBA VAE.
+
+---
+
+## Variant-Specific Architecture Details
+
+### Edit-2511: `zero_cond_t`
+
+Qwen-Image-Edit-2511 introduces the `zero_cond_t = true` config flag, unique among all variants. This changes how timestep conditioning is applied to the image stream during editing:
+
+Despite the name, this is **not** "CFG unconditional" behavior. It is an **intra-sequence timestep split** used during editing, where the image stream contains concatenated tokens (target/noise tokens followed by control/appearance tokens).
+
+- **With `zero_cond_t = true`**: the model builds two timestep conditionings (`t` and `0`) and applies them to different segments of the **image-token sequence**:
+  - **Target/noise tokens** get modulation at the real diffusion timestep (`t`)
+  - **Control/appearance tokens** get modulation at a **zero timestep** (`t=0`)
+- **Text stream**: still uses the real timestep (`t`) — only the image modulation is split
+- **Purpose / Result**: treat control tokens as a "clean reference" while denoising the target tokens, reducing edit drift and improving structural stability
+
+#### Edit-2511 Improvements over Edit-2509
+
+| Improvement | Description |
+|-------------|-------------|
+| Mitigated image drift | Better preservation of original image content during editing |
+| Improved character consistency | Better identity preservation for both single and multi-person edits |
+| Integrated LoRA capabilities | Popular community LoRAs merged into base weights |
+| Enhanced industrial design | Specialized for product design, material replacement |
+| Strengthened geometric reasoning | Better spatial understanding, construction line generation |
+
+### Layered Model: Layer-Conditional Generation
+
+Qwen-Image-Layered extends the base architecture with three additional capabilities:
+
+#### `use_additional_t_cond = true`
+
+Adds a **layer-index conditioning signal** to the timestep embedding. This allows the transformer to know which layer it is currently generating (e.g., foreground, midground, background). The conditioning is a binary tensor indicating whether each output frame is an RGB image.
+
+#### `use_layer3d_rope = true`
+
+Extends the standard 2D spatial RoPE to **3D positional encoding** by adding a layer dimension:
+
+```
+Standard RoPE: [temporal=16, height=56, width=56]  → 2D spatial + batch
+Layered RoPE:  [layer_index, height, width]         → 3D with layer awareness
+```
+
+This enables the transformer to differentiate between different output layers while maintaining spatial coherence within each layer.
+
+#### RGBA Output
+
+The Layered model generates **multiple RGBA images** (configurable number of layers). Each layer includes an alpha channel for compositing:
+
+- **Layer 0**: Original/composite image (can be excluded with `--remove_first_image_from_target`)
+- **Layer 1+**: Individual decomposed layers (foreground, objects, background, etc.)
+
+The number of output layers is controlled by `--output_layers` at inference time.
+
+### Layered Pipeline Inference Differences
+
+The Layered pipeline differs from T2I and Edit in several significant ways at inference time:
+
+#### Different Shift Formula
+
+The Layered pipeline does **not** use the standard `calculate_shift()` linear interpolation. Instead, it uses a square-root formula that produces gentler shift scaling at higher resolutions:
+
+```python
+# T2I and Edit pipelines: linear interpolation
+mu = calculate_shift(image_seq_len, base_seq_len=256, max_seq_len=4096,
+                     base_shift=0.5, max_shift=1.15)
+
+# Layered pipeline: square-root scaling
+base_seqlen = 256 * 256 / 16 / 16  # = 256
+mu = (image_latents.shape[1] / base_seqlen) ** 0.5
+```
+
+For a 1328×1328 image (seq_len ≈ 6889): T2I mu ≈ 0.93, Layered mu ≈ 5.19.
+
+#### CFG Normalization is Optional
+
+| Pipeline | CFG Normalization | Default |
+|----------|:-----------------:|:-------:|
+| T2I | **Always applied** | — |
+| Edit | **Always applied** | — |
+| Layered | Optional via `cfg_normalize` | **False** |
+
+The normalization formula rescales the combined CFG prediction to match the magnitude of the conditional prediction:
+```python
+comb_pred = neg_pred + true_cfg_scale * (noise_pred - neg_pred)
+if cfg_normalize:
+    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+    noise_pred = comb_pred * (cond_norm / noise_norm)
+else:
+    noise_pred = comb_pred  # Layered default: no rescaling
+```
+
+#### Edit Pipeline Batch Size Restriction
+
+The Edit pipeline (`QwenImageEditPlusPipeline`) enforces `batch_size=1` and raises `ValueError` if a larger batch is requested. This is relevant for training-time sample generation configuration.
+
+### Model Loading in Training Pipeline
+
+The training pipeline activates variant-specific features based on `--model_version`:
+
+```python
+model = load_qwen_image_model(
+    ...
+    zero_cond_t       = (model_version == "edit-2511"),      # Only Edit-2511
+    use_additional_t_cond = (model_version == "layered"),     # Only Layered
+    use_layer3d_rope  = (model_version == "layered"),         # Only Layered
+)
+```
+
+The VAE input channels are similarly conditioned:
+
+```python
+input_channels = 4 if is_layered else 3  # RGBA only for Layered
+```
 
 ---
 
@@ -419,28 +760,133 @@ The scheduler implements flow matching with dynamic timestep shifting.
 
 ### Key Parameters
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Training Timesteps | 1000 | Discrete timestep range |
-| Base Shift | 0.5 | Shift for base sequence length |
-| Max Shift | 0.9 | Shift for max sequence length |
-| Shift Terminal | 0.02 | Terminal shift value |
-| Time Shift Type | exponential | Exponential shift curve |
-| Dynamic Shifting | true | Adapts to image resolution |
-| Base Seq Length | 256 | Reference sequence length |
-| Max Seq Length | 8192 | Maximum supported sequence |
+| Parameter | Scheduler Config | Pipeline Default | Notes |
+|-----------|:----------------:|:----------------:|-------|
+| Training Timesteps | 1000 | — | Discrete timestep range |
+| Base Shift | 0.5 | 0.5 | Shift for base sequence length |
+| Max Shift | **0.9** | **1.15** | Shift for max sequence length |
+| Shift Terminal | 0.02 | — | Terminal shift value |
+| Time Shift Type | exponential | — | Exponential shift curve |
+| Dynamic Shifting | true | — | Adapts to image resolution |
+| Base Seq Length | 256 | 256 | Reference sequence length |
+| Max Seq Length | **8192** | **4096** | Maximum supported sequence |
+
+**Important**: The scheduler config and pipeline `calculate_shift()` defaults differ for `max_shift` and `max_seq_len`. At inference time, the pipeline reads from the scheduler config with its own defaults as fallbacks:
+```python
+mu = calculate_shift(
+    image_seq_len,
+    self.scheduler.config.get("base_image_seq_len", 256),
+    self.scheduler.config.get("max_image_seq_len", 4096),   # fallback if missing
+    self.scheduler.config.get("base_shift", 0.5),
+    self.scheduler.config.get("max_shift", 1.15),            # fallback if missing
+)
+```
+
+Since the official scheduler config **does** include these values, inference uses the scheduler config values (0.9 / 8192). The pipeline defaults (1.15 / 4096) only apply if the scheduler config lacks these keys.
 
 ### Dynamic Shift Formula
 
-The scheduler adjusts the noise schedule based on image resolution:
+The scheduler adjusts the noise schedule based on image resolution via **linear interpolation** between `(base_seq_len, base_shift)` and `(max_seq_len, max_shift)`:
 
 ```python
-# Simplified dynamic shift calculation
-image_seq_len = (height // 8 // patch_size) * (width // 8 // patch_size)
-shift = base_shift + (max_shift - base_shift) * (image_seq_len / max_image_seq_len)
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
 ```
 
-This ensures consistent training dynamics across different resolutions.
+Where `image_seq_len = (height // 8 // patch_size) * (width // 8 // patch_size)`. The returned `mu` is passed to the scheduler's `set_timesteps()` to shift the noise schedule.
+
+**Layered Pipeline Uses a Different Formula**: The Layered pipeline does NOT use `calculate_shift()`. Instead it computes mu via a square-root formula (see [Layered Pipeline Inference Differences](#layered-pipeline-inference-differences) below).
+
+---
+
+## Flow Matching Training Details
+
+Qwen-Image uses a **Rectified Flow** formulation for flow matching training. Understanding these details aids in configuring timestep sampling and loss computation.
+
+### Core Formulation
+
+Given a training image `x₀` encoded by the VAE as `z = E(x₀)`, and random noise `x₁ ~ N(0, I)`:
+
+```
+Intermediate latent:  x_t = t·x₀ + (1-t)·x₁
+Target velocity:      v_t = dx_t/dt = x₀ - x₁
+Training loss:        L = E[‖v_θ(x_t, t, h) - v_t‖²]
+```
+
+Where `h = ϕ(S)` is the conditioning from the Qwen2.5-VL text encoder, and `t ∈ [0, 1]`.
+
+### Timestep Sampling
+
+Timesteps are sampled from a **logit-normal distribution** (not uniform). This concentrates more training signal in the middle timesteps where the model learns the most:
+
+```
+t ~ LogitNormal(μ, σ²)    where t ∈ [0, 1]
+```
+
+In the blissful-tuner training pipeline, this corresponds to `--timestep_sampling shift` with `--discrete_flow_shift` controlling the shift parameter.
+
+### Normalization Layers
+
+The transformer uses:
+- **RMSNorm** for QK-Norm (query-key normalization in attention)
+- **LayerNorm** for all other normalization layers
+- **Scale & Shift modulation** conditioned on timestep throughout all blocks
+
+### Official Inference Parameters
+
+The official Qwen-Image examples use these defaults:
+
+| Parameter | T2I (Original/2512) | Edit (Original) | Edit-2509/2511 |
+|-----------|:-------------------:|:---------------:|:--------------:|
+| `num_inference_steps` | 50 | 50 | **40** |
+| `true_cfg_scale` | 4.0 | 4.0 | 4.0 |
+| `guidance_scale` | N/A | N/A | **1.0** |
+| `negative_prompt` | " " or detailed | " " | " " |
+
+**Important**: Edit-2509/2511 uses `guidance_scale=1.0` (disabling standard CFG) combined with `true_cfg_scale=4.0` (enabling true CFG with a separate unconditional forward pass). This dual-parameter approach is different from T2I, which only uses `true_cfg_scale`.
+
+---
+
+## Progressive Curriculum Learning
+
+Qwen-Image was trained using a 7-stage progressive curriculum. Understanding these stages provides context for training strategy decisions:
+
+### Training Stages
+
+| Stage | Resolution | Focus | Key Filters |
+|-------|-----------|-------|-------------|
+| 1 | 256×256 | Initial pre-training | Broken files, dedup, NSFW, min resolution |
+| 2 | 256×256 | Image quality | Rotation, clarity, luma, saturation, entropy, texture |
+| 3 | 256×256 | Image-text alignment | CLIP/SigLIP scoring, caption quality, recaptioning |
+| 4 | 256×256 | Text rendering | Synthetic text data (3 strategies), intensive text filter |
+| 5 | 640×640 | High-resolution | Quality, resolution, aesthetic, watermark filters |
+| 6 | 640×640 | Category balance | Portrait augmentation, domain resampling |
+| 7 | 640→1328 | Multi-scale | Hierarchical taxonomy, balanced multi-resolution |
+
+### Data Distribution
+
+The training data is distributed across four primary domains:
+- **Nature** (~55%): Objects, landscapes, cityscapes, plants, animals, indoor, food
+- **Design** (~27%): Posters, UIs, slides, paintings, sculptures, digital arts
+- **People** (~13%): Portraits, sports, activities
+- **Synthetic** (~5%): Controlled text rendering (not AI-generated images)
+
+### Text Rendering Data Synthesis
+
+Three synthesis strategies address the long-tail distribution of textual content:
+
+1. **Pure Rendering**: Text paragraphs rendered on clean backgrounds with dynamic layout
+2. **Compositional Rendering**: Synthetic text composited into realistic scenes (paper, boards, etc.)
+3. **Complex Rendering**: Pre-defined templates (PowerPoint slides, UI mockups) with placeholder text substitution
 
 ---
 
@@ -459,6 +905,8 @@ The model is trained on specific aspect ratios for optimal quality:
 | 2:3 | 1056 × 1584 | 132 × 198 | 6534 |
 
 **Note**: Sequence length = (latent_h / patch_size) × (latent_w / patch_size) where patch_size=2
+
+**Resolution Ambiguity**: The official repo is inconsistent for the 4:3 and 3:4 aspect ratios. The Qwen-Image-2512 README uses 1472×1104 / 1104×1472, while the original Qwen-Image demo scripts use 1472×1140 / 1140×1472. The values above match the 2512 README.
 
 ---
 
@@ -486,7 +934,21 @@ For fine-tuning with LoRA, the following module patterns are typically targeted:
 "transformer_blocks.*.txt_mlp.net.2"
 ```
 
-### Text Encoder Targets (Optional)
+### Diffusers Default LoRA Targets (Comparison)
+
+The official diffusers DreamBooth training script uses a more conservative default — **attention-only**, without FFN layers:
+
+```python
+# Official diffusers default (train_dreambooth_lora_qwen_image.py):
+["to_q", "to_k", "to_v", "to_out.0"]
+# Default rank=4, alpha=4, dropout=0.0
+```
+
+The blissful-tuner pipeline targets **both attention and FFN** modules (as listed above), which allows for greater expressiveness but requires more VRAM. Use the diffusers defaults as a conservative starting point, and the full target list for maximum quality.
+
+**Text Encoder LoRA**: Not supported in diffusers (`supports_text_encoder_loras = False` in `QwenImageLoraLoaderMixin`). The blissful-tuner pipeline supports text encoder LoRA through its own implementation.
+
+### Text Encoder Targets (Optional, Blissful-Tuner Only)
 
 ```python
 # Self-attention
@@ -505,9 +967,13 @@ For fine-tuning with LoRA, the following module patterns are typically targeted:
 
 ## Prompt Enhancement System
 
-Qwen-Image uses a sophisticated prompt rewriting system to improve generation quality:
+Qwen-Image uses a sophisticated prompt rewriting system to improve generation quality. There are **two versions** of the system:
 
-### Language Detection
+### Version 1: Original (`prompt_utils.py`)
+
+Used with the original Qwen-Image model. Uses the **Qwen-Plus** API (DashScope) for rewriting.
+
+#### Language Detection
 
 ```python
 # Detects CJK characters to determine language
@@ -516,7 +982,7 @@ if any('\u4e00' <= char <= '\u9fff' for char in prompt):
 return 'en'  # English
 ```
 
-### Rewriting Categories
+#### Rewriting Categories
 
 The prompt enhancer classifies prompts into three categories:
 
@@ -524,12 +990,40 @@ The prompt enhancer classifies prompts into three categories:
 2. **Text-Containing Images**: Images with visible text (signs, labels, UI)
 3. **General Images**: Landscapes, objects, abstract compositions
 
+#### Magic Suffix (Original Only)
+
+- **Chinese**: Appends "超清，4K，电影级构图"
+- **English**: Appends "Ultra HD, 4K, cinematic composition"
+
+### Version 2: Updated for 2512 (`prompt_utils_2512.py`)
+
+Dramatically more sophisticated (~6000 word system prompt). Key differences from v1:
+
+- **No magic suffix** — the "Ultra HD, 4K" suffix is **not appended** for Qwen-Image-2512
+- **Portrait subtask** now demands: ethnicity, gender, specific age, face shape, eye shape/color, nose type, skin tone/texture, detailed makeup (eyeshadow, eyeliner, eyelashes, eyebrow shape, lipstick, blush, highlight), clothing with materials, hairstyle details, pose breakdown (~200 words target)
+- **Text-containing subtask** requires: exact text transcription with punctuation, font style, color, layout direction, and for infographics, explicit text content (rejects vague descriptions like "a list")
+- **General subtask** covers: spatial layering (foreground/midground/background), surface textures, dynamic interactions, time/weather, emotional tone
+
+### Edit Prompt Enhancement
+
+For editing tasks, a separate system uses **Qwen-VL-Max** (vision-language model) to rewrite prompts with image context. This is fundamentally different — it sends both the prompt AND the reference image to the API.
+
+Six task-type-specific handling rules:
+1. **Add/Delete/Replace**: Supplements vague instructions with specific details (color, size, position)
+2. **Text Editing**: All text in double quotes, preserves original language/capitalization
+3. **Human (ID) Editing**: Maintains visual consistency (ethnicity, gender, age, hairstyle, expression)
+4. **Style Conversion**: Describes style with key visual features; fixed colorization template
+5. **Content Filling**: Fixed inpainting/outpainting templates
+6. **Multi-Image**: Clearly identifies which image's element is modified
+
+**Warning**: The official documentation states that editing results may become **unstable without prompt rewriting**. Prompt rewriting is strongly recommended for all Edit tasks.
+
 ### Recommended Prompting
 
-- **For Chinese prompts**: Add "超清，4K，电影级构图"
-- **For English prompts**: Add "Ultra HD, 4K, cinematic composition"
 - **Text in images**: Wrap displayed text in quotation marks ("text here")
-- **Negative prompt**: "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感"
+- **Negative prompt (2512 full version)**: "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲。"
+- **Negative prompt (English equivalent)**: "Low resolution, low quality, deformed limbs, deformed fingers, oversaturated, wax-like, faceless detail, overly smooth, AI-generated look. Chaotic composition. Blurry, distorted text."
+- **Edit models**: Negative prompt should be a single space `" "` (hardcoded in official demos)
 
 ---
 
@@ -550,7 +1044,7 @@ For Qwen-Image training, use flow matching with shift:
 
 ```bash
 --timestep_sampling shift
---discrete_flow_shift 3.0  # Typical value, adjust as needed
+--discrete_flow_shift 2.2  # Low relative to other architectures; ~2.2 for 1328x1328
 ```
 
 ### Batch Accumulation
@@ -572,9 +1066,9 @@ The following insights are extracted from the official Qwen-Image Technical Repo
 
 The Multi-Scale Rotary Position Embedding design serves a critical purpose beyond standard 2D position encoding:
 
-**Text Token Positioning**: Text tokens from the T5-based text encoder are positioned along the diagonal of the image grid rather than prepended or appended. This design:
+**Text Token Positioning**: Text tokens from the Qwen2.5-VL text encoder are positioned along the diagonal of the image grid rather than prepended or appended. This design:
 
-1. Preserves the gradual positional encoding from the T5 encoder
+1. Preserves the gradual positional encoding from the Qwen2.5-VL encoder
 2. Allows smooth interpolation between text and image positions
 3. Enables better handling of long text sequences for text rendering tasks
 4. The axes `[16, 56, 56]` allocate 16 dims for temporal/text position and 56 dims each for spatial height/width
@@ -635,21 +1129,43 @@ For image editing (TI2I), the model uses a **frame dimension extension** mechani
 
 ### Post-Training Methods
 
-After base training, Qwen-Image undergoes additional fine-tuning stages:
+After base training, Qwen-Image undergoes three additional fine-tuning stages:
 
 #### 1. SFT (Supervised Fine-Tuning)
-Fine-tuning on high-quality curated datasets for specific capabilities like text rendering and image editing.
+Fine-tuning on hierarchically organized, human-annotated high-quality datasets. Selection criteria: clear, rich detail, bright, photorealistic images. Guides the model toward greater realism and finer details.
 
 #### 2. DPO (Direct Preference Optimization)
+
+Adapted for flow matching (not the standard LLM DPO formulation). Large-scale offline preference learning:
+
+**Data preparation**: Multiple images generated per prompt with different seeds. Human annotators select best/worst. For prompts with reference images, the worst is rejected if it deviates significantly.
+
+**Flow-matching DPO loss**:
 ```
-L_DPO = -log σ(β(log π(y_w|x) - log π(y_l|x)))
+Diff_policy = ‖v_θ(x_win_t, h, t) - v_win_t‖² - ‖v_θ(x_lose_t, h, t) - v_lose_t‖²
+Diff_ref    = ‖v_ref(x_win_t, h, t) - v_win_t‖² - ‖v_ref(x_lose_t, h, t) - v_lose_t‖²
+L_DPO       = -E[log σ(-β(Diff_policy - Diff_ref))]
 ```
-Where `y_w` and `y_l` are preferred and rejected generations respectively.
+
+Where `v_θ` is the policy model's velocity prediction, `v_ref` is the reference model's, and β is a scaling parameter. This operates on velocity predictions rather than token probabilities.
 
 #### 3. GRPO (Group Relative Policy Optimization)
-A variant of PPO adapted for diffusion models, using group-based reward normalization:
+
+Small-scale fine-grained RL refinement after DPO. Uses Flow-GRPO framework:
+
+**Algorithm**: Generate group G of images `{x_i_0}` with trajectories. Compute group-normalized advantages:
 ```
-L_GRPO = -E[r(y) · log π(y|x)] + β · KL(π || π_ref)
+A_i = [R(x_i_0, h) - mean(R)] / std(R)
+```
+
+**Flow-GRPO loss**:
+```
+L_GRPO = E[1/G Σ_i 1/T Σ_t min(r_i_t(θ)·A_i, clip(r_i_t(θ), 1-ε, 1+ε)·A_i) - β·D_KL(π_θ ‖ π_ref)]
+```
+
+Where `r_i_t(θ)` is the importance ratio and the KL-divergence has a closed form:
+```
+D_KL = Δt/2 · [σ_t(1-t)/2t + 1/σ_t² · ‖v_θ - v_ref‖²]
 ```
 
 **Impact**: RL fine-tuning improves GenEval benchmark score from **0.87 → 0.91**, making Qwen-Image the first foundation model to exceed 0.9 on this benchmark.
@@ -759,16 +1275,47 @@ Subject + Scene + Style + Camera Language + Atmosphere + Detail
 
 ## Version History
 
-| Version | Date | Changes |
-|---------|------|---------|
-| Qwen-Image | 2025-08-04 | Initial release |
-| Qwen-Image-2512 | 2025-12-31 | Improved realism, textures, text rendering |
+| Version | Date | Pipeline Class | Key Changes |
+|---------|------|----------------|-------------|
+| Qwen-Image | 2025-08-04 | `QwenImagePipeline` | Initial T2I release, 60-layer MMDiT, Qwen2.5-VL text encoder |
+| Qwen-Image-Edit | 2025-08-04 | `QwenImageEditPipeline` | Single-image editing with dual-path conditioning |
+| Qwen-Image-Edit-2509 | 2025-09 | `QwenImageEditPlusPipeline` | Multi-image input, ControlNet support, improved consistency |
+| Qwen-Image-Edit-2511 | 2025-11 | `QwenImageEditPlusPipeline` | `zero_cond_t`, reduced drift, integrated LoRAs, geometric reasoning |
+| Qwen-Image-2512 | 2025-12-31 | `QwenImagePipeline` | Improved realism, textures, text rendering, fine detail |
+| Qwen-Image-Layered | 2025-12 | `QwenImageLayeredPipeline` | RGBA layer decomposition, 3D RoPE, layer-index conditioning |
+
+---
+
+## Additional Pipeline Variants (Diffusers)
+
+Beyond the three core pipelines documented above, the HuggingFace diffusers library implements several additional Qwen-Image pipeline variants. These are listed here for reference even though the blissful-tuner training pipeline does not directly use them:
+
+| Pipeline Class | Purpose | Notes |
+|---------------|---------|-------|
+| `QwenImagePipeline` | Text-to-image generation | Core T2I pipeline |
+| `QwenImageEditPipeline` | Single-image editing | Original edit variant |
+| `QwenImageEditPlusPipeline` | Multi-image editing (2509/2511) | Enhanced edit with `zero_cond_t` |
+| `QwenImageLayeredPipeline` | RGBA layer decomposition | 3D RoPE, layer-index conditioning |
+| `QwenImageImg2ImgPipeline` | Image-to-image | Init from existing image |
+| `QwenImageInpaintPipeline` | Inpainting | Mask-guided generation |
+| `QwenImageControlNetPipeline` | ControlNet-guided generation | Uses `QwenImageControlNetModel` |
+| `QwenImageControlNetInpaintPipeline` | ControlNet + inpainting | Combined control |
+| `QwenImageEditInpaintPipeline` | Edit + inpainting | Combined edit + mask |
+| `ReduxImageEncoder` | Image encoding helper | Used by some pipelines |
+
+Additionally, diffusers provides **modular pipeline** variants under `modular_pipelines/qwenimage/` that decompose the pipeline into reusable blocks (encoders, decoders, denoising, prompt handling).
 
 ---
 
 ## References
 
-- [Qwen-Image HuggingFace](https://huggingface.co/Qwen/Qwen-Image-2512)
-- [Qwen-Image Technical Report](https://arxiv.org/abs/2508.02324)
+- [Qwen-Image-2512 HuggingFace](https://huggingface.co/Qwen/Qwen-Image-2512)
+- [Qwen-Image-Edit-2511 HuggingFace](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
+- [Qwen-Image-Layered HuggingFace](https://huggingface.co/Qwen/Qwen-Image-Layered)
+- [Qwen-Image Technical Report (arXiv 2508.02324)](https://arxiv.org/abs/2508.02324)
+- [Qwen-Image-Layered Technical Report (arXiv 2512.15603)](https://arxiv.org/abs/2512.15603)
 - [Qwen-Image Blog](https://qwenlm.github.io/blog/qwen-image/)
 - [Diffusers Documentation](https://huggingface.co/docs/diffusers)
+- [Comfy-Org Qwen-Image Weights](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)
+- [Comfy-Org Qwen-Image-Edit Weights](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)
+- [Comfy-Org Qwen-Image-Layered Weights](https://huggingface.co/Comfy-Org/Qwen-Image-Layered_ComfyUI)
