@@ -4,7 +4,12 @@ import unittest
 
 import torch
 
-from musubi_tuner.convert_lora import _normalize_module_name, _resolve_arch_from_metadata, convert_from_diffusers, convert_to_diffusers
+from musubi_tuner.convert_lora import (
+    _normalize_module_name,
+    _resolve_arch_from_metadata,
+    convert_from_diffusers,
+    convert_to_diffusers,
+)
 
 
 class TestNormalizeModuleName(unittest.TestCase):

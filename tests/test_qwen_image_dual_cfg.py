@@ -27,14 +27,38 @@ class TestQwenImageDualCfg(unittest.TestCase):
 
     def test_guidance_scale_override_sets_true_cfg_when_true_cfg_not_provided(self):
         args = self._parse(
-            ["prog", "--model_version", "edit-2509", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--guidance_scale", "7"]
+            [
+                "prog",
+                "--model_version",
+                "edit-2509",
+                "--text_encoder",
+                "x",
+                "--save_path",
+                "x",
+                "--prompt",
+                "x",
+                "--guidance_scale",
+                "7",
+            ]
         )
         self.assertEqual(args.guidance_scale, 7.0)
         self.assertEqual(args.true_cfg_scale, 7.0)
 
     def test_true_cfg_scale_override_keeps_edit_guidance_default(self):
         args = self._parse(
-            ["prog", "--model_version", "edit-2509", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--true_cfg_scale", "6"]
+            [
+                "prog",
+                "--model_version",
+                "edit-2509",
+                "--text_encoder",
+                "x",
+                "--save_path",
+                "x",
+                "--prompt",
+                "x",
+                "--true_cfg_scale",
+                "6",
+            ]
         )
         self.assertEqual(args.guidance_scale, 1.0)
         self.assertEqual(args.true_cfg_scale, 6.0)
@@ -56,4 +80,3 @@ class TestQwenImageDualCfg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

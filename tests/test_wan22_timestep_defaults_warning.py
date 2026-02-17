@@ -60,4 +60,3 @@ class TestWan22TimestepDefaultsWarning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -142,7 +142,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
                     logger.info(f"cache Text Encoder outputs for prompt: {p}")
                     ctx_vec = text_embedder([p]).to(torch.bfloat16).cpu()  # [1, 512, 15360]
-                    flux2_utils.validate_ctx_vec_dim(ctx_vec, model_version_info, source="Flux2NetworkTrainer.process_sample_prompts()")
+                    flux2_utils.validate_ctx_vec_dim(
+                        ctx_vec, model_version_info, source="Flux2NetworkTrainer.process_sample_prompts()"
+                    )
 
                     # save prompt cache
                     sample_prompts_te_outputs[p] = ctx_vec

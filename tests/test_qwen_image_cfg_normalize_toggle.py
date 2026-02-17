@@ -26,7 +26,18 @@ class TestQwenImageCfgNormalizeToggle(unittest.TestCase):
 
     def test_cfg_normalize_can_be_forced_off_for_non_layered(self):
         args = self._parse(
-            ["prog", "--model_version", "original", "--no_cfg_normalize", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"]
+            [
+                "prog",
+                "--model_version",
+                "original",
+                "--no_cfg_normalize",
+                "--text_encoder",
+                "x",
+                "--save_path",
+                "x",
+                "--prompt",
+                "x",
+            ]
         )
         self.assertFalse(args.cfg_normalize)
 
@@ -45,4 +56,3 @@ class TestQwenImageCfgNormalizeToggle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

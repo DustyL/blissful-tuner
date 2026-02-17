@@ -80,4 +80,3 @@ def test_qwen3_embedder_accepts_single_string():
     out = embedder("a")
     assert out.shape == (1, 3, 6)
     assert len(tok.calls) == 1
-

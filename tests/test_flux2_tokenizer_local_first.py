@@ -58,4 +58,3 @@ def test_load_qwen2_tokenizer_local_first_skips_local_attempt_for_non_dir_path()
 
     assert tok is sentinel
     assert patched.call_args_list[0].args[0] == tokenizer_id
-

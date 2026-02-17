@@ -44,14 +44,18 @@ class TestQwenImageEmbedsCacheKey(unittest.TestCase):
         ) as mocked:
             args_edit = self._parse(["prog", "--model_version", "edit", "--text_encoder", "x", "--save_path", "x", "--prompt", "A"])
             args_edit.control_image_path = ["a.png"]
-            qwen_image_generate_image.prepare_text_inputs(args_edit, images, device=torch.device("cpu"), shared_models=shared_models)
+            qwen_image_generate_image.prepare_text_inputs(
+                args_edit, images, device=torch.device("cpu"), shared_models=shared_models
+            )
             self.assertEqual(len(shared_models["conds_cache"]), 2)
 
             args_2511 = self._parse(
                 ["prog", "--model_version", "edit-2511", "--text_encoder", "x", "--save_path", "x", "--prompt", "A"]
             )
             args_2511.control_image_path = ["a.png"]
-            qwen_image_generate_image.prepare_text_inputs(args_2511, images, device=torch.device("cpu"), shared_models=shared_models)
+            qwen_image_generate_image.prepare_text_inputs(
+                args_2511, images, device=torch.device("cpu"), shared_models=shared_models
+            )
             self.assertEqual(len(shared_models["conds_cache"]), 4)
             self.assertEqual(mocked.call_count, 4)
 
@@ -74,9 +78,13 @@ class TestQwenImageEmbedsCacheKey(unittest.TestCase):
             "get_qwen_prompt_embeds_with_image",
             side_effect=fake_get_embeds_with_image,
         ) as mocked:
-            args_default = self._parse(["prog", "--model_version", "edit", "--text_encoder", "x", "--save_path", "x", "--prompt", "A"])
+            args_default = self._parse(
+                ["prog", "--model_version", "edit", "--text_encoder", "x", "--save_path", "x", "--prompt", "A"]
+            )
             args_default.control_image_path = ["a.png"]
-            qwen_image_generate_image.prepare_text_inputs(args_default, images, device=torch.device("cpu"), shared_models=shared_models)
+            qwen_image_generate_image.prepare_text_inputs(
+                args_default, images, device=torch.device("cpu"), shared_models=shared_models
+            )
             self.assertEqual(len(shared_models["conds_cache"]), 2)
 
             args_resize = self._parse(
@@ -94,11 +102,12 @@ class TestQwenImageEmbedsCacheKey(unittest.TestCase):
                 ]
             )
             args_resize.control_image_path = ["a.png"]
-            qwen_image_generate_image.prepare_text_inputs(args_resize, images, device=torch.device("cpu"), shared_models=shared_models)
+            qwen_image_generate_image.prepare_text_inputs(
+                args_resize, images, device=torch.device("cpu"), shared_models=shared_models
+            )
             self.assertEqual(len(shared_models["conds_cache"]), 4)
             self.assertEqual(mocked.call_count, 4)
 
 
 if __name__ == "__main__":
     unittest.main()
-

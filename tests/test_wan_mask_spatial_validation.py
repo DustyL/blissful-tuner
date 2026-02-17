@@ -19,9 +19,7 @@ class _DummyWanVAE:
         lat_h = max(1, height // 8)
         lat_w = max(1, width // 8)
         lat_f = max(1, (frames - 1) // 4 + 1)
-        return [
-            torch.zeros(16, lat_f, lat_h, lat_w, device=self.device, dtype=self.dtype) for _ in range(bsize)
-        ]
+        return [torch.zeros(16, lat_f, lat_h, lat_w, device=self.device, dtype=self.dtype) for _ in range(bsize)]
 
 
 class TestWanMaskSpatialValidation(unittest.TestCase):
@@ -72,4 +70,3 @@ class TestWanMaskSpatialValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
