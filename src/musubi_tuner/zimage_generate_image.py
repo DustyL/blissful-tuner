@@ -30,6 +30,8 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, setup_parser_compile, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
 
+from blissful_tuner.latent_preview import LatentPreviewer
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -163,6 +165,15 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="Shift factor for flow matching schedulers. Default is 3.0.",
     )
+    parser.add_argument(
+        "--dynamic_shift",
+        action="store_true",
+        help=(
+            "Auto-compute flow_shift from resolution using FLUX-style linear interpolation "
+            f"(maps image seq len [{zimage_config.BASE_IMAGE_SEQ_LEN}, {zimage_config.MAX_IMAGE_SEQ_LEN}] "
+            f"to shift [{zimage_config.BASE_SHIFT}, {zimage_config.MAX_SHIFT}]). Overrides --flow_shift."
+        ),
+    )
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
@@ -198,6 +209,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
+
+    # Blissful: latent preview during denoising
+    parser.add_argument(
+        "--preview_latent_every",
+        type=int,
+        default=None,
+        help="Enable latent preview every N steps. If --preview_vae is not specified it will use latent2rgb",
+    )
+    parser.add_argument("--preview_vae", type=str, default=None, help="Path to TAE vae for previews")
+
     add_lycoris_arg(parser)
     setup_parser_compile(parser)
 
@@ -665,6 +686,10 @@ def generate(
     latents = torch.randn(shape, generator=seed_g, device="cpu" if args.cpu_noise else device, dtype=torch.float32).to(device)
     image_sequence_length = (height_latent // model.all_patch_size[0]) * (width_latent // model.all_patch_size[0])
 
+    preview_original_latents = None
+    if args.preview_latent_every:
+        preview_original_latents = latents.detach().clone()
+
     # The batch size is 1, so we can trim embeds as the length of the prompt
     embed, _ = zimage_utils.trim_pad_embeds_and_mask(image_sequence_length, embed, mask)
     mask = None  # No attention mask needed after trimming
@@ -674,9 +699,28 @@ def generate(
 
     # 5. Prepare timesteps
     num_inference_steps = args.infer_steps
-    timesteps, sigmas = zimage_utils.get_timesteps_sigmas(num_inference_steps, args.flow_shift)
+    flow_shift = args.flow_shift
+    if args.dynamic_shift:
+        flow_shift = zimage_utils.compute_dynamic_shift(image_sequence_length)
+        logger.info(f"Dynamic shift: image_seq_len={image_sequence_length} -> flow_shift={flow_shift:.4f}")
+
+    timesteps, sigmas = zimage_utils.get_timesteps_sigmas(num_inference_steps, flow_shift)
     timesteps = timesteps.to(device)
     sigmas = sigmas.to(device)
+
+    previewer = None
+    if args.preview_latent_every:
+        os.makedirs(args.save_path, exist_ok=True)
+        preview_dtype = torch.float16 if device.type == "cuda" else torch.float32
+        previewer = LatentPreviewer(
+            args,
+            preview_original_latents,
+            scheduler=None,
+            device=device,
+            dtype=preview_dtype,
+            model_type="flux",
+        )
+        previewer.sigmas = sigmas
 
     # 6. Denoising loop
     do_cfg = args.guidance_scale > 1.0  # 0 for no CFG
@@ -718,6 +762,9 @@ def generate(
 
             noise_pred = -noise_pred.squeeze(2)  # Remove frame dimension and invert sign (because z-image predicts negative noise)
             latents = zimage_utils.step(noise_pred.to(torch.float32), latents, sigmas, i)
+
+            if previewer is not None and (i + 1) % args.preview_latent_every == 0:
+                previewer.preview(latents, i + 1)
 
             pbar.update(1)
 
