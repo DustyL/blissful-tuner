@@ -279,6 +279,18 @@ def trim_pad_embeds_and_mask(
     return prompt_embeds, prompt_masks
 
 
+def compute_dynamic_shift(image_seq_len: int) -> float:
+    """Compute resolution-dependent flow shift using FLUX-style linear interpolation.
+
+    Maps image_seq_len linearly from [BASE_IMAGE_SEQ_LEN, MAX_IMAGE_SEQ_LEN] to [BASE_SHIFT, MAX_SHIFT].
+    Values outside the range are clamped.
+    """
+    mu = (zimage_config.MAX_SHIFT - zimage_config.BASE_SHIFT) / (
+        zimage_config.MAX_IMAGE_SEQ_LEN - zimage_config.BASE_IMAGE_SEQ_LEN
+    ) * (image_seq_len - zimage_config.BASE_IMAGE_SEQ_LEN) + zimage_config.BASE_SHIFT
+    return max(zimage_config.BASE_SHIFT, min(zimage_config.MAX_SHIFT, mu))
+
+
 def get_timesteps_sigmas(num_inference_steps: int, shift: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Retrieve timesteps based on Z-Image's sigma schedule with shift."""
     num_train_timesteps = zimage_config.DEFAULT_SCHEDULER_NUM_TRAIN_TIMESTEPS
