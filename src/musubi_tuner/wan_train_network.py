@@ -124,6 +124,15 @@ class WanNetworkTrainer(NetworkTrainer):
                     "The rejection sampling loop conflicts with bucketed timestep distribution, "
                     "producing heavily skewed effective sampling. Remove --num_timestep_buckets."
                 )
+            # TP-04: Warn about mixed-expert gradients with gradient accumulation.
+            grad_accum = getattr(args, "gradient_accumulation_steps", 1) or 1
+            if grad_accum > 1:
+                logger.warning(
+                    f"gradient_accumulation_steps={grad_accum} with dual-expert training: "
+                    "micro-batches within one accumulation group may use different experts, "
+                    "producing mixed-expert gradient steps. This is supported but may increase "
+                    "training noise. Consider batch_size>1 instead if possible."
+                )
 
         self.timestep_boundary = (
             args.timestep_boundary if args.timestep_boundary is not None else self.config.boundary
@@ -540,6 +549,22 @@ class WanNetworkTrainer(NetworkTrainer):
         )
         # if args.force_v2_1_time_embedding:
         #    model.set_time_embedding_v2_1(True)
+
+        # TP-03: Post-FP8 validation — verify norm/modulation params were NOT quantized.
+        # FP8 exclude keys use substring matching ("norm" in key), which should cover WanRMSNorm
+        # and WanLayerNorm. This check is a safety net against model changes that rename layers.
+        if args.fp8_base:
+            fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+            bad_params = []
+            for name, param in model.named_parameters():
+                if any(kw in name for kw in ("norm", "modulation")) and param.dtype in fp8_dtypes:
+                    bad_params.append(f"  {name}: {param.dtype}")
+            if bad_params:
+                raise ValueError(
+                    f"FP8 quantization incorrectly applied to {len(bad_params)} norm/modulation parameter(s):\n"
+                    + "\n".join(bad_params[:10])
+                    + ("\n  ..." if len(bad_params) > 10 else "")
+                )
 
         if self.high_low_training:
             # load high noise model

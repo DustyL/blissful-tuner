@@ -160,7 +160,7 @@ def save_text_encoder_output_cache(item_info, embed, mask, is_llm):
 
 **Impact**: Not a correctness bug (lengths can be inferred from variable-length tensor shapes), but an efficiency and consistency gap. If the training loop ever needs explicit masks (e.g., for cross-attention mask optimization), they'd need to be reconstructed.
 
-**Suggested Fix**: Optionally save `context_len` as an integer tensor alongside the embedding.
+**Status**: BY DESIGN — WAN cross-attention uses `k_lens=None` (in `WanModel.forward` and `wan_attention`), meaning zero-padded tokens participate in attention unmasked. This is intentional per the upstream WAN implementation. Saving `context_len` would be a no-op without also changing the cross-attention code to use it, which would alter model behavior. The variable-length T5 embeddings are already stored without padding waste via the `varlen_t5` key format.
 
 ---
 
@@ -299,7 +299,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: If FP8 accidentally quantizes norms, training diverges with NaN gradients.
 
-**Suggested Fix**: Add a validation step after FP8 application to verify no norm/modulation parameter was quantized.
+**Fix**: Added post-FP8 validation in `load_transformer()` that iterates `named_parameters()` after model loading and raises `ValueError` if any parameter containing "norm" or "modulation" in its name has an FP8 dtype. Catches issues at model load time before training begins.
 
 ---
 
@@ -313,7 +313,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: Rare (requires batch to straddle boundary), but could cause training instability with large accumulation steps.
 
-**Suggested Fix**: Document limitation: "gradient accumulation > 1 with dual-expert is supported but may produce mixed-expert gradient steps." Or detect and log when accumulation spans an expert swap.
+**Fix**: Added warning in `handle_model_specific_args()` when `gradient_accumulation_steps > 1` with dual-expert training. Warns that micro-batches may use different experts, producing mixed-expert gradient steps. Suggests using `batch_size > 1` instead if possible.
 
 ---
 
@@ -327,7 +327,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: Untested combinations may cause weight misalignment or silent corruption.
 
-**Suggested Fix**: Add integration test for `--blocks_to_swap N --dit_high_noise`. Log expert swap events with block device info.
+**Fix**: Added `tests/test_wan_expert_swap.py` with 5 tests: round-trip swap preserves weights, swap respects `strict=True` key mismatch, torch.compile key patching, TP-14 structure validation, and swap is a true exchange (not copy). Uses lightweight mock state dicts to test the swap logic without loading full models.
 
 ---
 
@@ -633,12 +633,12 @@ synchronize_device(device)
 | LC-02 | MEDIUM | 1 | Latent Cache | I2V mask construction undocumented, misleading shape comment at line 77 | FIXED (via LC-06) |
 | LC-03 | MEDIUM | 1 | Latent Cache | CLIP/WAN version confusion — no guard against `--clip` with WAN 2.2 A14B tasks | FIXED |
 | LC-04 | MEDIUM | 1 | Latent Cache | Missing mask spatial dimension validation — silent failure on mismatched masks | FIXED |
-| TC-01 | MEDIUM | 1 | Text Cache | No attention mask / context_len saved in WAN text cache (unlike HV) | OPEN |
+| TC-01 | MEDIUM | 1 | Text Cache | No attention mask / context_len saved in WAN text cache (unlike HV) | BY DESIGN |
 | TP-01 | MEDIUM | 2 | Training | Timestep bucketing should error with dual-expert, not warn | FIXED |
 | TP-02 | MEDIUM | 2 | Training | Rejection sampling for dual-expert timesteps is wasteful | TRIAGED (documented) |
-| TP-03 | MEDIUM | 2 | Training | FP8 norm preservation not validated for WAN 2.2 | OPEN |
-| TP-04 | MEDIUM | 2 | Training | Gradient accumulation + expert swap edge case | OPEN |
-| TP-05 | MEDIUM | 2 | Training | Block swap + dual-expert interaction undertested | OPEN |
+| TP-03 | MEDIUM | 2 | Training | FP8 norm preservation not validated for WAN 2.2 | FIXED |
+| TP-04 | MEDIUM | 2 | Training | Gradient accumulation + expert swap edge case | FIXED |
+| TP-05 | MEDIUM | 2 | Training | Block swap + dual-expert interaction undertested | FIXED |
 | GN-01 | MEDIUM | 4 | Generation | Hardcoded 5s sleep for block swap sync — fragile | FIXED |
 | TT-01 | HIGH | 6 | Tests | No WAN dual-expert training tests (critical gap) | PARTIAL (basic tests exist, block-swap gap remains) |
 | TT-02 | HIGH | 6 | Tests | No WAN dataset loading tests (varlen T5, batch) | FIXED |
