@@ -1000,7 +1000,11 @@ def calculate_shift_qwen_image(
 
 
 def calculate_shift(
-    image_seq_len: int, base_seq_len: int = 256, max_seq_len: int = 4096, base_shift: float = 0.5, max_shift: float = 1.15
+    image_seq_len: int,
+    base_seq_len: int = SCHEDULER_BASE_IMAGE_SEQ_LEN,
+    max_seq_len: int = SCHEDULER_MAX_IMAGE_SEQ_LEN,
+    base_shift: float = SCHEDULER_BASE_SHIFT,
+    max_shift: float = SCHEDULER_MAX_SHIFT,
 ) -> float:
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len

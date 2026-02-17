@@ -85,9 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--guidance_scale",
         type=float,
         default=4.0,
-        help=(
-            "Legacy true-CFG scale (two-pass). If --true_cfg_scale is not set, this value is used for CFG. Default is 4.0."
-        ),
+        help=("Legacy true-CFG scale (two-pass). If --true_cfg_scale is not set, this value is used for CFG. Default is 4.0."),
     )
     parser.add_argument(
         "--true_cfg_scale",
@@ -712,6 +710,11 @@ def prepare_text_inputs(
 
     if args.is_layered and args.automatic_prompt_lang_for_layered is not None and (prompt is None or prompt.strip() == ""):
         # automatic prompt generation for layered images
+        if images is None:
+            raise ValueError(
+                "--automatic_prompt_lang_for_layered requires --control_image_path "
+                "(the VL model needs an image to generate a caption from)."
+            )
         use_en = args.automatic_prompt_lang_for_layered == "en"
         prompt = qwen_image_utils.get_image_caption(vl_processor, text_encoder, images, use_en_prompt=use_en)
         logger.info(f"Generated automatic prompt for layered images: {prompt}")
@@ -791,7 +794,8 @@ def generate(
     Returns:
         tuple: (flux_models.AutoEncoder model (vae) or None, torch.Tensor generated latent)
     """
-    assert args.is_edit and args.control_image_path is not None or not args.is_edit, "Qwen-Image-Edit requires control_image_path"
+    if args.is_edit and args.control_image_path is None:
+        raise ValueError("Qwen-Image-Edit requires --control_image_path")
 
     device, dit_weight_dtype = (gen_settings.device, gen_settings.dit_weight_dtype)
     vae_instance_for_return = None
