@@ -553,19 +553,27 @@ def prepare_text_inputs(
         conds_cache[cache_key] = (embed, mask)
 
     negative_prompt = args.negative_prompt
-    if negative_prompt is not None:
-        cache_key = negative_prompt
+    should_encode_negative = negative_prompt is not None or args.guidance_scale > 1.0
+    if should_encode_negative:
+        effective_negative_prompt = "" if negative_prompt is None else negative_prompt
+        if negative_prompt is None:
+            logger.info(
+                "CFG is enabled and --negative_prompt is not provided. Encoding empty string for unconditional conditioning."
+            )
+
+        cache_key = effective_negative_prompt
         if cache_key in conds_cache:
             negative_embed, negative_mask = conds_cache[cache_key]
         else:
             move_models_to_device_if_needed()
 
-            negative_embed, negative_mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, negative_prompt)
+            negative_embed, negative_mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, effective_negative_prompt)
             negative_embed = negative_embed.cpu()
             negative_mask = negative_mask.cpu()
 
             conds_cache[cache_key] = (negative_embed, negative_mask)
     else:
+        effective_negative_prompt = None
         negative_embed = None
         negative_mask = None
 
@@ -580,7 +588,7 @@ def prepare_text_inputs(
     clean_memory_on_device(device)
 
     arg_c = {"embed": embed, "mask": mask, "prompt": prompt}
-    arg_null = {"embed": negative_embed, "mask": negative_mask, "prompt": negative_prompt}
+    arg_null = {"embed": negative_embed, "mask": negative_mask, "prompt": effective_negative_prompt}
 
     return arg_c, arg_null
 
