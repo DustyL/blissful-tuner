@@ -23,13 +23,13 @@ import importlib
 # future import break also results in a graceful skip rather than a hard module-level failure.
 _k5_skip_reason = None
 kandinsky5_generate_video = None
-if not hasattr(importlib.import_module("blissful_tuner.utils"), "ensure_dtype_form"):
-    _k5_skip_reason = "blissful_tuner.utils.ensure_dtype_form not found"
-else:
-    try:
+try:
+    if not hasattr(importlib.import_module("blissful_tuner.utils"), "ensure_dtype_form"):
+        _k5_skip_reason = "blissful_tuner.utils.ensure_dtype_form not found"
+    else:
         from musubi_tuner import kandinsky5_generate_video
-    except Exception as e:
-        _k5_skip_reason = str(e)
+except Exception as e:
+    _k5_skip_reason = f"{type(e).__name__}: {e}"
 
 
 class TestLoraMultiplierDefaults(unittest.TestCase):

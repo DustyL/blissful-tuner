@@ -544,7 +544,7 @@ These items were verified correct across all sources:
 | Qwen2Tokenizer (not Qwen3) | `zimage_utils.py` `load_qwen2_tokenizer_local_first()` | Correct tokenizer |
 | Chat template enable_thinking=True | `zimage_utils.py` `get_text_embeds()` | Matches official |
 | Max seq length 512 | `zimage_config.py` `DEFAULT_MAX_SEQUENCE_LENGTH` | Correct |
-| VAE float32 always | `zimage_autoencoder.py` `AutoencoderKL.encode/decode` | force_upcast equivalent |
+| VAE float32 always | `zimage_autoencoder.py` `load_autoencoder_kl()` `.to(torch.float32)` | force_upcast equivalent |
 | VAE latent_channels=16 | `zimage_config.py` `ZIMAGE_VAE_LATENT_CHANNELS` | Correct (not SD1.x's 4) |
 | VAE encode + decode | `zimage_autoencoder.py` `AutoencoderKL` + `load_autoencoder_kl()` | Both implemented |
 | Scaling factor 0.3611, shift 0.1159 | `zimage_config.py` `ZIMAGE_VAE_SCALING_FACTOR` / `ZIMAGE_VAE_SHIFT_FACTOR` | Matches HF config |
