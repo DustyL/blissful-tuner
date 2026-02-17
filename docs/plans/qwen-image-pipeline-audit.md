@@ -298,17 +298,24 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
 **Issue**: Uses `logging.getLogger(__name__)` instead of `BlissfulLogger(__name__, "green")`. Inconsistent log formatting.
 
 ### Test Coverage Summary [P1 — systemic gap]
-**Status**: CONFIRMED
-**Issue**: Qwen-Image has the weakest test coverage of any supported architecture despite being the most complex (3 model variants, unique CFG normalization, layered RGBA). Only 2 of 15 test files have direct Qwen-Image coverage (arch registry + unknown format rejection). Zero tests for:
-- `pack_latents`/`unpack_latents` roundtrip
-- `calculate_shift_qwen_image` vs `calculate_shift` divergent defaults
-- `resolve_model_version_args` validation
-- `call_dit` img_shapes construction (3 modes)
-- `remove_first_image_from_target` integration
-- Edit mode fallback (no control images)
-- CFG normalization formula
+**Status**: RESOLVED (tests added)
+**Issue**: Qwen-Image has the most unique architecture surface area (Edit + multi-control, Layered RGBA, CFG-norm + dual-CFG defaults). Early in the audit it was under-tested, which made regressions hard to catch.
+**Fix**: Added broad, lightweight unit tests + mock-based trainer integration tests that validate the tricky pure functions and the training-time `call_dit` shape plumbing without requiring model weights or GPUs.
 
-**Recommended new test files**: `tests/test_qwen_image_utils.py` (pure functions), `tests/test_qwen_image_training.py` (mock-based integration). See full agent report for detailed test signatures.
+**Coverage now includes**:
+- `pack_latents`/`unpack_latents` roundtrip (single-frame + layered)
+- `calculate_shift_qwen_image` endpoint correctness (base/max seq_len ↔ base/max shift)
+- `resolve_model_version_args` validation + shorthand flags
+- Trainer `call_dit` `img_shapes` construction (T2I/Edit/Layered) and `remove_first_image_from_target` integration
+
+**Key test files**:
+- `tests/test_qwen_image_utils.py` (pure functions)
+- `tests/test_qwen_image_training.py` (mock-based integration)
+- Plus focused regression tests for individual fixes:
+  - Dual-CFG defaults + prompt-line overrides: `tests/test_qwen_image_dual_cfg.py`
+  - CFG-norm epsilon + toggle: `tests/test_qwen_image_cfg_norm_epsilon.py`, `tests/test_qwen_image_cfg_normalize_toggle.py`
+  - Embed cache key correctness: `tests/test_qwen_image_generate_image_cache_key.py`
+  - Edit training fallback behavior: `tests/test_qwen_image_training_edit_fallback.py`
 
 ---
 
@@ -317,15 +324,15 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
 | Priority | Count | Resolved | Remaining |
 |----------|-------|----------|-----------|
 | P0 | 4 | 4 | 0 |
-| P1 | 7 | 6 | 1 (Test Coverage systemic gap) |
+| P1 | 7 | 7 | 0 |
 | P2 | 19 | 17 | 2 (doc-only: V2, V6) |
 | P3 | 10 | 0 | 10 (doc/minor/deferred) |
 | Invalidated | 12 | — | — |
-| **Total Active** | **40** | **27** | **13** |
+| **Total Active** | **40** | **28** | **12** |
 
 Notes:
 - T2 confirmed no change needed (base class covers validation). T4, C2, C6 verified against Diffusers.
-- Test Coverage (P1): Partially addressed — 6 dedicated Qwen-Image test files exist as regression tests for individual fixes, but comprehensive `test_qwen_image_utils.py` / `test_qwen_image_training.py` not yet created.
+- Test Coverage (P1): Resolved — `test_qwen_image_utils.py` and `test_qwen_image_training.py` added, plus multiple focused regression tests.
 - V3 counted once under P3 (also appears in Validated Findings section).
 
 ### Priority Breakdown
@@ -336,14 +343,14 @@ Notes:
 - ~~L1~~: `exclude_mod` regex broken — fixed (correct regex in 3 files)
 - ~~L2~~: `merge_lora.py` silent fail — fixed (architecture-aware dispatch)
 
-**P1 (Incorrect behavior) — 6/7 resolved:**
+**P1 (Incorrect behavior) — 7/7 resolved:**
 - ~~T1~~: Edit model silent fallback — fixed (error-by-default + `--allow_edit_fallback_to_t2i`)
 - ~~I1~~: CFG differs from official — fixed (dual-CFG with `--true_cfg_scale`, commit `efd4a98`)
 - ~~I2~~: `zero_cond_t` docs wrong — corrected (intra-sequence timestep split)
 - ~~I14~~: Embed cache key incomplete — fixed (`embeds_cache_key()` helper)
 - ~~L3~~: `convert_lora.py` missing detection — fixed
 - ~~L4~~: `convert_lora.py` missing CLI choice — fixed
-- Test Coverage Summary: **partially addressed** — 6 dedicated Qwen-Image test files added as regression tests; comprehensive `test_qwen_image_utils.py` / `test_qwen_image_training.py` not yet created
+- ~~Test Coverage Summary~~: Resolved — broad unit/integration tests added (`tests/test_qwen_image_utils.py`, `tests/test_qwen_image_training.py`) + focused regression tests
 
 **P2 (Edge case/improvement) — 17/19 resolved:**
 - ~~T2~~: Confirmed base class covers `require_mask_weights_if_enabled()` — no change needed
@@ -482,11 +489,11 @@ Notes:
 
 ## Audit Status: COMPLETE
 **Date completed**: 2026-02-17
-**Last revision**: 2026-02-17 (v4: all verifications complete, counts corrected)
+**Last revision**: 2026-02-17 (v5: test coverage closed)
 **Phases**: All 3 phases complete
 **Total findings**: 40 active (4 P0, 7 P1, 19 P2, 10 P3) + 12 invalidated
-**Resolved**: 27/40 — all P0 (4/4), 6/7 P1, 17/19 P2, 0/10 P3
-**Remaining**: 13 items (1 P1 test coverage systemic, 2 P2 doc-only, 10 P3 doc/minor/deferred)
+**Resolved**: 28/40 — all P0 (4/4), all P1 (7/7), 17/19 P2, 0/10 P3
+**Remaining**: 12 items (2 P2 doc-only, 10 P3 doc/minor/deferred)
 **Agent reports archived**: Training (a0374ce), Caching (a3cd502), Inference (a776980), LoRA (a942e20), Tests (a5ea998)
 
 ### Revision Log
@@ -516,3 +523,6 @@ Notes:
   - C6 verified against Diffusers — end-to-end control image ordering consistent with "Edit Plus" `Picture N` semantics
   - Corrected total count: 40 active (not 36) — V1/V2/V6 (P2) and Test Coverage Summary (P1) were undercounted in v2
   - Updated summary table to show resolved/remaining per priority
+- **v5** (2026-02-17): Test coverage closure:
+  - Added `tests/test_qwen_image_utils.py` (pack/unpack, shift endpoints, model_version resolution)
+  - Added `tests/test_qwen_image_training.py` (mock-based `call_dit` shape + `img_shapes` coverage across modes)
