@@ -37,11 +37,12 @@ Issues are prioritized: P0 = will crash/corrupt, P1 = incorrect behavior, P2 = e
 **Issue**: The while-loop counting control images has no upper bound and no validation that layered models require exactly 1 control image. Malformed cache with non-sequential indices (e.g., `latents_control_0`, `latents_control_2` missing `_1`) will silently stop early.
 **Fix**: Add validation: `if args.is_layered and num_control_images != 1: raise ValueError(...)`.
 
-### T4. `qwen_shift` Timestep Sampling Correctness [P2 — needs verification]
+### T4. `qwen_shift` Timestep Sampling Correctness [P2 — verified]
 **Location**: `src/musubi_tuner/hv_train_network.py:1022-1023`
-**Status**: NEEDS VERIFICATION
+**Status**: VERIFIED (Diffusers)
 **Issue**: The `qwen_shift` sampling uses `(h // 2) * (w // 2)` with parameters `x1=256, y1=0.5, x2=8192, y2=0.9`. The h,w refer to unpacked latent dimensions, and the `// 2` accounts for 2x2 packing. This matches the inference formula, but should be verified against official training code if available.
 **Impact**: If wrong, timestep distribution will be skewed during training.
+**Verification**: Diffusers uses the same `calculate_shift(image_seq_len, base_image_seq_len, max_image_seq_len, base_shift, max_shift)` formula with the exponential time shift `t = (t*exp(mu))/(1+(exp(mu)-1)*t)` inside `scheduling_flow_match_euler_discrete.py`. Parameters `(base_seq_len=256, max_seq_len=8192, base_shift=0.5, max_shift=0.9)` match the official scheduler config documented in `docs/qwen_image_architecture.md:742`. Ref: `diffusers/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py`, `diffusers/src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py`.
 
 ---
 
@@ -55,12 +56,12 @@ Issues are prioritized: P0 = will crash/corrupt, P1 = incorrect behavior, P2 = e
 - Silent prompt↔image↔cache misalignment if earlier items are skipped (image N gets paired with prompt N+K)
 **Fix**: Remove the `continue` pattern entirely. For Edit models, `raise ValueError()` when control images are missing — skipping is never safe because it desynchronizes parallel lists. Remove the `print()` at lines 69-71 as well (see C11).
 
-### C2. `prompt_template_encode_start_idx` May Be Wrong for Edit Mode [P2 — needs verification]
+### C2. `prompt_template_encode_start_idx` May Be Wrong for Edit Mode [P2 — verified]
 **Location**: `src/musubi_tuner/qwen_image/qwen_image_utils.py:338,397-399`
-**Status**: NEEDS VERIFICATION
+**Status**: VERIFIED (Diffusers)
 **Issue**: T2I uses `prompt_template_encode_start_idx = 34`, Edit uses `= 64`. These indices control how much of the system prompt prefix is stripped. The Edit system prompt is longer (264 chars vs 153 for T2I), so the drop index difference seems correct, but token positions (not character positions) should be verified against the actual tokenizer output.
 **Impact**: Wrong drop index means either leaked system tokens or truncated user content in embeddings.
-**Fix**: Consider computing the drop index dynamically: tokenize the template prefix once and derive the index from token positions rather than hardcoding 34/64. This survives tokenizer/template drift and makes testing straightforward.
+**Verification**: Diffusers defines `QWENIMAGE_PROMPT_TEMPLATE_START_IDX = 34` and `QWENIMAGE_EDIT_PROMPT_TEMPLATE_START_IDX = 64` in `diffusers/src/diffusers/modular_pipelines/qwenimage/prompt_templates.py`. Our hardcoded values match exactly. Dynamic computation remains a nice-to-have for template drift resilience but is not urgently needed.
 
 ### C3. Alpha Mask Priority Unclear in Logs [P2]
 **Location**: `src/musubi_tuner/dataset/image_video_dataset.py:2499-2518`
@@ -80,10 +81,11 @@ Issues are prioritized: P0 = will crash/corrupt, P1 = incorrect behavior, P2 = e
 **Issue**: If a mask has a drastically different aspect ratio from the target image (e.g., user provides wrong mask file), the `F.interpolate` call succeeds silently but produces spatially misaligned weights.
 **Fix**: Add warning if mask aspect ratio differs from target by >10%.
 
-### C6. Multi-Control-Image Alignment [P2 — needs verification]
+### C6. Multi-Control-Image Alignment [P2 — verified]
 **Location**: `src/musubi_tuner/qwen_image_cache_text_encoder_outputs.py:52-59`
-**Status**: NEEDS VERIFICATION
+**Status**: VERIFIED (Diffusers + code trace)
 **Issue**: For Edit-2509/2511 with multiple control images, the text encoder processes all images (creating `Picture 1: <image>`, `Picture 2: <image>` prefixes), but latent caching encodes each control separately. During training, these need to be correctly matched. Verify alignment.
+**Verification**: End-to-end order is consistent: (1) Latent caching stores control latents in `item.control_content` order (`qwen_image_cache_latents.py:80+`). (2) Text-encoder caching builds `images[i]` in the same order (`qwen_image_cache_text_encoder_outputs.py:52+`), and `get_qwen_prompt_embeds_with_image()` turns them into `Picture 1`, `Picture 2`, … in-order (`qwen_image_utils.py:509+`). (3) Training concatenates `latents_control_0..N` contiguously with a gap guard (`qwen_image_train_network.py`). This matches Diffusers' "Edit Plus" semantics in `diffusers/src/diffusers/modular_pipelines/qwenimage/encoders.py`.
 
 ### C7. Control Image Resolution Downsampled to 384x384 [P3 — doc gap]
 **Location**: `src/musubi_tuner/qwen_image/qwen_image_utils.py:903`
@@ -312,36 +314,69 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
 
 ## Summary Statistics
 
-| Priority | Count | Needs Verification |
-|----------|-------|--------------------|
-| P0 | 4 | 0 |
-| P1 | 6 | 0 |
-| P2 | 16 | 3 |
-| P3 | 10 | 0 |
-| Invalidated | 12 | — |
-| **Total Active** | **36** | **3** |
+| Priority | Count | Resolved | Remaining |
+|----------|-------|----------|-----------|
+| P0 | 4 | 4 | 0 |
+| P1 | 7 | 6 | 1 (Test Coverage systemic gap) |
+| P2 | 19 | 17 | 2 (doc-only: V2, V6) |
+| P3 | 10 | 0 | 10 (doc/minor/deferred) |
+| Invalidated | 12 | — | — |
+| **Total Active** | **40** | **27** | **13** |
+
+Notes:
+- T2 confirmed no change needed (base class covers validation). T4, C2, C6 verified against Diffusers.
+- Test Coverage (P1): Partially addressed — 6 dedicated Qwen-Image test files exist as regression tests for individual fixes, but comprehensive `test_qwen_image_utils.py` / `test_qwen_image_training.py` not yet created.
+- V3 counted once under P3 (also appears in Validated Findings section).
 
 ### Priority Breakdown
 
-**P0 (Will crash/corrupt) — 4 confirmed:**
-- I4: `negative_prompt=None` crashes ALL model versions (inference)
-- C1: `continue` pattern misaligns prompts↔images↔caches (caching)
-- L1: `exclude_mod` regex broken — modulation layers always trained (LoRA)
-- L2: `merge_lora.py` silently fails for Qwen-Image (LoRA merge)
+**P0 (Will crash/corrupt) — 4/4 resolved:**
+- ~~I4~~: `negative_prompt=None` crash — fixed (default `" "`)
+- ~~C1~~: `continue` pattern misalignment — fixed (`raise ValueError()`)
+- ~~L1~~: `exclude_mod` regex broken — fixed (correct regex in 3 files)
+- ~~L2~~: `merge_lora.py` silent fail — fixed (architecture-aware dispatch)
 
-**P1 (Incorrect behavior) — 6 confirmed:**
-- T1: Edit model silent fallback — error-by-default recommended (training)
-- I1: CFG differs from official Edit-2509/2511 (inference)
-- I2: `zero_cond_t` docs describe wrong semantics — corrected to intra-sequence split (docs/inference)
-- I14: Embed cache key missing `model_version` and `resize_control_to_image_size` (inference)
-- L3: `convert_lora.py` missing Qwen-Image detection (LoRA convert)
-- L4: `convert_lora.py` missing `qwen_image` CLI choice (LoRA convert)
+**P1 (Incorrect behavior) — 6/7 resolved:**
+- ~~T1~~: Edit model silent fallback — fixed (error-by-default + `--allow_edit_fallback_to_t2i`)
+- ~~I1~~: CFG differs from official — fixed (dual-CFG with `--true_cfg_scale`, commit `efd4a98`)
+- ~~I2~~: `zero_cond_t` docs wrong — corrected (intra-sequence timestep split)
+- ~~I14~~: Embed cache key incomplete — fixed (`embeds_cache_key()` helper)
+- ~~L3~~: `convert_lora.py` missing detection — fixed
+- ~~L4~~: `convert_lora.py` missing CLI choice — fixed
+- Test Coverage Summary: **partially addressed** — 6 dedicated Qwen-Image test files added as regression tests; comprehensive `test_qwen_image_utils.py` / `test_qwen_image_training.py` not yet created
 
-**P2 (Edge case/improvement) — 16 confirmed + 3 needs verification:**
-- T2, T3, T4, C2, C3, C4, C5, C6, C11, I3, I5, I6, I7, I8, I13, V1, V2, V6, L5
+**P2 (Edge case/improvement) — 17/19 resolved:**
+- ~~T2~~: Confirmed base class covers `require_mask_weights_if_enabled()` — no change needed
+- ~~T3~~: Control image count validation + contiguous key guard
+- ~~T4~~: `qwen_shift` verified against Diffusers — correct
+- ~~C2~~: `prompt_template_encode_start_idx` verified against Diffusers — correct (34/64)
+- ~~C3~~: Mask source summary log already in dataset layer
+- ~~C4~~: Empty mask warning at cache time
+- ~~C5~~: Mask aspect ratio mismatch warning at cache time
+- ~~C6~~: Multi-control-image alignment verified against Diffusers — consistent
+- ~~C11~~: Debug `print()` → `logger.debug()`
+- ~~I3~~: `--cfg_normalize` / `--no_cfg_normalize` toggle with model-version defaults
+- ~~I5~~: Model-version-specific `infer_steps` defaults (50 T2I, 40 Edit)
+- ~~I6~~: `--automatic_prompt_lang_for_layered` crash guard
+- ~~I7~~: Edit control image assertion clarity
+- ~~I8~~: Dead `calculate_shift()` removed + defaults fixed
+- ~~I13~~: CFG normalization epsilon guard (`apply_cfg_norm()`)
+- ~~V1~~: All-zero mask training-time warning
+- ~~L5~~: `lora_qwen_image.py` switched to BlissfulLogger
+- V2: Prior preservation for Layered — **doc gap, not yet written**
+- V6: Alpha mask conflict with Layered — **doc gap, not yet written**
 
-**P3 (Documentation/minor) — 10 confirmed:**
-- C7, C8, C9, C10, I9, I10, I11, I12, T5, V3
+**P3 (Documentation/minor) — 0/10 (all remaining):**
+- C7: Control image 384px downsample — doc gap
+- C8: Cache key F-dimension semantics — doc gap
+- C9: Per-layer mask limitation — doc gap
+- C10: VAE scale factor hardcoded — future-proofing only
+- I9: RCM threshold help text — minor
+- I10: Batch decode `batch_size=1` assertion — minor guard
+- I11: `guidance_embeds` support — future-proofing only
+- I12: Prompt enhancement limitation — doc gap
+- T5: `mask_min_weight` vs prior warning prominence — minor
+- V3: Gamma/min-weight pipeline (raw cached, transforms at training time) — doc gap
 
 ---
 
@@ -447,10 +482,11 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
 
 ## Audit Status: COMPLETE
 **Date completed**: 2026-02-17
-**Last revision**: 2026-02-17 (implementation progress: 28/36 items resolved)
+**Last revision**: 2026-02-17 (v4: all verifications complete, counts corrected)
 **Phases**: All 3 phases complete
-**Total findings**: 36 active (4 P0, 6 P1, 16 P2, 10 P3) + 12 invalidated
-**Resolved**: 28/36 (all P0, all P1, 12/16 P2, 4/10 P3)
+**Total findings**: 40 active (4 P0, 7 P1, 19 P2, 10 P3) + 12 invalidated
+**Resolved**: 27/40 — all P0 (4/4), 6/7 P1, 17/19 P2, 0/10 P3
+**Remaining**: 13 items (1 P1 test coverage systemic, 2 P2 doc-only, 10 P3 doc/minor/deferred)
 **Agent reports archived**: Training (a0374ce), Caching (a3cd502), Inference (a776980), LoRA (a942e20), Tests (a5ea998)
 
 ### Revision Log
@@ -469,8 +505,14 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
   - Fixed status banner contradiction (header vs footer)
 - **v3** (2026-02-17): Implementation progress update:
   - **Sprint 1 (P0)**: All 4 items resolved — I4, C1, L1, L2
-  - **Sprint 2 (P1)**: All 6 items resolved — T1, I1 (efd4a98), I2 (docs correct), I14, L3, L4
-  - **Sprint 4 (P2)**: 12/16 resolved — I3, I5, I6, I7, I8, I13, C3 (already in dataset layer), C4, C5, C11, V1, L5
-  - **Sprint 4 (P2) remaining**: T2 (verified base class covers it — no change needed), T3 (contiguous key + upper bound), T4 (needs verification), C2 (needs verification), C6 (needs verification)
-  - **Sprint 5 (P3)**: I10, I11, C10 still need implementation; C7, C8, C9, I9, I12, V2, V3, V6, T5 are doc-only
+  - **Sprint 2 (P1)**: 6/7 resolved — T1, I1 (efd4a98), I2 (docs correct), I14, L3, L4; Test Coverage partially addressed (6 test files)
+  - **Sprint 4 (P2)**: 17/19 resolved — I3, I5, I6, I7, I8, I13, C3, C4, C5, C11, V1, L5 (code fixes); T2, T4, C2, C6 (verified, no change needed); T3 (contiguous key + upper bound)
+  - **Sprint 4 (P2) remaining**: V2, V6 (doc-only gaps)
+  - **Sprint 5 (P3)**: 10 items remaining — C7, C8, C9, C10, I9, I10, I11, I12, T5, V3
   - Also fixed: debug `print()` in `qwen_image_cache_latents.py` → `logger.debug()`
+- **v4** (2026-02-17): Verification pass:
+  - T4 verified against Diffusers — `qwen_shift` formula and parameters match official scheduler
+  - C2 verified against Diffusers — `prompt_template_encode_start_idx` 34/64 match `QWENIMAGE_PROMPT_TEMPLATE_START_IDX` / `QWENIMAGE_EDIT_PROMPT_TEMPLATE_START_IDX`
+  - C6 verified against Diffusers — end-to-end control image ordering consistent with "Edit Plus" `Picture N` semantics
+  - Corrected total count: 40 active (not 36) — V1/V2/V6 (P2) and Test Coverage Summary (P1) were undercounted in v2
+  - Updated summary table to show resolved/remaining per priority
