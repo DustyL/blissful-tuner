@@ -465,22 +465,14 @@ sd["lm_head.weight"] = sd["model.embed_tokens.weight"]  # unconditional
 - **Files**: `src/musubi_tuner/zimage/zimage_config.py` (constants exist), `src/musubi_tuner/zimage/zimage_utils.py` (add function)
 - **Commits**: 8fd0ba6, b787c14
 
-The constants exist but no function uses them:
-```python
-BASE_IMAGE_SEQ_LEN = 256
-MAX_IMAGE_SEQ_LEN = 4096
-BASE_SHIFT = 0.5
-MAX_SHIFT = 1.15
-```
+**Fix implemented**: Added `compute_dynamic_shift()` to `zimage_utils.py` and `--dynamic_shift` CLI flag. Linear interpolation from `[BASE_IMAGE_SEQ_LEN, MAX_IMAGE_SEQ_LEN]` to `[BASE_SHIFT, MAX_SHIFT]`, clamped to `[BASE_SHIFT, MAX_SHIFT]` range:
 
-**Implementation**:
 ```python
-def compute_shift(image_seq_len):
-    mu = (MAX_SHIFT - BASE_SHIFT) / (MAX_IMAGE_SEQ_LEN - BASE_IMAGE_SEQ_LEN) * (image_seq_len - BASE_IMAGE_SEQ_LEN) + BASE_SHIFT
-    return mu
+def compute_dynamic_shift(image_seq_len: int) -> float:
+    mu = (MAX_SHIFT - BASE_SHIFT) / (MAX_IMAGE_SEQ_LEN - BASE_IMAGE_SEQ_LEN) \
+         * (image_seq_len - BASE_IMAGE_SEQ_LEN) + BASE_SHIFT
+    return max(BASE_SHIFT, min(MAX_SHIFT, mu))
 ```
-
-Add `--dynamic_shift` flag to generation script that auto-computes shift from resolution.
 
 ---
 
@@ -534,38 +526,38 @@ These items were verified correct across all sources:
 
 | Item | Location | Verification |
 |------|----------|-------------|
-| Flow matching timestep reversal | `zimage_train_network.py:317` | `(1000.0 - timesteps) / 1000.0` |
-| Flow matching target | `zimage_train_network.py:338` | `latents - noise` |
-| Inference output negation | `zimage_generate_image.py:612` | `-noise_pred.squeeze(2)` |
-| CFG formula | `zimage_generate_image.py:608` | `pos + scale * (pos - neg)` matches official |
-| Latent encode normalization | `zimage_train_network.py:270` | `(raw - 0.1159) * 0.3611` |
-| Latent decode denormalization | `zimage_utils.py:23` | `(latents / 0.3611) + 0.1159` |
-| AdaLN block: 4 outputs, no activation | `zimage_model.py:243,269` | Bare Linear, chunk(4) |
-| AdaLN FinalLayer: SiLU + 1 output | `zimage_model.py:310-313` | Sequential(SiLU, Linear) |
-| TimestepEmbedder mid_size=1024 | `zimage_model.py:423` | Matches reference |
-| Tanh gating | `zimage_model.py:271` | `gate_msa.tanh()` |
-| Scale formula: `1 + scale` (no shift) | `zimage_model.py:272` | Matches all sources |
-| QK-Norm before RoPE | `zimage_model.py:181-188` | norm_q/norm_k → apply_rotary_emb |
-| Sandwich-Norm post-output | `zimage_model.py:274-276` | `norm2(attn_out)` = correct |
-| FinalLayer nn.LayerNorm | `zimage_model.py:308` | Not RMSNorm |
-| Text encoder: hidden_states[-2] | `zimage_utils.py:213-218` | Penultimate layer |
-| Qwen2Tokenizer (not Qwen3) | `zimage_utils.py:8,160` | Correct tokenizer |
-| Chat template enable_thinking=True | `zimage_utils.py:186-192` | Matches official |
-| Max seq length 512 | `zimage_config.py:28` | Correct |
-| VAE float32 always | `zimage_autoencoder.py:488` | force_upcast equivalent |
-| VAE latent_channels=16 | `zimage_config.py:55` | Correct (not SD1.x's 4) |
-| VAE encode + decode | `zimage_autoencoder.py:389-400` | Both implemented |
-| Scaling factor 0.3611, shift 0.1159 | `zimage_config.py:58-59` | Matches HF config |
-| Target modules: ZImageTransformerBlock | `lora_zimage.py` | Correct |
-| Exclude: _modulation + _refiner | `network_arch.py:90-93` | Correct pattern |
-| 5D frame dimension | `zimage_train_network.py:293,335` | unsqueeze(2)/squeeze(2) |
-| Dynamic shift constants | `zimage_config.py:46-49` | BASE_SHIFT=0.5, MAX_SHIFT=1.15 |
-| Sigma schedule with Flux-style shift | `zimage_utils.py:256-269` | Correct formula |
-| Resolution divisible by 16 check | `zimage_generate_image.py:234` | VAE_SCALE * 2 = 16 |
-| RMSNorm float32 upcasting | `zimage_model.py:96-99` | Deliberate stability improvement |
-| OmniBase caching (SigLIP2 + control) | `zimage_cache_latents.py:78-198` | Correct cache keys |
-| FFN hidden dim: int(dim/3*8) = 10240 | `zimage_model.py:235` | Correct formula |
-| `--lora_multiplier` defaults | All `*_generate_*.py` | All use `default=None` (already fixed) |
+| Flow matching timestep reversal | `zimage_train_network.py` `call_dit()` | `(1000.0 - timesteps) / 1000.0` |
+| Flow matching target | `zimage_train_network.py` `call_dit()` | `latents - noise` |
+| Inference output negation | `zimage_generate_image.py` `generate()` denoise loop | `-noise_pred.squeeze(2)` |
+| CFG formula | `zimage_generate_image.py` `generate()` denoise loop | `pos + scale * (pos - neg)` matches official |
+| Latent encode normalization | `zimage_train_network.py` `get_noisy_latents()` | `(raw - 0.1159) * 0.3611` |
+| Latent decode denormalization | `zimage_utils.py` `decode_latents()` | `(latents / 0.3611) + 0.1159` |
+| AdaLN block: 4 outputs, no activation | `zimage_model.py` `ZImageTransformerBlock.__init__` | Bare Linear, chunk(4) |
+| AdaLN FinalLayer: SiLU + 1 output | `zimage_model.py` `FinalLayer.__init__` | Sequential(SiLU, Linear) |
+| TimestepEmbedder mid_size=1024 | `zimage_model.py` `TimestepEmbedder.__init__` | Matches reference |
+| Tanh gating | `zimage_model.py` `ZImageTransformerBlock._forward` | `gate_msa.tanh()` |
+| Scale formula: `1 + scale` (no shift) | `zimage_model.py` `ZImageTransformerBlock._forward` | Matches all sources |
+| QK-Norm before RoPE | `zimage_model.py` `ZImageAttention.forward` | norm_q/norm_k → apply_rotary_emb |
+| Sandwich-Norm post-output | `zimage_model.py` `ZImageTransformerBlock._forward` | `norm2(attn_out)` = correct |
+| FinalLayer nn.LayerNorm | `zimage_model.py` `FinalLayer.__init__` | Not RMSNorm |
+| Text encoder: hidden_states[-2] | `zimage_utils.py` `encode_prompt()` | Penultimate layer |
+| Qwen2Tokenizer (not Qwen3) | `zimage_utils.py` `load_qwen_tokenizer()` | Correct tokenizer |
+| Chat template enable_thinking=True | `zimage_utils.py` `encode_prompt()` | Matches official |
+| Max seq length 512 | `zimage_config.py` `TEXT_MAX_LENGTH` | Correct |
+| VAE float32 always | `zimage_autoencoder.py` `ZImageAutoencoder.encode/decode` | force_upcast equivalent |
+| VAE latent_channels=16 | `zimage_config.py` `LATENT_CHANNELS` | Correct (not SD1.x's 4) |
+| VAE encode + decode | `zimage_autoencoder.py` `ZImageAutoencoder` | Both implemented |
+| Scaling factor 0.3611, shift 0.1159 | `zimage_config.py` `SCALING_FACTOR/SHIFT_FACTOR` | Matches HF config |
+| Target modules: ZImageTransformerBlock | `lora_zimage.py` `ZIMAGE_TARGET_REPLACE_MODULES` | Correct |
+| Exclude: _modulation + _refiner | `network_arch.py` `ARCH_CONFIGS[Z_IMAGE]` | Correct pattern |
+| 5D frame dimension | `zimage_train_network.py` `call_dit()` | unsqueeze(2)/squeeze(2) |
+| Dynamic shift constants | `zimage_config.py` `BASE_SHIFT/MAX_SHIFT` | BASE_SHIFT=0.5, MAX_SHIFT=1.15 |
+| Sigma schedule with Flux-style shift | `zimage_utils.py` `get_schedule()` | Correct formula |
+| Resolution divisible by 16 check | `zimage_generate_image.py` `generate()` | VAE_SCALE * 2 = 16 |
+| RMSNorm float32 upcasting | `zimage_model.py` `ZImageRMSNorm.forward` | Deliberate stability improvement |
+| OmniBase caching (SigLIP2 + control) | `zimage_cache_latents.py` `encode_and_save_batch()` | Correct cache keys |
+| FFN hidden dim: int(dim/3*8) = 10240 | `zimage_model.py` `FeedForward.__init__` | Correct formula |
+| `--lora_multiplier` defaults | All `*_generate_*.py` | All use `default=None` (regression tested) |
 
 ---
 

@@ -15,9 +15,15 @@ from musubi_tuner import (
     zimage_generate_image,
 )
 
-try:
+import importlib
+
+# Kandinsky 5 has a transitive import error (ensure_dtype_form missing from blissful_tuner.utils).
+# Gate on the specific missing symbol so we avoid importing the Kandinsky stack at all when it
+# would fail — this prevents side-effect warnings from partially-loaded Kandinsky modules.
+_k5_importable = hasattr(importlib.import_module("blissful_tuner.utils"), "ensure_dtype_form")
+if _k5_importable:
     from musubi_tuner import kandinsky5_generate_video
-except ImportError:
+else:
     kandinsky5_generate_video = None
 
 
@@ -94,9 +100,10 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
         ]
 
         for module, argv in cases:
-            if module is None:
-                continue
-            with self.subTest(module=module.__name__):
+            name = module.__name__ if module is not None else argv[-1]
+            with self.subTest(module=name):
+                if module is None:
+                    self.skipTest("kandinsky5_generate_video not importable (ensure_dtype_form missing)")
                 args = self._parse(module, argv)
                 self.assertIsNone(args.lora_multiplier)
 
