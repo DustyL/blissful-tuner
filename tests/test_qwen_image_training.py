@@ -42,7 +42,9 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         trainer.is_layered = False
 
         latents, noise, noisy_model_input, timesteps, batch = self._make_common_inputs(bsz=1, channels=16, height=4, width=4)
-        args = SimpleNamespace(is_layered=False, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False)
+        args = SimpleNamespace(
+            is_layered=False, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False
+        )
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
@@ -70,7 +72,9 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         latents, noise, noisy_model_input, timesteps, batch = self._make_common_inputs(bsz=1, channels=16, height=4, width=4)
         batch["latents_control_0"] = torch.zeros_like(latents)
 
-        args = SimpleNamespace(is_layered=False, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False)
+        args = SimpleNamespace(
+            is_layered=False, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False
+        )
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
@@ -102,7 +106,9 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         timesteps = torch.zeros(bsz, dtype=torch.float32)
         batch = {"latents": latents, "vl_embed": [torch.zeros(2, 8, dtype=torch.float32)]}
 
-        args = SimpleNamespace(is_layered=True, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False)
+        args = SimpleNamespace(
+            is_layered=True, remove_first_image_from_target=False, split_attn=False, gradient_checkpointing=False
+        )
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
@@ -161,4 +167,3 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
