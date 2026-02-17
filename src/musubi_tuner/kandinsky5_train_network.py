@@ -216,6 +216,9 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
                     f"offload_dit={transformer_offloaded}, blocks_to_swap={getattr(transformer, 'blocks_to_swap', 0)}"
                 )
 
+                # round width and height to multiples of 16
+                width = (width // 16) * 16
+                height = (height // 16) * 16
                 # latent resolution (already /8 in cache)
                 latent_w = max(1, width // 8)
                 latent_h = max(1, height // 8)

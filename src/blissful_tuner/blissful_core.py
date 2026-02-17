@@ -508,7 +508,11 @@ def add_blissful_k5_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     parser.add_argument("--quantized_qwen", action="store_true", help="Quantize Qwen TE to NF4 with BitsAndBytes to save VRAM")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile optimization")
     parser.add_argument(
-        "--output_type", type=str, default="video", choices=["video", "latent", "both"], help="Type of output to produce."
+        "--output_type",
+        type=str,
+        default="video",
+        choices=["video", "latent", "both"],
+        help="Type of output to save, choose 'video' for decoded video/image, latent for latent.safetensors, both for both!",
     )
     parser.add_argument(
         "--fp16_accumulation",
@@ -545,7 +549,7 @@ def add_blissful_k5_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         type=str,
         default="default",
         choices=["default", "dpm++"],
-        help="Scheduler to use for inference, default is probably best right now",
+        help="Scheduler to use for inference, DPM++ can potentially improve outputs slightly but default is usually okay",
     )
     parser.add_argument(
         "--force_traditional_attn", action="store_true", help="Force Flash/Sage/etc attention even when task requests NABLA"
@@ -555,12 +559,12 @@ def add_blissful_k5_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--nabla_p",
         type=float,
         default=0.9,
-        help="NABLA P value for when using forced NABLA(ignored if task conf specifies a P value).",
+        help="0.0 - 1.0 (float): NABLA P value for when using forced NABLA (ignored if task conf specifies a P value). 0.7 might be good.",
     )
     parser.add_argument(
         "--disable_vae_workaround",
         action="store_true",
-        help="Disables patching the VAE to fix massive OOM on latest PyTorch/CUDA versions. This patch seems not necessary on at least some earlier versions and quality is potentially improved without it.",
+        help="Disables patching the VAE to fix massive OOM on latest PyTorch/CUDA versions. This patch seems not necessary on at least some earlier versions and quality is potentially improved without it, but will use more VRAM.",
     )
     parser.add_argument(
         "--prompt_wildcards",

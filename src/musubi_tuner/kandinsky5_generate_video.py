@@ -50,32 +50,34 @@ def _get_device(device_arg: Optional[str]) -> torch.device:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Kandinsky5 sampling (mirrors training sampler, no training)")
     parser.add_argument("--task", type=str, default="k5-pro-t2v-5s-sd", choices=list(TASK_CONFIGS.keys()))
-    parser.add_argument("--prompt", type=str, required=True)
-    parser.add_argument("--negative_prompt", type=str, default="")
-    parser.add_argument(
-        "--i", "--image", dest="image", type=str, default=None, help="Init image path for i2v-style seeding (first frame)"
-    )
+    parser.add_argument("--prompt", type=str, required=True, help="Prompt for generation")
+    parser.add_argument("--negative_prompt", type=str, default="", help="Negative prompt for generation")
+    parser.add_argument("--i", "--image", dest="image", type=str, default=None, help="Init image path for i2v or image edit")
     parser.add_argument(
         "--image_last", type=str, default=None, help="Optional last-frame image path for i2v first_last conditioning"
     )
-    parser.add_argument("--save_path", type=str, required=True)
-    parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--save_path", type=str, required=True, help="Folder to save outputs to")
+    parser.add_argument("--width", type=int, default=None, help="Requested width of generated output. Default depends on task.")
+    parser.add_argument("--height", type=int, default=None, help="Requested height of generated output. Default depends on task.")
     parser.add_argument("--frames", type=int, default=None, help="Output length in latent frames, exclusive of '--video_length'")
     parser.add_argument(
         "--video_length",
         type=int,
         default=None,
-        help="Output length in pixel frames, exclusive of '--frames' and will be rounded up to fit 4n + 1 if necessary.",
+        help="Output length in pixel frames, exclusive of '--frames' and will be rounded up to fit 4n + 1 if necessary. Use 1 for images or image tasks.",
     )
-    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument(
+        "--steps", type=int, default=None, help="Number of inference steps, default depends on task but is often 50"
+    )
     parser.add_argument("--guidance", type=float, default=None)
     parser.add_argument(
         "--scheduler_scale", type=float, default=None, help="Like flow shift for other models, alters timestep distribution"
     )
     parser.add_argument("--seed", type=str, default="42")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--dit", type=str, default=None)
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device to use for inference. Default is CUDA if available else CPU"
+    )
+    parser.add_argument("--dit", type=str, required=True, help="Path to diffusion transformer to inference")
     parser.add_argument("--vae", type=str, default=None)
     parser.add_argument("--text_encoder_qwen", type=str, default=None)
     parser.add_argument("--text_encoder_clip", type=str, default=None)
@@ -158,7 +160,10 @@ def main():
 
     width = args.width or task_conf.resolution
     height = args.height or task_conf.resolution
-    frames = args.frames if args.frames is not None else (5 if task_conf.dit_params.visual_cond else 1)
+    # round width and height to multiples of 16
+    width = (width // 16) * 16
+    height = (height // 16) * 16
+    frames = args.frames or (5 if task_conf.dit_params.visual_cond else 1)
     i2v_mode = "first_last" if args.image_last else "first"
     steps = args.steps or task_conf.num_steps
     args.steps = steps  # Previewer need
