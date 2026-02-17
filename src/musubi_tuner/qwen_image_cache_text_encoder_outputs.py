@@ -67,8 +67,9 @@ def encode_and_save_batch(
         images = None
 
     for i, item in enumerate(batch):
-        print(
-            f"Item {i}: {item.item_key}, prompt: {item.caption}, control images: {[im.shape for im in images[i] if im is not None] if images is not None else None}"
+        logger.debug(
+            f"Item {i}: {item.item_key}, prompt: {item.caption}, "
+            f"control images: {[im.shape for im in images[i] if im is not None] if images is not None else None}"
         )
 
     # encode prompt
