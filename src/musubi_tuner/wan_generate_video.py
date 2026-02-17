@@ -3,7 +3,6 @@ import gc
 import random
 import os
 import re
-import time
 import math
 import copy
 from types import ModuleType
@@ -786,6 +785,7 @@ def merge_lora_weights(
     lycoris: bool = False,
     save_merged_model: Optional[str] = None,
     converter: Optional[callable] = None,
+    extra_unet_targets: Optional[List[str]] = None,
 ) -> None:
     """merge LoRA weights to the model
 
@@ -844,11 +844,19 @@ def merge_lora_weights(
                 file=None,
                 weights_sd=weights_sd,
                 unet=model,
-                text_encoder=None,
                 vae=None,
                 for_inference=True,
-                extra_unet_targets=["WanAttentionBlock"],
+                extra_unet_targets=extra_unet_targets,
             )
+            matched = sum(1 for _ in lycoris_net.unet_loras) if hasattr(lycoris_net, "unet_loras") else -1
+            if matched == 0:
+                raise ValueError(
+                    f"LyCORIS merge matched 0 modules in model. "
+                    f"Check extra_unet_targets={extra_unet_targets}. "
+                    f"Model block types: {sorted(set(m.__class__.__name__ for m in model.modules()))}"
+                )
+            elif matched > 0:
+                logger.info(f"LyCORIS merge matched {matched} modules")
             lycoris_net.merge_to(None, model, weights_sd, dtype=None, device=device)
         else:
             net_type = detect_network_type(weights_sd)
@@ -1587,9 +1595,8 @@ def run_sampling(
 
             if len(models) > 1 and (args.offload_inactive_dit or args.lazy_loading):
                 if args.blocks_to_swap > 0:
-                    # prepare block swap for low noise model
-                    logger.info("Waiting for 5 seconds to finish block swap")
-                    time.sleep(5)
+                    # Synchronize device to ensure block swap transfers are complete
+                    synchronize_device(device)
 
                 if args.offload_inactive_dit:
                     logger.info("Switching model to CPU/GPU for both low and high noise models")
@@ -1778,11 +1785,6 @@ def generate(
         del models
         del scheduler
         synchronize_device(device)
-
-        # wait for 5 seconds until block swap is done
-        if args.blocks_to_swap > 0:
-            logger.info("Waiting for 5 seconds to finish block swap")
-            time.sleep(5)
 
         gc.collect()
         clean_memory_on_device(device)
@@ -2113,11 +2115,6 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     del models
     clean_memory_on_device(device)
     synchronize_device(device)
-
-    # wait for 5 seconds until block swap is done
-    if args.blocks_to_swap > 0:
-        logger.info("Waiting for 5 seconds to finish block swap")
-        time.sleep(5)
 
     gc.collect()
     clean_memory_on_device(device)

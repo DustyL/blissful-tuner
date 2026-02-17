@@ -58,6 +58,42 @@ class WanNetworkTrainer(NetworkTrainer):
         self._i2v_training = "i2v" in args.task or "flf2v" in args.task
         self._control_training = self.config.is_fun_control
 
+        if self.config.v2_2:
+            recommended_flow_shift = None
+            if args.task == "t2v-A14B":
+                recommended_flow_shift = 12.0
+            elif args.task == "i2v-A14B":
+                recommended_flow_shift = 5.0
+
+            timestep_sampling = getattr(args, "timestep_sampling", None)
+            discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
+
+            if timestep_sampling == "sigma":
+                rec = (
+                    f" (recommended: --timestep_sampling shift --discrete_flow_shift {recommended_flow_shift})"
+                    if recommended_flow_shift is not None
+                    else " (recommended: --timestep_sampling shift)"
+                )
+                default_note = (
+                    "The base defaults (sigma/1.0) often produce suboptimal results for WAN 2.2."
+                    if discrete_flow_shift == 1.0
+                    else "Sigma-based timestep sampling often produces suboptimal results for WAN 2.2."
+                )
+                logger.warning(
+                    f"WAN 2.2 task '{args.task}' is using --timestep_sampling sigma{rec}. "
+                    f"{default_note}"
+                )
+            elif (
+                isinstance(timestep_sampling, str)
+                and timestep_sampling.endswith("shift")
+                and recommended_flow_shift is not None
+                and discrete_flow_shift == 1.0
+            ):
+                logger.warning(
+                    f"WAN 2.2 task '{args.task}' is using --timestep_sampling {timestep_sampling} but --discrete_flow_shift is still 1.0 (default). "
+                    f"Consider --discrete_flow_shift {recommended_flow_shift}."
+                )
+
         self.dit_dtype = detect_wan_sd_dtype(args.dit)
 
         if self.dit_dtype == torch.float16:
@@ -86,8 +122,10 @@ class WanNetworkTrainer(NetworkTrainer):
                     "Block swap is not supported with offloading inactive DiT / 非アクティブDiTをオフロードする設定ではブロックスワップはサポートされていません"
                 )
             if args.num_timestep_buckets is not None:
-                logger.warning(
-                    "num_timestep_buckets is not working well with high and low models training / high and lowモデルのトレーニングではnum_timestep_bucketsがうまく機能しません"
+                raise ValueError(
+                    "num_timestep_buckets is incompatible with dual-expert (high/low noise) training. "
+                    "The rejection sampling loop conflicts with bucketed timestep distribution, "
+                    "producing heavily skewed effective sampling. Remove --num_timestep_buckets."
                 )
 
         self.timestep_boundary = (
@@ -564,7 +602,11 @@ class WanNetworkTrainer(NetworkTrainer):
         high_noise = sample_timesteps[0] / 1000.0 >= self.timestep_boundary
         self.next_model_is_high_noise = high_noise
 
-        # choose each member of latents for high or low noise model. because we want to train all the latents
+        # Rejection sampling: resample each batch element until it falls in the active expert's range.
+        # This preserves p(t | t in region) for any sampler type (shift, logsnr, qinglong, etc).
+        # Performance: ~8 retries avg for high-noise (12.5% acceptance), ~1.1 for low-noise (87.5%).
+        # TODO(TP-02): Could vectorize by decoupling timestep sampling from noisy input computation
+        # in the base class, then sampling N candidates at once and filtering.
         num_max_calls = 100
         final_noisy_model_inputs = []
         final_timesteps_list = []

@@ -347,7 +347,7 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     return sigma
 
 
-def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype):
+def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype, n_dim: int = 5):
     """Computes loss weighting scheme for SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
@@ -355,7 +355,7 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
     """
     if weighting_scheme == "sigma_sqrt" or weighting_scheme == "cosmap" or weighting_scheme == "structure_bell":
-        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=n_dim, dtype=dtype)
         if weighting_scheme == "sigma_sqrt":
             weighting = (sigmas**-2.0).float()
         elif weighting_scheme == "cosmap":
@@ -1182,7 +1182,9 @@ class NetworkTrainer:
         sampled_weighting = [0] * noise_scheduler.config.num_train_timesteps
         for i in tqdm(range(len(sampled_weighting))):
             timesteps = torch.tensor([i + 1], device="cpu")
-            weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, "cpu", torch.float16)
+            weighting = compute_loss_weighting_for_sd3(
+                args.weighting_scheme, noise_scheduler, timesteps, "cpu", torch.float16, n_dim=latents.ndim
+            )
             if weighting is None:
                 weighting = torch.tensor(1.0, device="cpu")
             elif torch.isinf(weighting).any():
@@ -1870,6 +1872,11 @@ class NetworkTrainer:
         logger.info(f"Load dataset config from {args.dataset_config}")
         user_config = config_utils.load_user_config(args.dataset_config)
         blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
+
+        mask_loss_warning = config_utils.get_mask_loss_disabled_warning(args, blueprint)
+        if mask_loss_warning is not None:
+            logger.warning(mask_loss_warning)
+
         train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
             blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
         )
@@ -2429,7 +2436,7 @@ class NetworkTrainer:
                     )
 
                     weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
+                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype, n_dim=latents.ndim
                     )
 
                     # Compute prior prediction if prior preservation is enabled

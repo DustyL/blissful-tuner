@@ -659,6 +659,7 @@ def save_latent_cache_z_image(
     latent: torch.Tensor,
     control_latents: Optional[List[torch.Tensor]] = None,
     siglip_features: Optional[List[torch.Tensor]] = None,
+    mask_weights: Optional[torch.Tensor] = None,
 ):
     """
     Z-Image architecture cache saver.
@@ -673,11 +674,16 @@ def save_latent_cache_z_image(
         control_latents: List of [C, H, W] control image latents
         siglip_features: List of [H_sig, W_sig, D_sig] SigLIP2 features
 
+    Mask-weighted loss (optional):
+        mask_weights: Optional mask weights for weighted loss training. Expected to be in latent space
+        resolution and saved as float32 for precision.
+
     Args:
         item_info: Item metadata for cache path
         latent: Target image latent [C, H, W]
         control_latents: Optional list of control image latents (OmniBase)
         siglip_features: Optional list of SigLIP2 features (OmniBase)
+        mask_weights: Optional mask weights tensor (see above)
     """
     assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
 
@@ -708,6 +714,12 @@ def save_latent_cache_z_image(
             assert sig.dim() == 3, f"siglip_features[{i}] should be 3D tensor [H, W, C]"
             sig_dtype = dtype_to_str(sig.dtype)
             sd[f"siglip_{i}_{sig_dtype}"] = sig.detach().cpu().contiguous()
+
+    if mask_weights is not None:
+        # Save mask weights in latent space dimensions as float32 for precision.
+        # Common convention in this repo is per-item mask shape like (1, 1, H, W) (then stacked to (B, 1, 1, H, W)).
+        mask_dtype_str = dtype_to_str(torch.float32)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 

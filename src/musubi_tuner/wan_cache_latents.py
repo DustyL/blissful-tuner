@@ -11,7 +11,7 @@ from blissful_tuner.blissful_logger import BlissfulLogger
 
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, save_latent_cache_wan, ARCHITECTURE_WAN
 from musubi_tuner.utils.model_utils import str_to_dtype
-from musubi_tuner.wan.configs import wan_i2v_14B
+from musubi_tuner.wan.configs import WAN_CONFIGS, wan_i2v_14B
 from musubi_tuner.wan.modules.vae import WanVAE
 from musubi_tuner.wan.modules.clip import CLIPModel
 import musubi_tuner.cache_latents as cache_latents
@@ -22,7 +22,32 @@ logger = BlissfulLogger(__name__, "green")
 black_image_latents = {}  # global variable for black image latent, used in encode_and_save_batch_one_frame. key: tuple for shape
 
 
-def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, batch: list[ItemInfo], one_frame: bool = False):
+def validate_wan_cache_latents_args(args: argparse.Namespace) -> None:
+    """Validate WAN cache-latents args for task-specific incompatibilities."""
+    if getattr(args, "clip", None) is None:
+        return
+
+    task = getattr(args, "task", None)
+    if task is None:
+        return
+
+    config = WAN_CONFIGS[task]
+    if getattr(config, "v2_2", False):
+        raise ValueError(
+            f"--clip is specified but task '{task}' is a WAN 2.2 model which does not use CLIP. "
+            "CLIP is only used for WAN 2.1 I2V caching/training. "
+            "For WAN 2.2 I2V, use --i2v without --clip."
+        )
+
+
+def encode_and_save_batch(
+    vae: WanVAE,
+    clip: Optional[CLIPModel],
+    i2v: bool,
+    batch: list[ItemInfo],
+    one_frame: bool = False,
+    allow_nonconforming_frames: bool = False,
+):
     if one_frame:
         encode_and_save_batch_one_frame(vae, clip, batch)
         return
@@ -35,10 +60,41 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
     contents = contents.to(vae.device, dtype=vae.dtype)
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
+    # LC-01: Validate T=4k+1 frame count constraint for WAN VAE temporal compression.
+    # The VAE compresses frames in groups of 4 (vae_stride_t=4), requiring T=4k+1 for clean division.
+    num_frames = contents.shape[2]
+    if num_frames > 1 and (num_frames - 1) % 4 != 0:
+        first_item = batch[0] if batch else None
+        first_item_key = getattr(first_item, "item_key", None)
+        more_items = f" (+{len(batch) - 1} more in batch)" if batch and len(batch) > 1 else ""
+        item_hint = f" Offending item: {first_item_key}{more_items}." if first_item_key else ""
+        msg = (
+            f"Video frame count {num_frames} does not satisfy the T=4k+1 constraint required by the WAN VAE "
+            f"(valid counts: 5, 9, 13, ..., 77, 81, 85, ...).{item_hint}"
+        )
+        if allow_nonconforming_frames:
+            logger.warning(f"{msg} Proceeding anyway (--allow_nonconforming_frames).")
+        else:
+            raise ValueError(f"{msg} Use --allow_nonconforming_frames to override this check.")
+
     h, w = contents.shape[3], contents.shape[4]
     if h < 8 or w < 8:
         item = batch[0]  # other items should have the same size
         raise ValueError(f"Image or video size too small: {item.item_key} and {len(batch) - 1} more, size: {item.original_size}")
+
+    for item in batch:
+        if item.mask_content is None:
+            continue
+        if item.mask_content.ndim != 2:
+            raise ValueError(
+                f"Mask for {item.item_key} must be a 2D grayscale array (H, W), but got shape {item.mask_content.shape}."
+            )
+        mask_h, mask_w = item.mask_content.shape
+        if (mask_h, mask_w) != (h, w):
+            raise ValueError(
+                f"Mask spatial dimensions (H={mask_h}, W={mask_w}) do not match content dimensions (H={h}, W={w}) for {item.item_key}. "
+                "This usually means the mask was not resized/cropped to the same bucket resolution as the image/video."
+            )
 
     # print(f"encode batch: {contents.shape}")
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
@@ -58,27 +114,25 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
             clip_context = None
 
         # encode image latent for I2V
-        B, _, _, lat_h, lat_w = latent.shape
-        num_frames = contents.shape[2]
+        B, _, lat_f, lat_h, lat_w = latent.shape
 
-        # Create mask for the required number of frames
-        msk = torch.ones(1, num_frames, lat_h, lat_w, dtype=vae.dtype, device=vae.device)
-        msk[:, 1:] = 0
-        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)  # 1, num_frames, 4, H, W -> 1, 4, num_frames, H, W
-        msk = msk.repeat(B, 1, 1, 1, 1)  # B, 4, num_frames, H, W
+        # I2V temporal mask: first latent frame = 1 (known image), rest = 0 (to generate).
+        # 4 mask channels match the WAN I2V input format: 16 noisy + 4 mask + 16 image = 36 channels.
+        # (The 4 corresponds to the VAE temporal scale factor / grouping.)
+        msk = torch.zeros(B, 4, lat_f, lat_h, lat_w, dtype=vae.dtype, device=vae.device)
+        msk[:, :, 0] = 1
 
-        # Zero padding for the required number of frames only
-        padding_frames = num_frames - 1  # The first frame is the input image
-        images_resized = torch.concat([images, torch.zeros(B, 3, padding_frames, h, w, device=vae.device)], dim=2)
+        # Pad reference image with zeros to full video length, then VAE-encode.
+        # Zero-padding produces naturally decayed latents for non-reference frames.
+        padding_frames = num_frames - 1
+        images_padded = torch.concat([images, images.new_zeros((B, 3, padding_frames, h, w))], dim=2)
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            y = vae.encode(images_resized)
-        y = torch.stack(y, dim=0)  # B, C, num_frames, H, W
+            y = vae.encode(images_padded)
+        y = torch.stack(y, dim=0)  # B, C, lat_f, H, W
+        y = y.to(vae.dtype)
 
-        y = y[:, :, :num_frames]  # may be not needed
-        y = y.to(vae.dtype)  # convert to bfloat16
-        y = torch.concat([msk, y], dim=1)  # B, 4 + C, num_frames, H, W
+        # Concatenate mask + image latent → 20-channel I2V conditioning tensor
+        y = torch.concat([msk, y], dim=1)  # B, 4 + C, lat_f, H, W
 
     else:
         clip_context = None
@@ -163,6 +217,21 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
     _, _, contents, content_masks = cache_latents.preprocess_contents(batch)
     contents = contents.to(vae.device, dtype=vae.dtype)  # B, C, F, H, W
     assert contents.shape[2] >= 2, "One frame training requires at least 1 control frame and 1 target frame"
+
+    h, w = contents.shape[3], contents.shape[4]
+    for item in batch:
+        if item.mask_content is None:
+            continue
+        if item.mask_content.ndim != 2:
+            raise ValueError(
+                f"Mask for {item.item_key} must be a 2D grayscale array (H, W), but got shape {item.mask_content.shape}."
+            )
+        mask_h, mask_w = item.mask_content.shape
+        if (mask_h, mask_w) != (h, w):
+            raise ValueError(
+                f"Mask spatial dimensions (H={mask_h}, W={mask_w}) do not match content dimensions (H={h}, W={w}) for {item.item_key}. "
+                "This usually means the mask was not resized/cropped to the same bucket resolution as the image/video."
+            )
 
     # print(f"encode batch: {contents.shape}")
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
@@ -262,6 +331,8 @@ def main():
         logger.info("Disabling cuDNN PyTorch backend.")
         torch.backends.cudnn.enabled = False
 
+    validate_wan_cache_latents_args(args)
+
     if args.clip is not None:
         args.i2v = True
 
@@ -294,18 +365,31 @@ def main():
 
     if args.clip is not None:
         clip_dtype = wan_i2v_14B.i2v_14B["clip_dtype"]
+        task = getattr(args, "task", None)
+        if task is not None:
+            task_config = WAN_CONFIGS[task]
+            clip_dtype = getattr(task_config, "clip_dtype", clip_dtype)
         clip = CLIPModel(dtype=clip_dtype, device=device, weight_path=args.clip)
     else:
         clip = None
 
     # Encode images
+    allow_nonconforming = getattr(args, "allow_nonconforming_frames", False)
+
     def encode(one_batch: list[ItemInfo]):
-        encode_and_save_batch(vae, clip, args.i2v, one_batch, args.one_frame)
+        encode_and_save_batch(vae, clip, args.i2v, one_batch, args.one_frame, allow_nonconforming)
 
     cache_latents.encode_datasets(datasets, encode, args)
 
 
 def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        choices=list(WAN_CONFIGS.keys()),
+        help="WAN task key (optional). Enables task-specific validation for options like --clip.",
+    )
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
     parser.add_argument(
         "--i2v",
@@ -316,12 +400,18 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         "--clip",
         type=str,
         default=None,
-        help="text encoder (CLIP) checkpoint path, optional. If training Wan2.1 I2V model, this is required",
+        help="text encoder (CLIP) checkpoint path, optional. Required for WAN 2.1 I2V. Not used for WAN 2.2 A14B.",
     )
     parser.add_argument(
         "--one_frame",
         action="store_true",
         help="Generate cache for one frame training (single frame, single section).",
+    )
+    parser.add_argument(
+        "--allow_nonconforming_frames",
+        action="store_true",
+        help="Allow video frame counts that don't satisfy the T=4k+1 constraint (5, 9, 13, ..., 81, 85, ...). "
+        "Non-conforming frame counts may produce incorrect latents or reshape errors.",
     )
     return parser
 

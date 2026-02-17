@@ -532,7 +532,7 @@ class WanAttentionBlock(nn.Module):
 
         if nag_scale is not None:
             nag_tau = kwargs.get("nag_tau", 3.5)
-            nag_alpha = kwargs.get("nah_alpha", 0.5)
+            nag_alpha = kwargs.get("nag_alpha", 0.5)
             if model_version == "2.2" or cross_attn_type == "t2v_cross_attn":
                 self.cross_attn = NAGCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps, attn_mode, split_attn, nag_scale=nag_scale, nag_tau=nag_tau, nag_alpha=nag_alpha)
             else:  # Wan 2.1 I2V cross attention w/ NAG

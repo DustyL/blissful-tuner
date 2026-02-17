@@ -148,6 +148,46 @@ class Blueprint:
     dataset_group: DatasetGroupBlueprint
 
 
+def get_mask_loss_disabled_warning(args: argparse.Namespace, blueprint: Blueprint) -> Optional[str]:
+    """Return a warning message when mask sources are configured but mask loss is disabled.
+
+    This helps catch the common configuration issue where a user sets `mask_directory` and/or
+    `alpha_mask` in the dataset config, but forgets to pass `--use_mask_loss` during training.
+    """
+
+    if bool(getattr(args, "use_mask_loss", False)):
+        return None
+
+    mask_directory_datasets = 0
+    alpha_mask_datasets = 0
+    require_mask_datasets = 0
+
+    for dataset in blueprint.dataset_group.datasets:
+        params = dataset.params
+        if getattr(params, "mask_directory", None):
+            mask_directory_datasets += 1
+        if getattr(params, "alpha_mask", False):
+            alpha_mask_datasets += 1
+        if getattr(params, "require_mask", False):
+            require_mask_datasets += 1
+
+    if mask_directory_datasets == 0 and alpha_mask_datasets == 0 and require_mask_datasets == 0:
+        return None
+
+    parts = []
+    if mask_directory_datasets > 0:
+        parts.append(f"mask_directory on {mask_directory_datasets} dataset(s)")
+    if alpha_mask_datasets > 0:
+        parts.append(f"alpha_mask on {alpha_mask_datasets} dataset(s)")
+    if require_mask_datasets > 0:
+        parts.append(f"require_mask on {require_mask_datasets} dataset(s)")
+
+    return (
+        f"Mask sources are configured in the dataset config ({', '.join(parts)}), but --use_mask_loss is disabled. "
+        "Mask weights will be ignored during training. Add --use_mask_loss to enable mask-weighted loss."
+    )
+
+
 class ConfigSanitizer:
     # @curry
     @staticmethod

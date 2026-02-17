@@ -118,6 +118,22 @@ python src/musubi_tuner/wan_cache_latents.py --dataset_config path/to/toml --vae
 
 **If you train I2V models, add `--i2v` option to the above command.** For Wan2.1, add `--clip path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` to specify the CLIP model. If not specified, the training will raise an error. For Wan2.2, CLIP model is not required.
 
+Optionally, pass `--task` (e.g. `i2v-A14B`, `t2v-A14B`) to enable task-specific validation. In particular, `wan_cache_latents.py` will reject `--clip` for WAN 2.2 tasks (A14B), since they do not use CLIP.
+
+Recommended examples:
+
+```bash
+# WAN 2.2 I2V (A14B): no CLIP
+python src/musubi_tuner/wan_cache_latents.py --task i2v-A14B --i2v \
+  --dataset_config path/to/toml --vae path/to/Wan2.1_VAE.pth
+
+# WAN 2.1 I2V (14B): requires CLIP
+python src/musubi_tuner/wan_cache_latents.py --task i2v-14B --i2v --clip path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
+  --dataset_config path/to/toml --vae path/to/Wan2.1_VAE.pth
+```
+
+For video datasets, the WAN VAE expects frame counts to satisfy `T = 4k + 1` (e.g., 81, 85, 89). If your videos don’t conform, `wan_cache_latents.py` will raise a `ValueError` by default. You can bypass this check with `--allow_nonconforming_frames` (not recommended; may produce incorrect latents).
+
 If you're running low on VRAM, specify `--vae_cache_cpu` to use the CPU for the VAE internal cache, which will reduce VRAM usage somewhat.
 
 The control video settings are required for training the Fun-Control model. Please refer to [Dataset Settings](./dataset_config.md#sample-for-video-dataset-with-control-images) for details.
@@ -130,6 +146,20 @@ The control video settings are required for training the Fun-Control model. Plea
 latentの事前キャッシングは上のコマンド例を使用してキャッシュを作成してください。
 
 **I2Vモデルを学習する場合は、`--i2v` オプションを上のコマンドに追加してください。**Wan2.1の場合は、`--clip path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` を追加してCLIPモデルを指定してください。指定しないと学習時にエラーが発生します。Wan2.2ではCLIPモデルは不要です。
+
+必要に応じて `--task`（例: `i2v-A14B`, `t2v-A14B`）を指定すると、タスク依存のバリデーションが有効になります。特にWAN 2.2（A14B）はCLIPを使わないため、`wan_cache_latents.py` は `--clip` を指定した場合にエラーにします。
+
+推奨コマンド例:
+
+```bash
+# WAN 2.2 I2V (A14B): CLIPは不要
+python src/musubi_tuner/wan_cache_latents.py --task i2v-A14B --i2v \
+  --dataset_config path/to/toml --vae path/to/Wan2.1_VAE.pth
+
+# WAN 2.1 I2V (14B): CLIPが必要
+python src/musubi_tuner/wan_cache_latents.py --task i2v-14B --i2v --clip path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
+  --dataset_config path/to/toml --vae path/to/Wan2.1_VAE.pth
+```
 
 VRAMが不足している場合は、`--vae_cache_cpu` を指定するとVAEの内部キャッシュにCPUを使うことで、使用VRAMを多少削減できます。
 

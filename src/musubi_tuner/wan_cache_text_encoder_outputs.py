@@ -21,6 +21,11 @@ def encode_and_save_batch(
     text_encoder: T5EncoderModel, batch: list[ItemInfo], device: torch.device, accelerator: Optional[accelerate.Accelerator]
 ):
     prompts = [item.caption for item in batch]
+    empty = [item.item_key for item, p in zip(batch, prompts) if p is None or str(p).strip() == ""]
+    if empty:
+        preview = ", ".join(empty[:3])
+        suffix = "..." if len(empty) > 3 else ""
+        logger.warning(f"Empty captions found for {len(empty)} items (first: {preview}{suffix}).")
     # print(prompts)
 
     # encode prompt
