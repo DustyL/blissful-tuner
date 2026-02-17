@@ -459,17 +459,25 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         noisy_model_input = qwen_image_utils.pack_latents(noisy_model_input)
         img_seq_len = noisy_model_input.shape[1]
 
-        # control
+        # control — collect contiguous latents_control_0 .. latents_control_N keys
         num_control_images = 0
         if is_edit:
-            while True:
-                key = f"latents_control_{num_control_images}"
-                if key in batch:
-                    num_control_images += 1
-                else:
-                    break
-            # Sanity-check: Edit-original uses 1 control image; Edit-2509/2511 can use more.
-            # An unreasonable count (>16) likely indicates a malformed latent cache.
+            while f"latents_control_{num_control_images}" in batch:
+                num_control_images += 1
+
+            # Detect non-contiguous keys (e.g. _0 and _2 but missing _1) which indicate a
+            # corrupted latent cache.  We only need to scan up to num_control_images + a
+            # small window — a full batch-key scan is unnecessary.
+            next_gap = num_control_images
+            while next_gap < num_control_images + 4:
+                if f"latents_control_{next_gap}" in batch:
+                    raise ValueError(
+                        f"Non-contiguous control image keys in batch: 'latents_control_{num_control_images}' is missing "
+                        f"but 'latents_control_{next_gap}' exists. This indicates a corrupted latent cache — "
+                        f"recache with the correct Edit model_version."
+                    )
+                next_gap += 1
+
             if num_control_images > 16:
                 raise ValueError(
                     f"Found {num_control_images} control images in batch — this is likely a malformed latent cache. "

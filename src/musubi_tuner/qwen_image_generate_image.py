@@ -366,6 +366,9 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
     args_copy._guidance_scale_was_set = guidance_scale_was_set
     args_copy._true_cfg_scale_was_set = true_cfg_scale_was_set
 
+    if "infer_steps" in overrides and args_copy.infer_steps < 1:
+        raise ValueError(f"--infer_steps must be >= 1, got {args_copy.infer_steps} (from prompt-file override)")
+
     return args_copy
 
 
