@@ -120,6 +120,15 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
             "Non-zero mask_min_weight reduces prior preservation effect. Recommend --mask_min_weight 0.0"
         )
 
+    # TP-11: Warn when prior preservation is active but normalize_per_sample is off.
+    normalize_per_sample = getattr(args, "normalize_per_sample", False)
+    if prior_preservation_weight > 0 and not normalize_per_sample:
+        _logger.warning(
+            "--prior_preservation_weight > 0 without --normalize_per_sample: "
+            "global normalization may cause per-sample loss imbalance when mask coverage varies across the batch. "
+            "Consider adding --normalize_per_sample for more predictable behavior."
+        )
+
 
 def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str | None = None) -> None:
     if not getattr(args, "use_mask_loss", False):
@@ -366,6 +375,10 @@ def apply_masked_loss_with_prior(
         # Global weighted mean; weight sum scaled by channels (compact mask has 1 where loss has C)
         target_weight_sum = mask_processed.sum(dtype=torch.float32) * num_channels
         if target_weight_sum < 1e-8:
+            _logger.warning(
+                "All-zero mask weights detected — target loss is zero for this batch. "
+                "This means no training signal is being applied. Check your mask images."
+            )
             L_target = loss.new_zeros((), dtype=torch.float32)
         else:
             L_target = target_loss_weighted.sum(dtype=torch.float32) / target_weight_sum

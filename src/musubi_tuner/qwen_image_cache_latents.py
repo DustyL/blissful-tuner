@@ -145,7 +145,31 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
         mask_weights_i = None
         if item.mask_content is not None:
             # mask_content is (H, W) grayscale numpy array with values 0-255
-            mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask_np = item.mask_content
+
+            # C4: Warn on all-zero masks (would produce zero training signal)
+            if mask_np.sum() == 0:
+                logger.warning(
+                    f"All-zero mask for '{item.item_key}' — this item will contribute zero training signal. "
+                    f"Check that the mask file is correct."
+                )
+
+            # C5: Warn on aspect ratio mismatch between mask and target image
+            mask_h, mask_w = mask_np.shape[:2]
+            # target_latent is (C, L, H, W); original image was VAE_SCALE_FACTOR * latent dims
+            img_h = target_latent.shape[2] * qwen_image_utils.VAE_SCALE_FACTOR
+            img_w = target_latent.shape[3] * qwen_image_utils.VAE_SCALE_FACTOR
+            if img_h > 0 and img_w > 0 and mask_h > 0 and mask_w > 0:
+                img_ar = img_w / img_h
+                mask_ar = mask_w / mask_h
+                if abs(img_ar - mask_ar) / max(img_ar, mask_ar) > 0.10:
+                    logger.warning(
+                        f"Mask aspect ratio ({mask_w}x{mask_h}, AR={mask_ar:.2f}) differs >10%% from target "
+                        f"({img_w}x{img_h}, AR={img_ar:.2f}) for '{item.item_key}'. "
+                        f"Spatial regions may be misaligned after resize."
+                    )
+
+            mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
             mask = mask.float() / 255.0  # Normalize to [0, 1]
 
             # Get latent dimensions from target_latent: (C, L, H, W)
@@ -157,7 +181,7 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
             # Reshape to (1, L, lat_h, lat_w) to match convention
             mask = mask.squeeze(1).unsqueeze(1).expand(-1, lat_l, -1, -1)  # (1, L, lat_h, lat_w)
             mask_weights_i = mask  # Keep as (1, L, H, W)
-        print(
+        logger.debug(
             f"Saving cache for item {item.item_key} at {item.latent_cache_path}, "
             f"target latents shape: {target_latent.shape}, "
             f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}, "

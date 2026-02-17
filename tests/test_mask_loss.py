@@ -359,6 +359,26 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         expected = torch.tensor(1.05 + 5.0)
         self.assertTrue(torch.allclose(result, expected, rtol=0, atol=1e-5))
 
+    def test_all_zero_mask_emits_warning(self) -> None:
+        """V1: All-zero masks should warn that training signal is zero."""
+        loss = torch.ones(1, 1, 1, 1, 1, dtype=torch.float32)
+        mask_weights = torch.zeros(1, 1, 1, 1, dtype=torch.float32)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        with self.assertLogs("musubi_tuner.modules.mask_loss", level="WARNING") as cm:
+            result = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
+
+        self.assertTrue(any("All-zero mask" in m for m in cm.output), cm.output)
+        self.assertTrue(torch.allclose(result, torch.tensor(0.0), atol=1e-6))
+
 
 class TestValidateMaskLossArgs(unittest.TestCase):
     def test_raises_error_for_prior_without_mask_loss(self) -> None:
