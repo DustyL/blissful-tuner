@@ -158,7 +158,6 @@ def main():
 
     logger.info(f"Loading AE model from {args.vae}")
     ae = flux2_utils.load_ae(args.vae, dtype=vae_dtype, device=device, disable_mmap=True)
-    ae.to(device)
     ae.eval()
 
     # encoding closure

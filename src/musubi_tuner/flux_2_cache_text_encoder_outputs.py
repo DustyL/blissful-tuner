@@ -46,7 +46,9 @@ def encode_and_save_batch(
         #     ctx_prompt = text_embedder(prompts).to(torch.bfloat16)
         #     ctx_vec = torch.cat([ctx_empty, ctx_prompt], dim=0)
         ctx_vec = ctx_vec.to(torch.bfloat16)
-        flux2_utils.validate_ctx_vec_dim(ctx_vec, _model_version_info, source="flux_2_cache_text_encoder_outputs.encode_and_save_batch()")
+        flux2_utils.validate_ctx_vec_dim(
+            ctx_vec, _model_version_info, source="flux_2_cache_text_encoder_outputs.encode_and_save_batch()"
+        )
         ctx_vec = ctx_vec.cpu()  # [1, 512, 15360]
 
     # save prompt cache

@@ -540,14 +540,16 @@ def prepare_image_inputs(args: argparse.Namespace, device: torch.device, ae: flu
     height, width = check_inputs(args)
 
     if args.control_image_path is not None and len(args.control_image_path):
-        img_ctx = [Image.open(input_image) for input_image in args.control_image_path]
-        # ref_tokens, ref_ids = encode_image_refs(ae, img_ctx)
+        img_ctx = []
+        for input_image in args.control_image_path:
+            img = Image.open(input_image)
+            img.load()  # Eagerly read pixel data so file handle can be released by GC
+            img_ctx.append(img)
+
         if len(img_ctx) > 1:
             limit_pixels = 1024**2
-        elif len(img_ctx) == 1:
-            limit_pixels = 2024**2
         else:
-            limit_pixels = None
+            limit_pixels = 2024**2
 
         if args.no_resize_control:
             if limit_pixels is not None:
@@ -781,7 +783,7 @@ def generate(
             shared_models["model"] = model
     else:
         # use shared model
-        model: flux2_models.Flux = shared_models["model"]
+        model: flux2_models.Flux2 = shared_models["model"]
         model.move_to_device_except_swap_blocks(device)  # Handles block swap correctly
         model.prepare_block_swap_before_forward()
 
@@ -890,9 +892,10 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
             "infer_steps": f"{args.infer_steps}",
             "embedded_cfg_scale": f"{args.embedded_cfg_scale}",
             "guidance_scale": f"{args.guidance_scale}",
+            "model_version": f"{args.model_version}",
         }
-        # if args.negative_prompt is not None:
-        #     metadata["negative_prompt"] = f"{args.negative_prompt}"
+        if args.negative_prompt is not None:
+            metadata["negative_prompt"] = f"{args.negative_prompt}"
 
     sd = {"latent": latent.contiguous()}
     save_file(sd, latent_path, metadata=metadata)

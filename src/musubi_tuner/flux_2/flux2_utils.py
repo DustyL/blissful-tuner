@@ -273,6 +273,7 @@ def preprocess_control_image(
             - None: Placeholder for compatibility.
     """
     control_image = Image.open(control_image_path)
+    control_image.load()  # Eagerly read pixel data so file handle can be released by GC
 
     if limit_size is None or limit_size[0] * limit_size[1] >= control_image.size[0] * control_image.size[1]:
         # No resizing needed - snap to bucket resolution (FLUX.2 requires multiples of 16)

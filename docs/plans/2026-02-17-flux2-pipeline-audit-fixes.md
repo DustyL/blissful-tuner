@@ -1,6 +1,6 @@
-# FLUX.2 Pipeline Audit — Complete Findings & Fix Plan (v4)
+# FLUX.2 Pipeline Audit — Complete Findings & Fix Plan (v4.2)
 
-**Date:** 2026-02-17 (v4: Phase 4 complete — all findings addressed)
+**Date:** 2026-02-17 (v4.2: I2-I11 cleanup pass complete — all findings addressed)
 **Scope:** Full audit of FLUX.2 LoRA training pipeline (training, caching, generation, LoRA conversion) against updated architecture documentation (`docs/flux2_architecture.md`, `docs/flux_2.md`).
 **Method:** 6 parallel sub-agents audited: (1) Training script, (2) Model definitions, (3) Utils/text encoding, (4) Caching scripts, (5) Generation pipeline, (6) LoRA targeting/conversion.
 
@@ -54,6 +54,32 @@ After v4/Phase 4 completion, additional Flux.2‑Dev / FLUX.2‑klein‑9B / FLU
 
 - `./venv/bin/ruff check` clean
 - `./venv/bin/python -m pytest -q` → **330 passed, 8 skipped**
+
+---
+
+## Post‑v4.1 Addendum (v4.2) — I2-I11 Cleanup Pass (2026-02-17)
+
+All remaining INFO-severity findings from Phase 4 step 4.5 have been addressed. These are dead code removal, type annotation fixes, PIL handle cleanup, and metadata gaps.
+
+### Changes
+
+| Finding | Description | File(s) | Fix |
+|---------|-------------|---------|-----|
+| I2 | Dead `vanilla_guidance()` and `encode_image_refs()` | `flux2_utils.py`, `flux_2_generate_image.py` | Removed functions + commented-out reference |
+| I4 | Wrong return type on `preprocess_contents_flux_2` | `flux_2_cache_latents.py` | Already correct after C3 fix (no change needed) |
+| I5 | Dead `else: limit_pixels = None` branch | `flux_2_generate_image.py` | Simplified to `if/else` (len always ≥ 1 inside guard) |
+| I6 | Redundant `ae.to(device)` after `load_ae` | `flux_2_cache_latents.py` | Removed (load_ae already loads to device) |
+| I7 | Unused `guidance_distilled` parameter | `flux_2_cache_text_encoder_outputs.py` | Removed parameter + caller arg + dead TODO block |
+| I8 | Type annotation `Flux` → `Flux2` | `flux_2_generate_image.py` | Fixed |
+| I9 | Dead `t_coords` variable in `scatter_ids` | `flux2_utils.py` | Removed initialization + append |
+| I10 | PIL Image handles not eagerly loaded | `flux_2_generate_image.py`, `flux2_utils.py` | Added `.load()` after `Image.open()` for eager pixel read |
+| I11 | Missing metadata fields | `flux_2_generate_image.py` | Uncommented negative prompt metadata; added `model_version` |
+
+### Validation (post‑v4.2)
+
+- `./venv/bin/ruff check` clean
+- `./venv/bin/ruff format --check` clean
+- `./venv/bin/python -m pytest -q` → **358 passed, 8 skipped**
 
 ### Implementation Status
 
@@ -773,7 +799,7 @@ logger.info(f"Using device: {device}, DiT weight weight precision: {dit_weight_d
 | 4.2 | W12 | `flux_2_generate_image.py` | DONE — Dead `--i` handler removed |
 | 4.3 | W11 | `flux_2_generate_image.py` | DONE — VAE loaded once before interactive loop via `shared_models["ae"]` |
 | 4.4 | W10 | `flux_2_generate_image.py` | DONE — `--prompt_wildcards` + `process_wildcards()` in all 3 code paths. Prompt weighting deferred (needs Mistral3/Qwen3 wrapper). |
-| 4.5 | I2-I11 | Various | OPEN — Dead code removal, type annotations, metadata (low priority) |
+| 4.5 | I2-I11 | Various | DONE — All INFO items addressed (see v4.2 addendum below) |
 
 ### Suggested Future Work (from implementation learnings)
 
@@ -783,7 +809,6 @@ logger.info(f"Using device: {device}, DiT weight weight precision: {dit_weight_d
 | C4 `--strict` mode | Refuse FLUX conversions when `ss_network_module` missing and `--arch auto` is ambiguous | Low |
 | Per-architecture latent ndim registry | Centralize `latents.ndim` knowledge to avoid future hardcoded `n_dim` bugs | Low |
 | Prompt weighting for Mistral3/Qwen3 | `MiniT5Wrapper` is T5-specific; need a new embedder wrapper for FLUX.2's text encoders | Medium |
-| I2-I11 cleanup pass | Dead code removal (`vanilla_guidance`, `encode_image_refs`, `t_coords`), type annotations, PIL context managers, metadata gaps | Low |
 
 ---
 
