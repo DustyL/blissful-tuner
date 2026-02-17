@@ -502,7 +502,7 @@ VRAMが限られている環境（例：48GB以下）の場合は、`--full_bf16
 
 Inference uses a dedicated script `qwen_image_generate_image.py`.
 
-> **Note on inference steps**: The default in this framework is 25 steps. The official Qwen-Image examples use **50 steps** for T2I and **40 steps** for Edit-2509/2511. Higher step counts generally produce better quality at the cost of slower generation. Adjust `--infer_steps` based on your quality/speed tradeoff.
+> **Note on inference steps**: Defaults are model-version dependent: **50 steps** for T2I/Layered and **40 steps** for Edit-2509/2511, matching the official Qwen-Image examples. Adjust `--infer_steps` based on your quality/speed tradeoff.
 
 > **Note on guidance for Edit-2509/2511**: The official Edit-2509/2511 pipeline uses `guidance_scale=1.0` (disabling standard CFG) combined with `true_cfg_scale=4.0` (using true CFG with a separate unconditional pass). In this framework, `--guidance_scale 4.0` is used as the primary guidance parameter.
 
@@ -692,3 +692,31 @@ RCMは、denoisingループの各ステップで以下の処理を実行しま�
 この自己修正的なメカニズムにより、denoisingプロセス全体を通して位置誤差が蓄積されるのを防ぎ、背景や顔のような変更しない要素が完全に位置ずれなく維持されることを保証します。
 
 </details>
+
+---
+
+## Known Limitations and Notes
+
+### Mask-Weighted Loss Training for Qwen-Image
+
+Qwen-Image supports mask-weighted loss for both standard and Edit variants. See [Masked Loss Training Guide](./MASKED_LOSS_TRAINING_GUIDE.md) for full details.
+
+**Layered model limitations:**
+
+- **Prior preservation is not available for the Layered layout.** The `--prior_preservation_weight` flag will raise `NotImplementedError` when used with Layered training. This is because the Layered loss layout (`B, L, C, H, W`) requires a different prior-mask decomposition that has not been implemented. Use `--mask_min_weight` as an alternative to prevent hallucination in unmasked regions.
+
+- **Alpha channel conflict:** Layered models require RGBA images where the alpha channel defines **layer transparency** (which pixels belong to each layer). If you also enable `alpha_mask=true` in your dataset config, the alpha channel is hijacked for loss weighting, conflicting with its semantic purpose. **Use separate `mask_directory` files** for mask-weighted loss with Layered models instead of `alpha_mask=true`.
+
+- **No per-layer masks.** A single mask is applied identically across all layers via `.expand()`. You cannot specify different mask weights for different layers (e.g., stronger weight on layer 1, weaker on layer 3). This is a known limitation of the current implementation.
+
+### Control Image Processing
+
+- **Control images are downsampled to 384x384** before being passed to the Qwen2.5-VL text encoder for the semantic path. This is the `CONDITION_IMAGE_RESOLUTION` constant in `qwen_image_utils.py`. The appearance path (VAE-encoded latents) uses full resolution. This matches the official Qwen-Image pipeline behavior.
+
+### Prompt Enhancement
+
+The official Qwen-Image pipeline includes a prompt enhancement system with language detection and category-specific rewriting (via Qwen-Plus API for T2I, Qwen-VL-Max for editing). This framework uses prompts as-is without automatic enhancement. If you are getting lower-quality results compared to official demos, consider manually writing more detailed, descriptive prompts.
+
+### Guidance Embeddings
+
+Current Qwen-Image models have `guidance_embeds=false` in their config, so the framework hardcodes `guidance=None`. If a future Qwen-Image variant enables guidance embeddings, the generation script would need to be updated to construct the guidance tensor from the model config.
