@@ -8,10 +8,17 @@ from musubi_tuner import (
     flux_2_generate_image,
     flux_kontext_generate_image,
     fpack_generate_video,
+    hv_1_5_generate_video,
     hv_generate_video,
     qwen_image_generate_image,
+    wan_generate_video,
     zimage_generate_image,
 )
+
+try:
+    from musubi_tuner import kandinsky5_generate_video
+except ImportError:
+    kandinsky5_generate_video = None
 
 
 class TestLoraMultiplierDefaults(unittest.TestCase):
@@ -72,9 +79,23 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
                 qwen_image_generate_image,
                 ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"],
             ),
+            (
+                wan_generate_video,
+                ["prog", "--save_path", "x", "--prompt", "x"],
+            ),
+            (
+                hv_1_5_generate_video,
+                ["prog", "--save_path", "x", "--prompt", "x"],
+            ),
+            (
+                kandinsky5_generate_video,
+                ["prog", "--dit", "x", "--save_path", "x", "--prompt", "x"],
+            ),
         ]
 
         for module, argv in cases:
+            if module is None:
+                continue
             with self.subTest(module=module.__name__):
                 args = self._parse(module, argv)
                 self.assertIsNone(args.lora_multiplier)
@@ -228,15 +249,11 @@ class TestZImageCfgArgs(unittest.TestCase):
             self._parse_zimage(["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--cfg_truncation", "1.5"])
 
         with self.assertRaises(ValueError):
-            self._parse_zimage(
-                ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--cfg_truncation", "-0.1"]
-            )
+            self._parse_zimage(["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--cfg_truncation", "-0.1"])
 
     def test_cfg_normalization_range_enforced(self):
         with self.assertRaises(ValueError):
-            self._parse_zimage(
-                ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--cfg_normalization", "0.0"]
-            )
+            self._parse_zimage(["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x", "--cfg_normalization", "0.0"])
 
     def test_fp8_llm_dtype_resolves_cuda_only(self):
         cpu_args = type("Args", (), {"fp8_llm": True})()

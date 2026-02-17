@@ -1,9 +1,9 @@
 # Z-Image LoRA Pipeline Audit — Action Plan
 
 **Created**: 2026-02-17
-**Revised**: 2026-02-17 (v5 — Phase 5 implemented)
+**Revised**: 2026-02-17 (v7 — All phases complete)
 **Source**: Comprehensive audit of Z-Image training/inference pipeline against `docs/z-image-integration-reference.md` v2.3
-**Status**: In Progress — Phases 1–5 complete, Phase 6+ pending
+**Status**: Complete — All 6 phases implemented
 
 ---
 
@@ -451,17 +451,19 @@ sd["lm_head.weight"] = sd["model.embed_tokens.weight"]  # unconditional
 
 ## Phase 6: Improvements
 
-### IMPROV-1: Expose CFG truncation and normalization
+### IMPROV-1: Expose CFG truncation and normalization ✅ DONE
 
 - **File**: `src/musubi_tuner/zimage_generate_image.py`
-- **Scope**: Add CLI args + wire into denoising loop
 - **See**: WARN-2 for implementation details
+
+**Fix implemented**: `--cfg_truncation` and `--cfg_normalization` CLI args added and wired into denoising loop.
 
 ---
 
-### IMPROV-2: Dynamic shift computation
+### IMPROV-2: Dynamic shift computation ✅ DONE
 
 - **Files**: `src/musubi_tuner/zimage/zimage_config.py` (constants exist), `src/musubi_tuner/zimage/zimage_utils.py` (add function)
+- **Commits**: 8fd0ba6, b787c14
 
 The constants exist but no function uses them:
 ```python
@@ -482,52 +484,47 @@ Add `--dynamic_shift` flag to generation script that auto-computes shift from re
 
 ---
 
-### IMPROV-3: Optional noise_refiner LoRA targeting
+### IMPROV-3: Optional noise_refiner LoRA targeting ✅ DONE
 
 - **Files**: `src/musubi_tuner/networks/lora_zimage.py`, `src/musubi_tuner/networks/network_arch.py`
-- **Context**: Diffusers applies LoRA to noise_refiner layers; Blissful Tuner excludes them via `r".*(_modulation|_refiner).*"` pattern
+- **Commit**: 81831a3
 
-**Implementation**: Add `--include_refiner` network arg that removes `_refiner` from exclude pattern:
-```python
-exclude_patterns = [r".*_modulation.*"]  # Always exclude modulation
-if not include_refiner:
-    exclude_patterns.append(r".*_refiner.*")
-```
+**Fix implemented**: Added `include_refiner` kwarg to `create_arch_network()`. When `include_refiner=True` is passed via `--network_args`, only `_modulation` is excluded (not `_refiner`), matching diffusers' LoRA targeting behavior.
 
 ---
 
-### IMPROV-4: Mask-weighted loss for Z-Image
+### IMPROV-4: Mask-weighted loss for Z-Image ✅ DONE
 
 - **See**: WARN-1 for full implementation scope
 - **Files**: `zimage_cache_latents.py`, `image_video_dataset.py`, CLAUDE.md
 
+**Fix implemented**: Mask weights baked into Z-Image latent cache via WARN-1. Training inherits mask loss application from base `NetworkTrainer`.
+
 ---
 
-### IMPROV-5: Empty-string negative prompts
+### IMPROV-5: Empty-string negative prompts ✅ DONE
 
 - **File**: `src/musubi_tuner/zimage_generate_image.py`
-- **Line**: ~588
+- **Commit**: 0567dd4
 
-**Current**: Uses `torch.zeros_like(embed)` for negative conditioning when no negative prompt specified.
-**Official**: Encodes empty string `""` through the text encoder (includes chat template tokens).
-
-**Impact**: May produce slightly different CFG results. The empty-string approach preserves the text encoder's token structure.
+**Fix implemented**: Negative conditioning now encodes empty string `""` through the text encoder (preserving chat template tokens) instead of `torch.zeros_like(embed)`.
 
 ---
 
-### IMPROV-6: Latent preview in generation
+### IMPROV-6: Latent preview in generation ✅ DONE
 
 - **File**: `src/musubi_tuner/zimage_generate_image.py`
-- **Context**: Other Blissful Tuner architectures have real-time latent preview during denoising. Z-Image denoising loop (lines 591-615) lacks preview hooks.
+- **Commit**: b787c14
+
+**Fix implemented**: Added `--preview_latent_every N` and `--preview_vae` CLI args. Previews during the denoise loop via `LatentPreviewer` using `model_type="flux"` (Z-Image uses 16ch latents like FLUX).
 
 ---
 
-### IMPROV-7: Regression test for LoRA multiplier defaults
+### IMPROV-7: Regression test for LoRA multiplier defaults ✅ DONE
 
-- **File**: `tests/` (new test)
-- **Context**: BUG-2 (the lora_multiplier crash) was already fixed across all scripts, but there is no test to prevent regression.
+- **File**: `tests/test_generation_argparse_defaults.py`
 
-**Implementation**: A lightweight test that simulates argparse with `--lora_weight` but no `--lora_multiplier` for each generation script and asserts no crash during argument processing.
+**Fix implemented**: Extended `test_lora_multiplier_default_is_none` to cover all 9 generation scripts (was 6). Added `wan_generate_video`, `hv_1_5_generate_video`, and `kandinsky5_generate_video` (conditional import due to pre-existing `ensure_dtype_form` issue). 8 subtests pass.
 
 ---
 
@@ -592,7 +589,11 @@ Recommended order for addressing items:
 | v1 | 2026-02-17 | Initial audit from 4 parallel sub-agents |
 | v2 | 2026-02-17 | Human review corrections: BUG-1 re-root-caused (LyCORIS targeting, not import), BUG-2 marked resolved (already fixed), BUG-5 added (--save_merged_model), BUG-6 added (--flash3), DOC-3 added (zimage.md control image claim), IMPROV-7 added (regression test), WARN-5 reframed as tradeoff, BUG-4 fix uses config constants |
 | v3 | 2026-02-17 | Phase 1 & 2 implemented: BUG-1 (lycoris.py auto-detect extended to 11 block types, merge_lora_weights gains extra_unet_targets param + observability guardrail, Z-Image import fixed + explicit targets), BUG-5 (non-LyCORIS save path added), BUG-3 (apply_fp16_downscale passed through checkpoint), BUG-4 (uses config constants), BUG-6 (flash3→flash fallback with warning) |
+| v4 | 2026-02-17 | Phase 3 implemented (DOC-1/2/3). Phase 4 implemented (WARN-1 mask loss, WARN-2 CFG truncation/normalization). |
+| v5 | 2026-02-17 | Phase 5 implemented (WARN-3 through WARN-9) |
+| v6 | 2026-02-17 | Phase 6 IMPROV-1/2/3/5/6 implemented: CFG truncation+normalization, dynamic shift (8fd0ba6+b787c14), include_refiner (81831a3), empty-string uncond (0567dd4), latent preview (b787c14) |
+| v7 | 2026-02-17 | All phases complete: IMPROV-4 (mask loss via WARN-1), IMPROV-7 (regression test extended to 9 scripts) |
 
 ---
 
-*Generated from audit of Z-Image pipeline against `docs/z-image-integration-reference.md` v2.3 (4 sources: HF configs, official GitHub, technical report, diffusers repository). Revised after human review with corrected root causes and additional findings.*
+*Generated from audit of Z-Image pipeline against `docs/z-image-integration-reference.md` v2.3 (4 sources: HF configs, official GitHub, technical report, diffusers repository). Revised after human review with corrected root causes and additional findings. All items resolved as of v7.*
