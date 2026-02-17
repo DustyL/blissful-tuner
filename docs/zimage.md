@@ -90,7 +90,7 @@ python src/musubi_tuner/zimage_cache_latents.py \
 
 - Uses `zimage_cache_latents.py`.
 - The dataset should be an image dataset.
-- Z-Image does not support control images, so only target image latents are cached.
+- In standard T2I mode, only target image latents are cached. In OmniBase mode, control latents and SigLIP2 features are also cached (see `--image_encoder`).
 
 <details>
 <summary>日本語</summary>
@@ -99,7 +99,7 @@ latentの事前キャッシングはZ-Image専用のスクリプトを使用し�
 
 - `zimage_cache_latents.py`を使用します。
 - データセットは画像データセットである必要があります。
-- Z-Imageはコントロール画像をサポートしていないため、ターゲット画像のlatentのみがキャッシュされます。
+- 標準のT2Iモードではターゲット画像のlatentのみがキャッシュされます。OmniBaseモードではコントロールlatentとSigLIP2特徴も追加でキャッシュされます（`--image_encoder`参照）。
 
 </details>
 
