@@ -321,19 +321,14 @@ So `zero_cond_t` applies zero-timestep conditioning specifically to the **contro
 
 ## Summary Statistics
 
-| Priority | Count | Resolved | Remaining |
-|----------|-------|----------|-----------|
-| P0 | 4 | 4 | 0 |
-| P1 | 7 | 7 | 0 |
-| P2 | 19 | 17 | 2 (doc-only: V2, V6) |
-| P3 | 10 | 0 | 10 (doc/minor/deferred) |
-| Invalidated | 12 | — | — |
-| **Total Active** | **40** | **28** | **12** |
-
-Notes:
-- T2 confirmed no change needed (base class covers validation). T4, C2, C6 verified against Diffusers.
-- Test Coverage (P1): Resolved — `test_qwen_image_utils.py` and `test_qwen_image_training.py` added, plus multiple focused regression tests.
-- V3 counted once under P3 (also appears in Validated Findings section).
+| Priority | Count | Resolved |
+|----------|-------|----------|
+| P0 | 4 | 4 |
+| P1 | 7 | 7 |
+| P2 | 19 | 19 |
+| P3 | 10 | 10 |
+| Invalidated | 12 | — |
+| **Total** | **40** | **40** |
 
 ### Priority Breakdown
 
@@ -352,7 +347,7 @@ Notes:
 - ~~L4~~: `convert_lora.py` missing CLI choice — fixed
 - ~~Test Coverage Summary~~: Resolved — broad unit/integration tests added (`tests/test_qwen_image_utils.py`, `tests/test_qwen_image_training.py`) + focused regression tests
 
-**P2 (Edge case/improvement) — 17/19 resolved:**
+**P2 (Edge case/improvement) — 19/19 resolved:**
 - ~~T2~~: Confirmed base class covers `require_mask_weights_if_enabled()` — no change needed
 - ~~T3~~: Control image count validation + contiguous key guard
 - ~~T4~~: `qwen_shift` verified against Diffusers — correct
@@ -370,20 +365,20 @@ Notes:
 - ~~I13~~: CFG normalization epsilon guard (`apply_cfg_norm()`)
 - ~~V1~~: All-zero mask training-time warning
 - ~~L5~~: `lora_qwen_image.py` switched to BlissfulLogger
-- V2: Prior preservation for Layered — **doc gap, not yet written**
-- V6: Alpha mask conflict with Layered — **doc gap, not yet written**
+- ~~V2~~: Prior preservation for Layered — documented in `qwen_image.md`
+- ~~V6~~: Alpha mask conflict with Layered — documented in `qwen_image.md`
 
-**P3 (Documentation/minor) — 0/10 (all remaining):**
-- C7: Control image 384px downsample — doc gap
-- C8: Cache key F-dimension semantics — doc gap
-- C9: Per-layer mask limitation — doc gap
-- C10: VAE scale factor hardcoded — future-proofing only
-- I9: RCM threshold help text — minor
-- I10: Batch decode `batch_size=1` assertion — minor guard
-- I11: `guidance_embeds` support — future-proofing only
-- I12: Prompt enhancement limitation — doc gap
-- T5: `mask_min_weight` vs prior warning prominence — minor
-- V3: Gamma/min-weight pipeline (raw cached, transforms at training time) — doc gap
+**P3 (Documentation/minor) — 10/10 resolved:**
+- ~~C7~~: Control image 384px downsample — documented in `qwen_image.md`
+- ~~C8~~: Cache key F-dimension semantics — code comments added
+- ~~C9~~: Per-layer mask limitation — documented in `qwen_image.md`
+- ~~C10~~: VAE scale factor comment expanded with propagation note
+- ~~I9~~: RCM threshold help text corrected (latent magnitudes ~3.0)
+- ~~I10~~: `decode_latent()` batch_size=1 assertion added
+- ~~I11~~: `guidance_embeds` limitation documented in `qwen_image.md`
+- ~~I12~~: Prompt enhancement limitation documented in `qwen_image.md`
+- ~~T5~~: `mask_min_weight` vs prior warning already prominent in `log_mask_loss_banner()`
+- ~~V3~~: Gamma/min-weight pipeline clarified in `MASKED_LOSS_TRAINING_GUIDE.md`
 
 ---
 
@@ -489,11 +484,10 @@ Notes:
 
 ## Audit Status: COMPLETE
 **Date completed**: 2026-02-17
-**Last revision**: 2026-02-17 (v5: test coverage closed)
+**Last revision**: 2026-02-17 (v6: all 40 findings resolved)
 **Phases**: All 3 phases complete
 **Total findings**: 40 active (4 P0, 7 P1, 19 P2, 10 P3) + 12 invalidated
-**Resolved**: 28/40 — all P0 (4/4), all P1 (7/7), 17/19 P2, 0/10 P3
-**Remaining**: 12 items (2 P2 doc-only, 10 P3 doc/minor/deferred)
+**Resolved**: 40/40 — ALL ITEMS RESOLVED
 **Agent reports archived**: Training (a0374ce), Caching (a3cd502), Inference (a776980), LoRA (a942e20), Tests (a5ea998)
 
 ### Revision Log
@@ -526,3 +520,11 @@ Notes:
 - **v5** (2026-02-17): Test coverage closure:
   - Added `tests/test_qwen_image_utils.py` (pack/unpack, shift endpoints, model_version resolution)
   - Added `tests/test_qwen_image_training.py` (mock-based `call_dit` shape + `img_shapes` coverage across modes)
+- **v6** (2026-02-17): All findings resolved (40/40):
+  - V2, V6, C7, C9, I11, I12: Documented layered limitations, control image processing, feature gaps in `qwen_image.md`
+  - V3: Clarified mask caching semantics in `MASKED_LOSS_TRAINING_GUIDE.md` (raw cached, gamma/min-weight at training time)
+  - I9: Fixed RCM threshold help text (absolute values should be ~0.5-2.0, not 0.01-0.1)
+  - I10: Added `batch_size=1` assertion in `decode_latent()`
+  - C8: Added F-dimension semantics comments (frames vs layers) in cache key code
+  - C10: Expanded VAE_SCALE_FACTOR comment with propagation note
+  - T5: Confirmed already addressed by `log_mask_loss_banner()` — prominent at startup
