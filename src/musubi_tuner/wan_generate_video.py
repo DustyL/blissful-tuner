@@ -1505,6 +1505,12 @@ def run_sampling(
     apply_cfg_array = []
     num_timesteps = len(timesteps)
 
+    if args.cfg_skip_mode != "none" and args.cfg_apply_ratio is None:
+        logger.warning(
+            f"--cfg_skip_mode is '{args.cfg_skip_mode}' but --cfg_apply_ratio is not set. "
+            "CFG skip mode will be ignored. Set --cfg_apply_ratio (0.0-1.0) to enable CFG skipping."
+        )
+
     if args.cfg_skip_mode != "none" and args.cfg_apply_ratio is not None:
         # Kohya's method
         # Calculate thresholds based on cfg_apply_ratio

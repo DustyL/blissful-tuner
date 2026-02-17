@@ -79,10 +79,7 @@ class WanNetworkTrainer(NetworkTrainer):
                     if discrete_flow_shift == 1.0
                     else "Sigma-based timestep sampling often produces suboptimal results for WAN 2.2."
                 )
-                logger.warning(
-                    f"WAN 2.2 task '{args.task}' is using --timestep_sampling sigma{rec}. "
-                    f"{default_note}"
-                )
+                logger.warning(f"WAN 2.2 task '{args.task}' is using --timestep_sampling sigma{rec}. {default_note}")
             elif (
                 isinstance(timestep_sampling, str)
                 and timestep_sampling.endswith("shift")
@@ -266,7 +263,13 @@ class WanNetworkTrainer(NetworkTrainer):
 
         # TODO support different cfg_scale for low and high noise models
         if cfg_scale is None:
-            cfg_scale = self.config.sample_guide_scale[0]  # use low noise guide scale by default
+            guide_scale = self.config.sample_guide_scale
+            if self.high_low_training and (not isinstance(guide_scale, (list, tuple)) or len(guide_scale) != 2):
+                raise ValueError(
+                    f"sample_guide_scale must be a 2-element tuple (low_noise, high_noise) for dual-expert mode, "
+                    f"got {guide_scale!r}"
+                )
+            cfg_scale = guide_scale[0] if isinstance(guide_scale, (list, tuple)) else guide_scale
         do_classifier_free_guidance = do_classifier_free_guidance and cfg_scale != 1.0
 
         # prepare parameters
@@ -561,6 +564,19 @@ class WanNetworkTrainer(NetworkTrainer):
                 model_high_noise.enable_block_swap(self.blocks_to_swap, accelerator.device, supports_backward=True)
                 model_high_noise.move_to_device_except_swap_blocks(accelerator.device)
                 model_high_noise.prepare_block_swap_before_forward()
+
+            # TP-14: One-time validation that both experts have identical structure.
+            # This prevents silent weight corruption if future model variants have asymmetric experts.
+            low_keys = set(model.state_dict().keys())
+            high_keys = set(model_high_noise.state_dict().keys())
+            if low_keys != high_keys:
+                only_low = low_keys - high_keys
+                only_high = high_keys - low_keys
+                raise ValueError(
+                    f"Dual-expert models have mismatched state dict keys.\n"
+                    f"  Only in low-noise model ({len(only_low)}): {sorted(only_low)[:5]}{'...' if len(only_low) > 5 else ''}\n"
+                    f"  Only in high-noise model ({len(only_high)}): {sorted(only_high)[:5]}{'...' if len(only_high) > 5 else ''}"
+                )
 
             self.dit_inactive_state_dict = model_high_noise.state_dict()
 

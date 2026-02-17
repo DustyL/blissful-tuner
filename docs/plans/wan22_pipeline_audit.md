@@ -384,7 +384,7 @@ if args.num_timestep_buckets is not None:
 
 **Problem**: Config uses `sample_guide_scale = (3.0, 4.0)` with comment "(low noise, high noise)". The inference code uses `[0]` for low noise. There's no validation that the tuple has exactly 2 elements, and some doc sections use reversed ordering.
 
-**Suggested Fix**: Add assertion in `handle_model_specific_args` for dual-expert: `assert len(config.sample_guide_scale) == 2`.
+**Fix**: Added validation in `do_inference` that raises `ValueError` if `sample_guide_scale` is not a 2-element tuple/list when in dual-expert mode. Also handles scalar `guide_scale` for single-expert mode.
 
 ---
 
@@ -517,7 +517,7 @@ synchronize_device(device)
 
 **Problem**: If user sets `--cfg_skip_mode early` without `--cfg_apply_ratio`, the condition `cfg_skip_mode != "none" and cfg_apply_ratio is not None` is False, so the skip mode is silently ignored. CFG falls through to default "always apply" behavior without warning.
 
-**Suggested Fix**: Add warning when `cfg_skip_mode != "none"` but `cfg_apply_ratio is None`.
+**Fix**: Added a warning in the denoising loop when `cfg_skip_mode != "none"` but `cfg_apply_ratio is None`, clearly telling users to set the ratio.
 
 ---
 
@@ -529,7 +529,7 @@ synchronize_device(device)
 
 **Problem**: `--perp_neg` and `--cfgzerostar_scaling` are mutually exclusive via `elif` but no upfront validation warns users. `perp_neg` silently takes precedence.
 
-**Suggested Fix**: Add upfront check raising `ValueError` if both are set.
+**Fix**: Already validated in `blissful_core.py:354-355` — `error_out(ValueError, "Cannot use '--cfgzerostar_scaling' with '--perp_neg'!")`. Was fixed prior to this audit round.
 
 ---
 
@@ -600,7 +600,7 @@ synchronize_device(device)
 
 **Severity**: HIGH (test gap)
 **Category**: Testing
-**Description**: No tests verify timestep boundary logic, model swapping during training, or offload behavior for WAN 2.2 dual-expert mode.
+**Description**: Basic dual-expert tests now exist in `tests/test_wan_dual_expert.py` (timestep boundary, rejection sampling). Remaining gap: block-swap + offload integration tests.
 
 ---
 
@@ -610,6 +610,8 @@ synchronize_device(device)
 **Category**: Testing
 **Description**: No tests verify varlen T5 cache loading, batch construction, or frame count validation for WAN.
 
+**Fix**: Added `tests/test_wan_dataset_loading.py` with 8 tests covering varlen T5 key normalization, latent stacking, mixed-mask batch alignment, no-mask batches, I2V `latents_image` key normalization, and timestep defaults.
+
 ---
 
 #### TT-03: No WAN Mask Loss Integration Test
@@ -617,6 +619,8 @@ synchronize_device(device)
 **Severity**: MEDIUM (test gap)
 **Category**: Testing
 **Description**: Generic mask loss tests exist but no test verifies WAN trainer correctly applies mask loss to `(B, C, F, H, W)` video tensors.
+
+**Fix**: Added `tests/test_wan_mask_loss_integration.py` with 8 tests: 16-channel video loss with 4D/5D masks, mask_weights=None fallback, use_mask_loss=False short-circuit, multi-channel consistency, prior preservation, gamma correction, and min_weight floor — all using WAN-shaped `(B, 16, F, H, W)` tensors.
 
 ---
 
@@ -636,18 +640,18 @@ synchronize_device(device)
 | TP-04 | MEDIUM | 2 | Training | Gradient accumulation + expert swap edge case | OPEN |
 | TP-05 | MEDIUM | 2 | Training | Block swap + dual-expert interaction undertested | OPEN |
 | GN-01 | MEDIUM | 4 | Generation | Hardcoded 5s sleep for block swap sync — fragile | FIXED |
-| TT-01 | HIGH | 6 | Tests | No WAN dual-expert training tests (critical gap) | OPEN |
-| TT-02 | HIGH | 6 | Tests | No WAN dataset loading tests (varlen T5, batch) | OPEN |
-| TT-03 | MEDIUM | 6 | Tests | No WAN mask loss integration test (video layout) | OPEN |
+| TT-01 | HIGH | 6 | Tests | No WAN dual-expert training tests (critical gap) | PARTIAL (basic tests exist, block-swap gap remains) |
+| TT-02 | HIGH | 6 | Tests | No WAN dataset loading tests (varlen T5, batch) | FIXED |
+| TT-03 | MEDIUM | 6 | Tests | No WAN mask loss integration test (video layout) | FIXED |
 | TC-02 | LOW | 1 | Text Cache | Empty captions silently processed without logging | FIXED |
 | LC-05 | LOW | 1 | Latent Cache | Redundant dtype casts with uncertain "we are not sure" comments | OPEN |
 | TP-06 | LOW | 2 | Training | LoRA + dual-expert behavior undocumented | OPEN |
 | TP-07 | LOW | 2 | Training | Prior preservation + expert swap interaction undocumented | OPEN |
 | TP-08 | LOW | 2 | Training | Timestep convention inconsistency (0-1 vs 1-1000) | OPEN |
-| TP-09 | LOW | 2 | Training | Guidance scale tuple ordering not validated | OPEN |
+| TP-09 | LOW | 2 | Training | Guidance scale tuple ordering not validated | FIXED |
 | TP-10 | LOW | 2 | Training | torch.compile key patching for expert swap is fragile | OPEN |
-| GN-02 | LOW | 4 | Generation | CFG skip mode silently ignored without cfg_apply_ratio | OPEN |
-| GN-03 | LOW | 4 | Generation | perp_neg and cfgzerostar mutual exclusion not validated | OPEN |
+| GN-02 | LOW | 4 | Generation | CFG skip mode silently ignored without cfg_apply_ratio | FIXED |
+| GN-03 | LOW | 4 | Generation | perp_neg and cfgzerostar mutual exclusion not validated | FIXED (pre-existing in blissful_core.py) |
 | GN-04 | LOW | 4 | Generation | Lazy loading model cleanup incomplete | OPEN |
 | DS-01 | LOW | 5 | Dataset | No warning when mask_directory set without use_mask_loss | FIXED |
 | TC-03 | NOTE | 1 | Text Cache | T5 attention no-scaling not documented in code comments | OPEN |
@@ -655,7 +659,7 @@ synchronize_device(device)
 | TP-11 | NOTE | 2 | Training | normalize_per_sample default could auto-enable with prior preservation | OPEN |
 | TP-12 | NOTE | 2 | Training | Missing EMA for LoRA training (feature request) | OPEN |
 | TP-13 | MEDIUM | R | Training | WAN 2.2 training defaults are easy-misuse traps (`--timestep_sampling sigma`, `--discrete_flow_shift 1.0`) | FIXED |
-| TP-14 | LOW | R | Training | Block swap + dual-expert: no runtime validation that both experts have identical block structure | OPEN |
+| TP-14 | LOW | R | Training | Block swap + dual-expert: no runtime validation that both experts have identical block structure | FIXED |
 | LC-06 | LOW | R | Latent Cache | I2V mask could be constructed directly in latent space from `lat_f` instead of pixel→latent reshape trick | FIXED |
 | DOC-01 | HIGH | R | Architecture Doc | I2V pseudocode in `wan22_architecture.md` has inverted mask convention and wrong image conditioning | FIXED |
 | CF-01 | NOTE | R | Design | Cache format evolution: proposed fixes (TC-01, LC-01 auto-pad) change on-disk format — need compatibility stance | OPEN |
@@ -688,7 +692,7 @@ synchronize_device(device)
 
 **Problem**: `swap_high_low_weights()` transfers state dict keys between experts, relying on `strict=True` to catch mismatches. But this only verifies key names match — it doesn't validate that both models have the same number of blocks, block layout, or block ordering. A future model variant with asymmetric experts would silently corrupt weights.
 
-**Suggested Fix**: Add a one-time startup assertion that both models' block counts and key sets are identical.
+**Fix**: Added a one-time startup validation in `load_transformer()` after loading both models: compares `state_dict().keys()` and raises `ValueError` with a detailed diff if they don't match. Fails fast at model load time rather than mid-training.
 
 ---
 
