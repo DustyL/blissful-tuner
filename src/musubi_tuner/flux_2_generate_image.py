@@ -25,6 +25,7 @@ from musubi_tuner.networks import lora_flux_2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, setup_parser_compile, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
+from blissful_tuner.prompt_management import process_wildcards
 
 import logging
 
@@ -36,6 +37,84 @@ class GenerationSettings:
     def __init__(self, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None):
         self.device = device
         self.dit_weight_dtype = dit_weight_dtype  # not used currently because model may be optimized
+
+
+def apply_model_defaults_and_enforce_fixed_params(args: argparse.Namespace) -> None:
+    """Fill model-specific defaults and enforce fixed parameters for FLUX.2 variants.
+
+    This uses `flux2_utils.FLUX2_MODEL_INFO[args.model_version]` as the canonical source of defaults and fixed params.
+    """
+    model_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
+
+    # 1) Sampling steps
+    default_num_steps = int(model_info.defaults["num_steps"])
+    if "num_steps" in model_info.fixed_params:
+        if args.infer_steps is not None and int(args.infer_steps) != default_num_steps:
+            logger.warning(f"--infer_steps={args.infer_steps} overridden to {default_num_steps} (fixed for {args.model_version})")
+        args.infer_steps = default_num_steps
+    elif args.infer_steps is None:
+        args.infer_steps = default_num_steps
+
+    # 2) Guidance scale
+    default_guidance = float(model_info.defaults["guidance"])
+    if "guidance" in model_info.fixed_params:
+        # Enforce both knobs, even if only one is used for a given model, to avoid silent no-op confusion.
+        if args.embedded_cfg_scale is not None and float(args.embedded_cfg_scale) != default_guidance:
+            logger.warning(
+                f"--embedded_cfg_scale={args.embedded_cfg_scale} overridden to {default_guidance} (fixed for {args.model_version})"
+            )
+        if args.guidance_scale is not None and float(args.guidance_scale) != default_guidance:
+            logger.warning(
+                f"--guidance_scale={args.guidance_scale} overridden to {default_guidance} (fixed for {args.model_version})"
+            )
+        args.embedded_cfg_scale = default_guidance
+        args.guidance_scale = default_guidance
+    else:
+        guidance_scale_set = args.guidance_scale is not None
+        embedded_cfg_scale_set = args.embedded_cfg_scale is not None
+
+        # Alias behavior (sentinel defaults are None):
+        # - Guidance-distilled variants use embedded guidance (embedded_cfg_scale).
+        # - Base variants use CFG guidance_scale.
+        if model_info.guidance_distilled:
+            if not embedded_cfg_scale_set and guidance_scale_set:
+                # Common UX footgun: users set --guidance_scale for dev models, but the code uses embedded guidance.
+                args.embedded_cfg_scale = float(args.guidance_scale)
+                embedded_cfg_scale_set = True
+
+            if embedded_cfg_scale_set and guidance_scale_set:
+                if float(args.guidance_scale) != float(args.embedded_cfg_scale):
+                    logger.warning(
+                        f"--guidance_scale={args.guidance_scale} is ignored for guidance-distilled models; "
+                        f"using --embedded_cfg_scale={args.embedded_cfg_scale}."
+                    )
+
+            if args.embedded_cfg_scale is None:
+                args.embedded_cfg_scale = default_guidance
+            if args.guidance_scale is None:
+                # Keep values aligned for logging/metadata even if one knob is unused.
+                args.guidance_scale = float(args.embedded_cfg_scale)
+        else:
+            if not guidance_scale_set and embedded_cfg_scale_set:
+                # Inverse alias: users sometimes set embedded scale, but base models use guidance_scale for CFG.
+                args.guidance_scale = float(args.embedded_cfg_scale)
+                guidance_scale_set = True
+
+            if embedded_cfg_scale_set and guidance_scale_set:
+                if float(args.guidance_scale) != float(args.embedded_cfg_scale):
+                    logger.warning(
+                        f"--embedded_cfg_scale={args.embedded_cfg_scale} is ignored for base models; "
+                        f"using --guidance_scale={args.guidance_scale}."
+                    )
+
+            if args.guidance_scale is None:
+                args.guidance_scale = default_guidance
+            if args.embedded_cfg_scale is None:
+                args.embedded_cfg_scale = float(args.guidance_scale)
+
+    # Negative prompts are ignored for guidance-distilled models.
+    if model_info.guidance_distilled and args.negative_prompt is not None and args.negative_prompt.strip():
+        logger.warning(f"--negative_prompt is ignored for guidance-distilled models like '{args.model_version}'.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +133,7 @@ def parse_args() -> argparse.Namespace:
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -66,7 +145,10 @@ def parse_args() -> argparse.Namespace:
 
     # inference
     parser.add_argument(
-        "--guidance_scale", type=float, default=4.0, help="Guidance scale for classifier free guidance. Default is 4.0."
+        "--guidance_scale",
+        type=float,
+        default=None,
+        help="Guidance scale for classifier-free guidance (base models). If omitted, uses model default.",
     )
     parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
     parser.add_argument(
@@ -81,14 +163,17 @@ def parse_args() -> argparse.Namespace:
         help="path to control (reference) image(s) for Flux 2 image edit",
     )
     parser.add_argument("--no_resize_control", action="store_true", help="do not resize control image")
-    parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 25")
+    parser.add_argument("--infer_steps", type=int, default=None, help="number of inference steps. If omitted, uses model default.")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     # parser.add_argument(
     #     "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
     # )
     parser.add_argument(
-        "--embedded_cfg_scale", type=float, default=4.0, help="Embeded CFG scale (distilled CFG Scale), default is 4.0"
+        "--embedded_cfg_scale",
+        type=float,
+        default=None,
+        help="Embedded guidance scale for guidance-distilled models. If omitted, uses model default.",
     )
     # parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference")
     # parser.add_argument(
@@ -141,6 +226,13 @@ def parse_args() -> argparse.Namespace:
     # New arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
+
+    parser.add_argument(
+        "--prompt_wildcards",
+        type=str,
+        default=None,
+        help="Path to a directory of wildcard.txt files. Use __keyword__ in prompts to randomly substitute from keyword.txt.",
+    )
 
     flux2_utils.add_model_version_args(parser)
 
@@ -195,14 +287,18 @@ def parse_args() -> argparse.Namespace:
 
     validate_lycoris_arg(args)
 
+    # Fill defaults and enforce fixed params per variant (e.g. Klein distilled fixed steps/guidance).
+    apply_model_defaults_and_enforce_fixed_params(args)
+
     return args
 
 
-def parse_prompt_line(line: str) -> Dict[str, Any]:
+def parse_prompt_line(line: str, prompt_wildcards: Optional[str] = None) -> Dict[str, Any]:
     """Parse a prompt line into a dictionary of argument overrides
 
     Args:
         line: Prompt line with options
+        prompt_wildcards: Optional path to wildcard directory for __keyword__ substitution
 
     Returns:
         Dict[str, Any]: Dictionary of argument overrides
@@ -215,6 +311,10 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         parts = line.split(" --")
         prompt = parts[0].strip()
         parts = parts[1:]
+
+    # Apply wildcards to prompt if configured
+    if prompt is not None and prompt_wildcards is not None:
+        prompt = process_wildcards(prompt, prompt_wildcards)
 
     # Create dictionary of overrides
     overrides = {} if prompt is None else {"prompt": prompt}
@@ -238,10 +338,12 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["infer_steps"] = int(value)
         elif option == "g" or option == "l":
             overrides["guidance_scale"] = float(value)
+        elif option == "e":
+            overrides["embedded_cfg_scale"] = float(value)
         elif option == "fs":
             overrides["flow_shift"] = float(value)
         elif option == "i":
-            overrides["image_path"] = value
+            logger.warning(f"--i {value!r} ignored: image_path is not yet supported for FLUX.2.")
         # elif option == "im":
         #     overrides["image_mask_path"] = value
         # elif option == "cn":
@@ -254,6 +356,10 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
     # If no control_image_path was provided, remove the empty list
     if not overrides["control_image_path"]:
         del overrides["control_image_path"]
+
+    # Apply wildcards to negative prompt if present
+    if "negative_prompt" in overrides and prompt_wildcards is not None:
+        overrides["negative_prompt"] = process_wildcards(overrides["negative_prompt"], prompt_wildcards)
 
     return overrides
 
@@ -278,6 +384,7 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
         else:
             setattr(args_copy, key, value)
 
+    apply_model_defaults_and_enforce_fixed_params(args_copy)
     return args_copy
 
 
@@ -338,6 +445,28 @@ def load_dit_model(args: argparse.Namespace, device: torch.device) -> flux2_mode
     return model
 
 
+def get_or_load_ae(
+    args: argparse.Namespace,
+    device: torch.device,
+    shared_models: Optional[Dict] = None,
+) -> flux2_models.AutoEncoder:
+    """Return the cached AE from shared_models, or load from disk.
+
+    This is the single source of truth for "should we load a new AE?"
+    Interactive mode pre-loads into shared_models["ae"]; single-prompt mode
+    loads fresh.
+    """
+    if shared_models is not None and "ae" in shared_models:
+        return shared_models["ae"]
+
+    return flux2_utils.load_ae(
+        args.vae,
+        dtype=torch.float32,
+        device=device,
+        disable_mmap=True,
+    )
+
+
 def optimize_model(model: flux2_models.Flux2, args: argparse.Namespace, device: torch.device) -> None:
     """optimize the model (FP8 conversion, device move etc.)
 
@@ -360,19 +489,13 @@ def optimize_model(model: flux2_models.Flux2, args: argparse.Namespace, device: 
         if args.blocks_to_swap == 0:
             model.to(device)  # make sure all parameters are on the right device (e.g. RoPE etc.)
     else:
-        # simple cast to dit_dtype
-        target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
-        target_device = None
-
         if args.fp8:
-            target_dtype = torch.float8_e4m3fn
+            logger.info("Casting model to FP8 (float8_e4m3fn)")
+            model.to(dtype=torch.float8_e4m3fn)
 
         if args.blocks_to_swap == 0:
             logger.info(f"Move model to device: {device}")
-            target_device = device
-
-        if target_device is not None and target_dtype is not None:
-            model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
+            model.to(device)
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
@@ -424,6 +547,11 @@ def prepare_image_inputs(args: argparse.Namespace, device: torch.device, ae: flu
         elif len(img_ctx) == 1:
             limit_pixels = 2024**2
         else:
+            limit_pixels = None
+
+        if args.no_resize_control:
+            if limit_pixels is not None:
+                logger.info("--no_resize_control is set: skipping control image pixel capping/resizing.")
             limit_pixels = None
 
         img_ctx_prep = flux2_utils.default_prep(img=img_ctx, limit_pixels=limit_pixels)
@@ -531,6 +659,8 @@ def prepare_text_inputs(
         # denoise_cfg expects unconditional then conditional
         ctx_vec = torch.cat([negative_ctx_vec, ctx_vec], dim=0)
 
+    flux2_utils.validate_ctx_vec_dim(ctx_vec, model_version_info, source="flux_2_generate_image.prepare_text_inputs()")
+
     if not (shared_models and "text_embedder" in shared_models):  # if loaded locally
         del text_embedder
     else:  # if shared, move back to original device (likely CPU)
@@ -609,20 +739,9 @@ def generate(
         # VAE is not loaded here if data is precomputed; decoding VAE is handled by caller (e.g., process_batch_prompts)
         # vae_instance_for_return remains None
     else:
-        # Load VAE if not precomputed (for single/interactive mode)
-        # shared_models for single/interactive might contain text/image encoders, but not VAE after `load_shared_models` change.
-        # So, VAE will be loaded here for single/interactive.
+        # Load or reuse cached VAE (interactive mode pre-loads into shared_models["ae"])
         logger.info("No precomputed data. Preparing image and text inputs.")
-        if shared_models and "ae" in shared_models:  # Should not happen with new load_shared_models
-            vae_instance_for_return = shared_models["ae"]
-        else:
-            # the dtype of VAE weights is float32, but we can load it as bfloat16 for better performance in future
-            vae_instance_for_return = flux2_utils.load_ae(
-                args.vae,
-                dtype=torch.float32,
-                device=device,
-                disable_mmap=True,
-            )
+        vae_instance_for_return = get_or_load_ae(args, device, shared_models)
 
         height, width, context, control_latent = prepare_i2v_inputs(
             args,
@@ -863,7 +982,7 @@ def preprocess_prompts_for_batch(prompt_lines: List[str], base_args: argparse.Na
             continue
 
         # Parse prompt line and create override dictionary
-        prompt_data = parse_prompt_line(line)
+        prompt_data = parse_prompt_line(line, base_args.prompt_wildcards)
         logger.info(f"Parsed prompt data: {prompt_data}")
         prompts_data.append(prompt_data)
 
@@ -1080,6 +1199,10 @@ def process_interactive(args: argparse.Namespace) -> None:
     shared_models = load_shared_models(args)
     shared_models["conds_cache"] = {}  # Initialize empty cache for interactive mode
 
+    # Load VAE once for interactive mode instead of reloading from disk each iteration
+    ae = flux2_utils.load_ae(args.vae, dtype=torch.float32, device="cpu", disable_mmap=True)
+    shared_models["ae"] = ae
+
     print("Interactive mode. Enter prompts (Ctrl+D or Ctrl+Z (Windows) to exit):")
 
     try:
@@ -1109,12 +1232,11 @@ def process_interactive(args: argparse.Namespace) -> None:
                     raise EOFError  # Exit on Ctrl+D or Ctrl+Z
 
                 # Parse prompt
-                prompt_data = parse_prompt_line(line)
+                prompt_data = parse_prompt_line(line, args.prompt_wildcards)
                 prompt_args = apply_overrides(args, prompt_data)
 
                 # Generate latent
-                # For interactive, precomputed data is None. shared_models contains text/image encoders.
-                # generate will load VAE internally.
+                # shared_models contains text embedder + cached VAE (loaded once before the loop).
                 returned_vae, latent = generate(prompt_args, gen_settings, shared_models)
 
                 # # If not one_frame_inference, move DiT model to CPU after generation
@@ -1145,7 +1267,7 @@ def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
     elif args.fp8:
         dit_weight_dtype = torch.float8_e4m3fn
 
-    logger.info(f"Using device: {device}, DiT weight weight precision: {dit_weight_dtype}")
+    logger.info(f"Using device: {device}, DiT weight precision: {dit_weight_dtype}")
 
     gen_settings = GenerationSettings(device=device, dit_weight_dtype=dit_weight_dtype)
     return gen_settings
@@ -1154,6 +1276,13 @@ def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
 def main():
     # Parse arguments
     args = parse_args()
+
+    # Apply prompt wildcards (single-prompt mode; batch/interactive handled in parse_prompt_line)
+    if args.prompt_wildcards is not None:
+        if args.prompt is not None:
+            args.prompt = process_wildcards(args.prompt, args.prompt_wildcards)
+        if args.negative_prompt is not None:
+            args.negative_prompt = process_wildcards(args.negative_prompt, args.prompt_wildcards)
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
@@ -1233,8 +1362,8 @@ def main():
         # generate will load all necessary models (VAE, Text/Image Encoders, DiT).
         returned_vae, latent = generate(args, gen_settings)
         # print(f"Generated latent shape: {latent.shape}")
-        # if args.save_merged_model:
-        #     return
+        if args.save_merged_model:
+            return
 
         # Save latent and video
         # returned_vae from generate will be used for decoding here.

@@ -71,13 +71,13 @@ Qwen3 4Bの重みは、すでにZ-Imageで用いているものがあればそ�
 ## Specifying Model Version / モデルバージョンの指定
 
 When specifying the model version in various scripts, use the following options:
-|type|version|sampling guidance scale|num sampling steps|
-|----|--------|----|----|
-|flux.2-dev|`--model_version flux.2-dev`|1.0|4|
-|flux.2-klein-4b|`--model_version flux.2-klein-4b`|4.0|50|
-|flux.2-klein-base-4b|`--model_version flux.2-klein-base-4b`|1.0|4|
-|flux.2-klein-9b|`--model_version flux.2-klein-9b`|4.0|50|
-|flux.2-klein-base-9b|`--model_version flux.2-klein-base-9b`|4.0|50|
+|type|version|sampling guidance scale|num sampling steps|distilled|
+|----|--------|----|----|-----|
+|flux.2-dev|`--model_version flux.2-dev`|4.0|50|guidance-distilled|
+|flux.2-klein-4b|`--model_version flux.2-klein-4b`|1.0|4|step-distilled (fixed)|
+|flux.2-klein-base-4b|`--model_version flux.2-klein-base-4b`|4.0|50|no (teacher model)|
+|flux.2-klein-9b|`--model_version flux.2-klein-9b`|1.0|4|step-distilled (fixed)|
+|flux.2-klein-base-9b|`--model_version flux.2-klein-base-9b`|4.0|50|no (teacher model)|
 
 ## Pre-caching / 事前キャッシング
 
@@ -174,7 +174,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 FLUX.2の学習は専用のスクリプト`flux_2_train_network.py`を使用します。
 
 - `flux_2_train_network.py`を使用します。
-- `--ae`、`--text_encoder` を指定する必要があります。
+- `--vae`、`--text_encoder` を指定する必要があります。
 - `--network_module networks.lora_flux_2`を指定する必要があります。
 - FLUX.2の学習には`--mixed_precision bf16`を推奨します。
 - FLUX.2には`--timestep_sampling flux2_shift`を推奨します。
@@ -204,16 +204,18 @@ python src/musubi_tuner/flux_2_generate_image.py \
 - **Requires** specifying `--vae`, `--text_encoder`
 - **Requires** specifying `--control_image_path` for the reference image.
 - Use the `--model_version` option for Flux.2 Klein inference. 
-- `--no_resize_control`: By default, the control image is resized to the recommended resolution for FLUX.2. If you specify this option, this resizing is skipped, and the image is used as-is.
-    
+- `--no_resize_control`: By default, the control image is resized (pixel-capped) to the recommended resolution for FLUX.2. If you specify this option, the pixel-cap resize is skipped. Note: the image is still cropped to a model-aligned (multiple-of-16) size.
+
     This feature is not officially supported by FLUX.2, but it is available for experimental use.
 
 - `--image_size` is the size of the generated image, height and width are specified in that order.
 - `--prompt`: Prompt for generation.
 - `--fp8_scaled` option is available for DiT to reduce memory usage. Quality may be slightly lower. `--fp8_text_encoder` option is available to reduce memory usage of Text Encoder (Qwen3 only). `--fp8` alone is also an option for DiT but `--fp8_scaled` potentially offers better quality.
 - LoRA loading options (`--lora_weight`, `--lora_multiplier`, `--include_patterns`, `--exclude_patterns`) are available. `--prefer_lycoris` forces the LyCORIS backend for all weight merging; `--lycoris` is a deprecated alias.
-- `--embedded_cfg_scale` (default 2.5) controls the distilled guidance scale.
+- `--infer_steps`: If omitted, uses the model default (e.g. DEV/base: 50, klein distilled: fixed 4). For distilled klein models, steps are fixed and user-specified values are overridden.
+- `--embedded_cfg_scale`: Controls the guidance scale for guidance-distilled models. If omitted, uses the model default (DEV: 4.0, klein distilled: fixed 1.0). For distilled klein models, guidance is fixed and user-specified values are overridden.
 - `--save_merged_model` option is available to save the DiT model after merging LoRA weights. Inference is skipped if this is specified.
+- `--prompt_wildcards`: Path to a directory of wildcard `.txt` files. Use `__keyword__` in prompts to randomly substitute from `keyword.txt`. Supports weighted selections (e.g., `red:2.0` in wildcard files). Works in single-prompt, batch (`--from_file`), and interactive modes. Note: wildcard draws use Python's `random` module and are not tied to `--seed`, so identical seeds may produce different outputs when wildcards are involved.
 
 <details>
 <summary>日本語</summary>
@@ -223,7 +225,7 @@ FLUX.2の推論は専用のスクリプト`flux_2_generate_image.py`を使用し
 - `flux_2_generate_image.py`を使用します。
 - `--vae`、`--text_encoder` を指定する必要があります。
 - `--control_image_path`を指定する必要があります（参照画像）。
-- `--no_resize_control`: デフォルトでは、参照画像はFLUX.2の推奨解像度にリサイズされます。このオプションを指定すると、このリサイズはスキップされ、画像はそのままのサイズで使用されます。
+- `--no_resize_control`: デフォルトでは、参照画像はFLUX.2の推奨解像度にリサイズ（ピクセル上限制限）されます。このオプションを指定すると、ピクセル上限リサイズはスキップされます。ただし、モデルに合わせたサイズ（16の倍数）へのクロップは引き続き行われます。
 
     この機能はFLUX.2では公式にサポートされていませんが、実験的に使用可能です。
 
@@ -231,7 +233,70 @@ FLUX.2の推論は専用のスクリプト`flux_2_generate_image.py`を使用し
 - `--prompt`: 生成用のプロンプトです。
 - DiTのメモリ使用量を削減するために、`--fp8_scaled`オプションを指定可能です。品質はやや低下する可能性があります。またText Encoderのメモリ使用量を削減するために、`--fp8_text_encoder`オプションを指定可能です（Qwen3のみ）。DiT用に`--fp8`単独のオプションも用意されていますが、`--fp8_scaled`の方が品質が良い可能性があります。
 - LoRAの読み込みオプション（`--lora_weight`、`--lora_multiplier`、`--include_patterns`、`--exclude_patterns`）が利用可能です。`--prefer_lycoris`はすべてのLoRA重みマージにLyCORISバックエンドを強制します。`--lycoris`は非推奨のエイリアスです。
-- `--embedded_cfg_scale`（デフォルト2.5）は、蒸留されたガイダンススケールを制御します。
+- `--infer_steps`: 省略した場合はモデルのデフォルト値が使われます（例: DEV/base: 50、klein蒸留: 固定 4）。蒸留されたkleinモデルではステップ数は固定で、ユーザー指定値は警告付きで上書きされます。
+- `--embedded_cfg_scale`: ガイダンス蒸留モデルのガイダンススケールです。省略した場合はモデルのデフォルト値が使われます（DEV: 4.0、klein蒸留: 固定 1.0）。蒸留されたkleinモデルではガイダンスは固定で、ユーザー指定値は警告付きで上書きされます。
 - `--save_merged_model`オプションは、LoRAの重みをマージした後にDiTモデルを保存するためのオプションです。これを指定すると推論はスキップされます。
+- `--prompt_wildcards`: ワイルドカード`.txt`ファイルのディレクトリパスです。プロンプト内で`__keyword__`を使うと、`keyword.txt`からランダムに置換されます。重み付き選択（例: ファイル内の`red:2.0`）に対応しています。単一プロンプト、バッチ（`--from_file`）、インタラクティブモードで動作します。注意: ワイルドカードの選択はPythonの`random`モジュールを使用し、`--seed`とは連動しません。
 
 </details>
+
+## Prompting Tips
+
+### DEV (Mistral3)
+
+FLUX.2-DEV supports structured JSON prompting for precise control. It also benefits from camera and lighting specifications:
+
+```json
+{
+  "subject": "A 35-year-old woman",
+  "setting": "a sunlit Parisian café terrace",
+  "action": "reading a vintage book",
+  "style": "cinematic photography, shallow depth of field",
+  "lighting": "golden hour, warm sunlight through leaves",
+  "colors": "#F5DEB3 warm wheat tones, #8B4513 rich brown accents",
+  "camera": "85mm lens, f/1.8, eye-level shot"
+}
+```
+
+**Tips:**
+- Use hex colors (`#F5DEB3`) for precise color specification
+- Include typography details when text is needed — BFL notes that objects containing text in reality (signs, labels, screens) should have explicit quoted text, otherwise the model generates gibberish
+- Specify camera parameters for photographic styles
+
+### Klein (Qwen3)
+
+Klein models respond better to **narrative, prose-style prompts** rather than structured formats:
+
+```
+A weathered lighthouse keeper stands at the edge of a storm-battered cliff,
+his silver beard catching the last golden rays of sunset. Salt-worn hands
+grip the rusty railing as waves crash below, sending up spray that catches
+the dying light like scattered diamonds.
+```
+
+**Tips:**
+- More descriptive, flowing language works best
+- Emphasis on emotional context and atmosphere
+- Lighting descriptions are particularly impactful
+- Avoid structured/JSON formats (no field labels)
+
+### Image Editing (I2I)
+
+When using a reference image with `--control_image_path`, write concise editing instructions (50-80 words):
+
+- Specify what changes AND what stays the same (e.g., "keep the face and lighting")
+- Turn negatives into positives ("don't change X" → "keep X")
+- Make abstractions concrete ("futuristic" → "glowing cyan neon, metallic panels")
+
+## Licensing
+
+| Model | License | Commercial Use |
+|-------|---------|----------------|
+| **FLUX.2-dev** | FLUX Non-Commercial License | No |
+| **FLUX.2-klein-9B** | FLUX Non-Commercial License | No |
+| **FLUX.2-klein-base-9B** | FLUX Non-Commercial License | No |
+| **FLUX.2-klein-4B** | **Apache 2.0** | **Yes** |
+| **FLUX.2-klein-base-4B** | **Apache 2.0** | **Yes** |
+| **FLUX.2 VAE (ae.safetensors)** | Apache 2.0 | Yes |
+
+> **Important:** Klein-4B and Klein-base-4B are the only commercially-usable FLUX.2 variants. LoRAs trained on a specific base model inherit its license restrictions — if commercial use is important, train on `klein-base-4b` or `klein-4b`.

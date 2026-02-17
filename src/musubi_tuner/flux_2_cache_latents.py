@@ -22,13 +22,15 @@ logging.basicConfig(level=logging.INFO)
 _model_version_info: Optional[Flux2ModelInfo] = None
 
 
-def preprocess_contents_flux_2(batch: List[ItemInfo]) -> tuple[torch.Tensor, List[List[np.ndarray]]]:
+def preprocess_contents_flux_2(
+    batch: List[ItemInfo],
+) -> tuple[torch.Tensor, Optional[list[Optional[list[torch.Tensor]]]]]:
     # item.content: target image (H, W, C)
     # item.control_content: list of images (H, W, C), optional
 
     # Stack batch into target tensor (B,H,W,C) in RGB order and control images list of tensors (H, W, C)
     contents = []
-    controls = []
+    controls: list[Optional[list[torch.Tensor]]] = []
     for item in batch:
         contents.append(torch.from_numpy(item.content))  # target image
 
@@ -37,21 +39,23 @@ def preprocess_contents_flux_2(batch: List[ItemInfo]) -> tuple[torch.Tensor, Lis
                 limit_pixels = 1024**2
             elif len(item.control_content) == 1:
                 limit_pixels = 2024**2
-            else:
-                limit_pixels = None
             img_ctx = [(Image.fromarray(cc) if isinstance(cc, np.ndarray) else cc).convert("RGB") for cc in item.control_content]
 
             img_ctx_prep = flux2_utils.default_prep(
                 img=img_ctx,
                 limit_pixels=limit_pixels,
             )
+            if not isinstance(img_ctx_prep, list):
+                img_ctx_prep = [img_ctx_prep]
             controls.append(img_ctx_prep)
+        else:
+            controls.append(None)
 
     contents = torch.stack(contents, dim=0)  # B, H, W, C
     contents = contents.permute(0, 3, 1, 2)  # B, H, W, C -> B, C, H, W
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
-    if not controls:
+    if all(c is None for c in controls):
         controls = None
 
     return contents, controls
@@ -66,7 +70,12 @@ def encode_and_save_batch(ae: flux2_models.AutoEncoder, batch: List[ItemInfo]):
     with torch.no_grad():
         latents = ae.encode(contents.to(ae.device, dtype=ae.dtype))  # B, C, H, W
         if controls is not None:
-            control_latents = [[ae.encode(c.to(ae.device, dtype=ae.dtype).unsqueeze(0))[0] for c in cl] for cl in controls]
+            control_latents: list[Optional[list[torch.Tensor]]] = []
+            for cl in controls:
+                if cl is None:
+                    control_latents.append(None)
+                    continue
+                control_latents.append([ae.encode(c.to(ae.device, dtype=ae.dtype).unsqueeze(0))[0] for c in cl])
         else:
             control_latents = None
 
@@ -90,7 +99,7 @@ def encode_and_save_batch(ae: flux2_models.AutoEncoder, batch: List[ItemInfo]):
 
             mask_weights_i = mask  # Keep as (1, 1, H, W) for layout="video" with F=1
 
-        print(
+        logger.info(
             f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
             f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
             f"{f', mask shape: {mask_weights_i.shape}' if mask_weights_i is not None else ''}"
@@ -150,6 +159,7 @@ def main():
     logger.info(f"Loading AE model from {args.vae}")
     ae = flux2_utils.load_ae(args.vae, dtype=vae_dtype, device=device, disable_mmap=True)
     ae.to(device)
+    ae.eval()
 
     # encoding closure
     def encode(batch: List[ItemInfo]):

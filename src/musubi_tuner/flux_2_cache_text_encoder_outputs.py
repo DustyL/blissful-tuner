@@ -28,6 +28,9 @@ def encode_and_save_batch(
     device: torch.device,
     arch_full: str,
 ):
+    global _model_version_info
+    if _model_version_info is None:
+        raise RuntimeError("model_version_info not set - call main() first")
     prompts = [item.caption for item in batch]
     # Use bfloat16 for autocast when text embedder uses FP8 (itemsize == 1 byte)
     autocast_dtype = torch.bfloat16 if text_embedder.dtype.itemsize == 1 else text_embedder.dtype
@@ -42,6 +45,8 @@ def encode_and_save_batch(
         #     ctx_empty = text_embedder([""]).to(torch.bfloat16)
         #     ctx_prompt = text_embedder(prompts).to(torch.bfloat16)
         #     ctx_vec = torch.cat([ctx_empty, ctx_prompt], dim=0)
+        ctx_vec = ctx_vec.to(torch.bfloat16)
+        flux2_utils.validate_ctx_vec_dim(ctx_vec, _model_version_info, source="flux_2_cache_text_encoder_outputs.encode_and_save_batch()")
         ctx_vec = ctx_vec.cpu()  # [1, 512, 15360]
 
     # save prompt cache

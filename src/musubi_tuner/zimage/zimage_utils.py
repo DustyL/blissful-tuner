@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from typing import Any, Optional, Union
 import logging
 
@@ -16,6 +17,19 @@ logging.basicConfig(level=logging.INFO)
 
 
 ZIMAGE_ID = "Tongyi-MAI/Z-Image"
+
+
+def load_qwen2_tokenizer_local_first(ckpt_path: str, tokenizer_id: str, subfolder: str | None) -> Qwen2Tokenizer:
+    """Load Qwen2Tokenizer, preferring local files in `ckpt_path` when available."""
+    if os.path.isdir(ckpt_path):
+        try:
+            logger.info(f"Loading tokenizer from local path: {ckpt_path}")
+            return Qwen2Tokenizer.from_pretrained(ckpt_path, subfolder=subfolder)
+        except Exception as e:
+            logger.info(f"Failed to load tokenizer from '{ckpt_path}', falling back to '{tokenizer_id}': {e}")
+
+    logger.info(f"Loading tokenizer from {tokenizer_id}")
+    return Qwen2Tokenizer.from_pretrained(tokenizer_id, subfolder=subfolder)
 
 
 def shift_scale_latents_for_decode(latents: torch.Tensor) -> torch.Tensor:
@@ -111,7 +125,20 @@ def load_qwen3(
         logger.info(f"Loading state dict from {ckpt_path}")
         sd = load_split_weights(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
 
-    sd["lm_head.weight"] = sd["model.embed_tokens.weight"]  # tie weights
+    # Tie weights only when appropriate.
+    # - Qwen3-4B uses tied weights (tie_word_embeddings=True): ensure lm_head exists and points at embed_tokens.
+    # - Qwen3-8B uses untied weights (tie_word_embeddings=False): do NOT overwrite lm_head if present.
+    #   If lm_head is missing (some split checkpoints), create a fallback weight to satisfy strict loading.
+    embed_key = "model.embed_tokens.weight"
+    lm_head_key = "lm_head.weight"
+    if embed_key not in sd:
+        raise KeyError(f"Missing required key in Qwen3 state dict: {embed_key}")
+
+    if not is_8b:
+        sd[lm_head_key] = sd[embed_key]
+    elif lm_head_key not in sd:
+        logger.warning("Qwen3-8B checkpoint missing lm_head.weight; using embed_tokens.weight as a fallback (lm_head unused).")
+        sd[lm_head_key] = sd[embed_key]
 
     info = qwen3.load_state_dict(sd, strict=True, assign=True)
     logger.info(f"Loaded Qwen3: {info}")
@@ -156,8 +183,7 @@ def load_qwen3(
     if tokenizer_id is None:
         tokenizer_id = ZIMAGE_ID
         subfolder = "tokenizer"
-    logger.info(f"Loading tokenizer from {tokenizer_id}")
-    tokenizer = Qwen2Tokenizer.from_pretrained(tokenizer_id, subfolder=subfolder)
+    tokenizer = load_qwen2_tokenizer_local_first(ckpt_path, tokenizer_id=tokenizer_id, subfolder=subfolder)
     return tokenizer, qwen3
 
 

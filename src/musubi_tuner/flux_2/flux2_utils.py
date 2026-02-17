@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import numpy as np
 import torch
 import torchvision
@@ -58,6 +59,23 @@ MAX_LENGTH = 512
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 SYSTEM_MESSAGE = """You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object
 attribution and actions without speculation."""
+
+
+def load_mistral3_processor(ckpt_path: str):
+    """Load the Mistral3 processor/tokenizer, preferring local files.
+
+    The text encoder checkpoints can be provided as a local HF snapshot directory; in that case,
+    loading the processor from `ckpt_path` avoids network dependencies and ensures tokenizer files match.
+    """
+    if os.path.isdir(ckpt_path):
+        try:
+            logger.info(f"Loading Mistral3 processor from local path: {ckpt_path}")
+            return AutoProcessor.from_pretrained(ckpt_path, use_fast=False)
+        except Exception as e:
+            logger.info(f"Failed to load Mistral3 processor from '{ckpt_path}', falling back to '{M3_TOKENIZER_ID}': {e}")
+
+    logger.info(f"Loading Mistral3 processor from Hugging Face ID: {M3_TOKENIZER_ID}")
+    return AutoProcessor.from_pretrained(M3_TOKENIZER_ID, use_fast=False)
 
 
 @dataclass(frozen=True)
@@ -135,6 +153,19 @@ MODEL_VERSION_ALIASES = {
 def resolve_model_version(v: str) -> str:
     """Resolve model version aliases to canonical names."""
     return MODEL_VERSION_ALIASES.get(v, v)
+
+
+def validate_ctx_vec_dim(ctx_vec: torch.Tensor, model_version_info: Flux2ModelInfo, source: str) -> None:
+    """Validate ctx_vec last-dim matches the expected model context dim."""
+    expected = int(model_version_info.params.context_in_dim)
+    actual = int(ctx_vec.shape[-1])
+    if actual != expected:
+        raise ValueError(
+            f"FLUX.2 ctx_vec dim mismatch ({source}): ctx_vec.shape={tuple(ctx_vec.shape)}, "
+            f"expected ctx_vec.shape[-1]={expected} for architecture='{model_version_info.architecture_full}' "
+            f"(got {actual}). Check that --text_encoder matches --model_version and any cached TE outputs were generated "
+            "for the same variant."
+        )
 
 
 def add_model_version_args(parser: argparse.ArgumentParser):
@@ -482,11 +513,11 @@ def get_schedule(num_steps: int, image_seq_len: int, flow_shift: Optional[float]
     Returns:
         List of timesteps from 1 to 0.
     """
-    mu = compute_empirical_mu(image_seq_len, num_steps)
     timesteps = torch.linspace(1, 0, num_steps + 1)
     if flow_shift is not None:
         timesteps = (timesteps * flow_shift) / (1 + (flow_shift - 1) * timesteps)
     else:
+        mu = compute_empirical_mu(image_seq_len, num_steps)
         timesteps = generalized_time_snr_shift(timesteps, mu, 1.0)
     return timesteps.tolist()
 
@@ -732,7 +763,7 @@ class Mistral3Embedder(nn.Module):
         device: Union[str, torch.device],
         disable_mmap: bool = False,
         state_dict: Optional[dict] = None,
-    ) -> tuple[AutoProcessor, Mistral3ForConditionalGeneration]:
+    ) -> None:
         super().__init__()
 
         M3_CONFIG_JSON = """
@@ -817,7 +848,7 @@ class Mistral3Embedder(nn.Module):
                 self.mistral3.to(dtype)
 
         # Load tokenizer
-        self.tokenizer = AutoProcessor.from_pretrained(M3_TOKENIZER_ID, use_fast=False)
+        self.tokenizer = load_mistral3_processor(ckpt_path)
 
     @property
     def dtype(self):
@@ -828,7 +859,8 @@ class Mistral3Embedder(nn.Module):
         return self.mistral3.device
 
     def to(self, *args, **kwargs):
-        return self.mistral3.to(*args, **kwargs)
+        self.mistral3.to(*args, **kwargs)
+        return self
 
     def forward(self, txt: list[str]):
         if not isinstance(txt, list):
@@ -880,7 +912,7 @@ class Mistral3Embedder(nn.Module):
         img = [[concatenate_images(img_i)] if len(img_i) > 1 else img_i for img_i in img]
 
         # cap the pixels
-        img = [[cap_pixels(img_i, UPSAMPLING_MAX_IMAGE_SIZE) for img_i in img_i] for img_i in img]
+        img = [[cap_pixels(im, UPSAMPLING_MAX_IMAGE_SIZE) for im in img_i] for img_i in img]
         return img
 
     def format_input(
@@ -973,12 +1005,14 @@ class Qwen3Embedder(nn.Module):
 
     def to(self, *args, **kwargs):
         # FIXME: chainging dtype not supported yet
-        return self.model.to(*args, **kwargs)
+        self.model.to(*args, **kwargs)
+        return self
 
-    def forward(self, txt: list[str]):
-        all_input_ids = []
-        all_attention_masks = []
+    def forward(self, txt: list[str] | str):
+        if not isinstance(txt, list):
+            txt = [txt]
 
+        formatted_prompts = []
         for prompt in txt:
             messages = [{"role": "user", "content": prompt}]
             text = self.tokenizer.apply_chat_template(
@@ -987,20 +1021,17 @@ class Qwen3Embedder(nn.Module):
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
+            formatted_prompts.append(text)
 
-            model_inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=self.max_length,
-            )
-
-            all_input_ids.append(model_inputs["input_ids"])
-            all_attention_masks.append(model_inputs["attention_mask"])
-
-        input_ids = torch.cat(all_input_ids, dim=0).to(self.model.device)
-        attention_mask = torch.cat(all_attention_masks, dim=0).to(self.model.device)
+        model_inputs = self.tokenizer(
+            formatted_prompts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+        )
+        input_ids = model_inputs["input_ids"].to(self.model.device)
+        attention_mask = model_inputs["attention_mask"].to(self.model.device)
 
         output = self.model(
             input_ids=input_ids,

@@ -22,7 +22,7 @@ from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 # FP8 optimization constants
 FP8_OPTIMIZATION_TARGET_KEYS = ["double_blocks", "single_blocks"]
-FP8_OPTIMIZATION_EXCLUDE_KEYS = ["norm", "pe_embedder", "time_in", "_modulation"]
+FP8_OPTIMIZATION_EXCLUDE_KEYS = ["norm", "pe_embedder", "time_in", "mod"]
 
 
 @dataclass
@@ -512,7 +512,7 @@ class Flux2(nn.Module):
 
     def fp8_optimization(
         self, state_dict: dict[str, torch.Tensor], device: torch.device, move_to_device: bool, use_scaled_mm: bool = False
-    ) -> int:
+    ) -> dict[str, torch.Tensor]:
         """
         Optimize the model state_dict with fp8.
 
@@ -524,16 +524,16 @@ class Flux2(nn.Module):
             move_to_device (bool):
                 Whether to move the weight to the device after optimization.
         """
-        TARGET_KEYS = ["single_blocks", "double_blocks"]
-        EXCLUDE_KEYS = [
-            "norm",
-            "mod",
-        ]
-
         from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 
         # inplace optimization
-        state_dict = optimize_state_dict_with_fp8(state_dict, device, TARGET_KEYS, EXCLUDE_KEYS, move_to_device=move_to_device)
+        state_dict = optimize_state_dict_with_fp8(
+            state_dict,
+            device,
+            FP8_OPTIMIZATION_TARGET_KEYS,
+            FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            move_to_device=move_to_device,
+        )
 
         # apply monkey patching
         apply_fp8_monkey_patch(self, state_dict, use_scaled_mm=use_scaled_mm)
@@ -567,6 +567,25 @@ class Flux2(nn.Module):
 
     def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = num_blocks
+
+        max_double_blocks_to_swap = max(0, self.num_double_blocks - 2)
+        max_single_blocks_to_swap = max(0, self.num_single_blocks - 2)
+        if num_blocks > 0:
+            if self.num_double_blocks == 0:
+                max_blocks_to_swap = max_single_blocks_to_swap
+            elif self.num_single_blocks == 0:
+                max_blocks_to_swap = max_double_blocks_to_swap
+            else:
+                # NOTE: For Flux-style models, swapping 1 double-stream block is roughly equivalent to swapping 2 single-stream blocks.
+                # The `num_blocks` input behaves like a budget where: budget ≈ (double_blocks) + (single_blocks / 2).
+                max_blocks_to_swap = max_double_blocks_to_swap + (max_single_blocks_to_swap // 2)
+
+            if num_blocks > max_blocks_to_swap:
+                raise ValueError(
+                    f"Cannot swap {num_blocks} blocks (max {max_blocks_to_swap}) for this model. "
+                    f"Max swappable blocks: {max_double_blocks_to_swap} double, {max_single_blocks_to_swap} single."
+                )
+
         if num_blocks <= 0:
             double_blocks_to_swap = 0
             single_blocks_to_swap = 0
@@ -597,10 +616,11 @@ class Flux2(nn.Module):
                 else:
                     double_blocks_to_swap = 1
 
-        assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
-            f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
-            f"Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks."
-        )
+        if double_blocks_to_swap > max_double_blocks_to_swap or single_blocks_to_swap > max_single_blocks_to_swap:
+            raise ValueError(
+                f"Cannot swap more than {max_double_blocks_to_swap} double blocks and {max_single_blocks_to_swap} single blocks. "
+                f"Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks."
+            )
 
         self.offloader_double = ModelOffloader(
             "double",

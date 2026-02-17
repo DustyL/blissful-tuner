@@ -66,7 +66,37 @@ class Flux2NetworkTrainer(NetworkTrainer):
             )
         self._i2v_training = False
         self._control_training = False  # this means video training, not control image training
-        self.default_guidance_scale = 4.0  # CFG scale for inference for base models
+        # Default guidance scale for sample image generation. (Some FLUX.2 variants are distilled / fixed-step.)
+        self.default_guidance_scale = float(self.model_version_info.defaults["guidance"])
+
+    @staticmethod
+    def _apply_flux2_sample_defaults(model_version: str, model_version_info: Flux2ModelInfo, prompt_dict: dict) -> None:
+        """Apply FLUX.2-variant sampling defaults for training sample prompts.
+
+        hv_train_network.sample_image_inference defaults are generic (e.g. sample_steps=20), but
+        FLUX.2 variants have canonical per-variant defaults in FLUX2_MODEL_INFO (e.g. Klein distilled 4 steps).
+
+        This also enforces fixed params for distilled variants to avoid confusing no-op samples.
+        """
+        default_num_steps = int(model_version_info.defaults["num_steps"])
+        if "num_steps" in model_version_info.fixed_params:
+            if "sample_steps" in prompt_dict and int(prompt_dict["sample_steps"]) != default_num_steps:
+                logger.warning(
+                    f"sample_steps={prompt_dict['sample_steps']} overridden to {default_num_steps} (fixed for {model_version})"
+                )
+            prompt_dict["sample_steps"] = default_num_steps
+        elif "sample_steps" not in prompt_dict:
+            prompt_dict["sample_steps"] = default_num_steps
+
+        default_guidance = float(model_version_info.defaults["guidance"])
+        if "guidance" in model_version_info.fixed_params:
+            if "guidance_scale" in prompt_dict and float(prompt_dict["guidance_scale"]) != default_guidance:
+                logger.warning(
+                    f"guidance_scale={prompt_dict['guidance_scale']} overridden to {default_guidance} (fixed for {model_version})"
+                )
+            prompt_dict["guidance_scale"] = default_guidance
+        elif "guidance_scale" not in prompt_dict:
+            prompt_dict["guidance_scale"] = default_guidance
 
     def process_sample_prompts(
         self,
@@ -82,6 +112,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
         if self.model_version_info is None:
             raise RuntimeError("model_version_info not set - call handle_model_specific_args first")
         model_version_info = self.model_version_info
+
+        for prompt_dict in prompts:
+            self._apply_flux2_sample_defaults(args.model_version, model_version_info, prompt_dict)
 
         # Load text encoder (Mistral3 for dev, Qwen3 for Klein)
         te_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
@@ -109,6 +142,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
                     logger.info(f"cache Text Encoder outputs for prompt: {p}")
                     ctx_vec = text_embedder([p]).to(torch.bfloat16).cpu()  # [1, 512, 15360]
+                    flux2_utils.validate_ctx_vec_dim(ctx_vec, model_version_info, source="Flux2NetworkTrainer.process_sample_prompts()")
 
                     # save prompt cache
                     sample_prompts_te_outputs[p] = ctx_vec
@@ -335,8 +369,8 @@ class Flux2NetworkTrainer(NetworkTrainer):
     def scale_shift_latents(latents):
         return latents
 
-    @staticmethod
     def call_dit(
+        self,
         args: argparse.Namespace,
         accelerator: Accelerator,
         transformer,
@@ -388,6 +422,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
         # context
         ctx_vec = batch["ctx_vec"]  # B, T, D  # [1, 512, 15360]
+        if self.model_version_info is None:
+            raise RuntimeError("model_version_info not set - call handle_model_specific_args first")
+        flux2_utils.validate_ctx_vec_dim(ctx_vec, self.model_version_info, source="Flux2NetworkTrainer.call_dit_and_get_target()")
         ctx, ctx_ids = flux2_utils.batched_prc_txt(ctx_vec)  # [1, 512, 15360], [1, 512, 4]
 
         # ensure the hidden state will require grad
