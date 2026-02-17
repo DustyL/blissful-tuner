@@ -46,6 +46,30 @@ class TestTimestepBoundaryClassification(unittest.TestCase):
         self.assertFalse(t[0] / 1000.0 >= i2v_boundary)
 
 
+class TestTimestepBoundaryParsing(unittest.TestCase):
+    """Verify WAN CLI accepts both normalized and [0..1000] boundary values (TP-08)."""
+
+    def test_parser_accepts_float_boundary(self) -> None:
+        from musubi_tuner.wan_train_network import wan_setup_parser
+
+        parser = argparse.ArgumentParser()
+        parser = wan_setup_parser(parser)
+
+        args = parser.parse_args(["--timestep_boundary", "0.875"])
+        self.assertIsInstance(args.timestep_boundary, float)
+        self.assertAlmostEqual(args.timestep_boundary, 0.875)
+
+    def test_parser_accepts_integer_boundary(self) -> None:
+        from musubi_tuner.wan_train_network import wan_setup_parser
+
+        parser = argparse.ArgumentParser()
+        parser = wan_setup_parser(parser)
+
+        args = parser.parse_args(["--timestep_boundary", "875"])
+        self.assertIsInstance(args.timestep_boundary, float)
+        self.assertAlmostEqual(args.timestep_boundary, 875.0)
+
+
 class TestBucketingDualExpertIncompatibility(unittest.TestCase):
     """Verify that timestep bucketing is rejected with dual-expert training (TP-01)."""
 
@@ -97,6 +121,35 @@ class TestBucketingDualExpertIncompatibility(unittest.TestCase):
             self.assertNotIn("incompatible", str(e).lower(), f"Unexpected bucketing error: {e}")
         except Exception:
             pass  # Other errors from incomplete mock setup are fine
+
+    @patch("musubi_tuner.wan_train_network.detect_wan_sd_dtype", return_value=torch.bfloat16)
+    def test_boundary_conversion_works_for_both_units(self, _mock_detect: MagicMock) -> None:
+        """handle_model_specific_args should normalize int-style boundaries (e.g. 875 -> 0.875)."""
+        from musubi_tuner.wan_train_network import WanNetworkTrainer
+
+        def make_args(boundary: float) -> argparse.Namespace:
+            return argparse.Namespace(
+                dit_high_noise="some_path",
+                dit="some_path",
+                task="t2v-A14B",
+                blocks_to_swap=None,
+                num_timestep_buckets=None,
+                offload_inactive_dit=False,
+                timestep_boundary=boundary,
+                mixed_precision="bf16",
+                fp8_scaled=False,
+                timestep_sampling="shift",
+                discrete_flow_shift=12.0,
+                gradient_accumulation_steps=1,
+            )
+
+        trainer_norm = WanNetworkTrainer.__new__(WanNetworkTrainer)
+        trainer_norm.handle_model_specific_args(make_args(0.875))
+        self.assertAlmostEqual(trainer_norm.timestep_boundary, 0.875)
+
+        trainer_int = WanNetworkTrainer.__new__(WanNetworkTrainer)
+        trainer_int.handle_model_specific_args(make_args(875.0))
+        self.assertAlmostEqual(trainer_int.timestep_boundary, 0.875)
 
 
 class TestFlowMatchingConvention(unittest.TestCase):

@@ -139,6 +139,36 @@ class TestExpertSwap(unittest.TestCase):
         # Swap should succeed because patch_fn adds ._orig_mod. to block keys
         trainer.swap_high_low_weights(args, accelerator, model)
         self.assertTrue(trainer.current_model_is_high_noise)
+        # TP-10: patching should not mutate the stored inactive state dict in-place.
+        self.assertEqual(set(inactive_sd.keys()), set(BLOCK_KEYS))
+
+    def test_compile_key_unpatching(self) -> None:
+        """With compile=True, compiled inactive keys should be unpatched if the model expects non-compiled keys."""
+        # Model uses non-compiled keys
+        model = _make_simple_model(BLOCK_KEYS, seed=42)
+
+        # Inactive dict uses compile-style keys
+        inactive_sd = OrderedDict()
+        gen = torch.Generator().manual_seed(99)
+        compile_keys = [
+            "blocks.0._orig_mod.weight",
+            "blocks.0._orig_mod.bias",
+            "blocks.1._orig_mod.weight",
+            "blocks.1._orig_mod.bias",
+            "head.weight",
+        ]
+        for key in compile_keys:
+            inactive_sd[key] = torch.randn(4, 4, generator=gen)
+
+        trainer = self._make_trainer()
+        trainer.dit_inactive_state_dict = inactive_sd
+        args = self._make_args(compile=True)
+        accelerator = MagicMock()
+
+        trainer.swap_high_low_weights(args, accelerator, model)
+        self.assertTrue(trainer.current_model_is_high_noise)
+        # Inactive dict stays unchanged (no in-place mutation)
+        self.assertEqual(set(inactive_sd.keys()), set(compile_keys))
 
     # --- Test 4: TP-14 structure validation catches mismatched experts ---
 

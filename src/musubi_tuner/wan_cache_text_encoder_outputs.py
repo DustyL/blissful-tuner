@@ -63,6 +63,10 @@ def main():
     config = wan_t2v_14B.t2v_14B  # all Wan2.1 models have the same config for t5
     accelerator = None
     if args.fp8_t5:
+        # NOTE(TC-04): `--fp8_t5` stores (most) T5 weights in FP8 to reduce VRAM.
+        # We still run the forward pass under bf16/fp16 autocast for activations/compute.
+        # `Accelerator(mixed_precision=...)` controls the autocast dtype, while `T5EncoderModel(fp8=True)`
+        # controls how the FP8 weights are loaded and handled internally.
         accelerator = accelerate.Accelerator(mixed_precision="bf16" if config.t5_dtype == torch.bfloat16 else "fp16")
 
     # prepare cache files and paths: all_cache_files_for_dataset = exisiting cache files, all_cache_paths_for_dataset = all cache paths in the dataset

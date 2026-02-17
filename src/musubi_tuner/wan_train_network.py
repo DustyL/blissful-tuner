@@ -144,7 +144,9 @@ class WanNetworkTrainer(NetworkTrainer):
             )
         if self.timestep_boundary is not None:
             if self.timestep_boundary > 1:
-                self.timestep_boundary /= 1000.0  # convert to 0 to 1 range
+                # TP-08: Users may specify the boundary either in normalized units [0, 1]
+                # or in scheduler timestep units [0, 1000]. Internally we store it normalized.
+                self.timestep_boundary /= 1000.0
             logger.info(f"Converted timestep_boundary to 0 to 1 range: {self.timestep_boundary}")
 
         self.default_guidance_scale = 1.0  # not used
@@ -640,6 +642,8 @@ class WanNetworkTrainer(NetworkTrainer):
         noisy_model_input, sample_timesteps = super().get_noisy_model_input_and_timesteps(
             args, noise[0:1], latents[0:1], timesteps[0:1] if timesteps is not None else None, noise_scheduler, device, dtype
         )
+        # TP-08: `sample_timesteps` are scheduler timesteps in the [0, 1000] / [1, 1000] space.
+        # `self.timestep_boundary` is stored normalized in [0, 1], so we divide by 1000 for comparisons.
         high_noise = sample_timesteps[0] / 1000.0 >= self.timestep_boundary
         self.next_model_is_high_noise = high_noise
 
@@ -681,15 +685,44 @@ class WanNetworkTrainer(NetworkTrainer):
 
     def swap_high_low_weights(self, args: argparse.Namespace, accelerator: Accelerator, model: WanModel):
         if self.current_model_is_high_noise != self.next_model_is_high_noise:
-
-            def patch_fn(state_dict):
+            # TP-10: torch.compile can introduce an extra "._orig_mod." segment in module key paths,
+            # which affects the model's state_dict keys. Keep swap robust by remapping keys only when
+            # needed, without mutating the stored inactive state dict in-place.
+            def patch_state_dict_for_compile_if_needed(state_dict: dict, expected_keys: set[str]) -> dict:
                 if not args.compile:
                     return state_dict
-                for key in list(state_dict.keys()):
+
+                if set(state_dict.keys()) == expected_keys:
+                    return state_dict
+
+                def add_orig_mod(key: str) -> str:
                     if key.startswith("blocks.") and "._orig_mod." not in key:
                         tokens = key.split(".")
-                        new_key = ".".join(tokens[:2] + ["_orig_mod"] + tokens[2:])
-                        state_dict[new_key] = state_dict.pop(key)
+                        return ".".join(tokens[:2] + ["_orig_mod"] + tokens[2:])
+                    return key
+
+                def remove_orig_mod(key: str) -> str:
+                    if key.startswith("blocks.") and "._orig_mod." in key:
+                        return key.replace("._orig_mod.", ".", 1)
+                    return key
+
+                def remap(fn) -> dict:
+                    remapped = {}
+                    for key, value in state_dict.items():
+                        new_key = fn(key)
+                        if new_key in remapped and new_key != key:
+                            raise ValueError(f"State dict key remap collision: '{key}' -> '{new_key}' already exists")
+                        remapped[new_key] = value
+                    return remapped
+
+                patched = remap(add_orig_mod)
+                if set(patched.keys()) == expected_keys:
+                    return patched
+
+                patched = remap(remove_orig_mod)
+                if set(patched.keys()) == expected_keys:
+                    return patched
+
                 return state_dict
 
             if self.blocks_to_swap == 0:
@@ -700,8 +733,13 @@ class WanNetworkTrainer(NetworkTrainer):
                     clean_memory_on_device(accelerator.device)
 
                 state_dict = model.state_dict()  # CPU or accelerator.device
+                expected_keys = set(state_dict.keys())
 
-                info = model.load_state_dict(patch_fn(self.dit_inactive_state_dict), strict=True, assign=True)
+                info = model.load_state_dict(
+                    patch_state_dict_for_compile_if_needed(self.dit_inactive_state_dict, expected_keys),
+                    strict=True,
+                    assign=True,
+                )
                 assert len(info.missing_keys) == 0, f"Missing keys: {info.missing_keys}"
                 assert len(info.unexpected_keys) == 0, f"Unexpected keys: {info.unexpected_keys}"
 
@@ -713,8 +751,13 @@ class WanNetworkTrainer(NetworkTrainer):
             else:
                 # If block swap is enabled, we cannot use offloading inactive DiT, because weights are partially on CPU
                 state_dict = model.state_dict()  # CPU or accelerator.device
+                expected_keys = set(state_dict.keys())
 
-                info = model.load_state_dict(patch_fn(self.dit_inactive_state_dict), strict=True, assign=True)
+                info = model.load_state_dict(
+                    patch_state_dict_for_compile_if_needed(self.dit_inactive_state_dict, expected_keys),
+                    strict=True,
+                    assign=True,
+                )
                 assert len(info.missing_keys) == 0, f"Missing keys: {info.missing_keys}"
                 assert len(info.unexpected_keys) == 0, f"Unexpected keys: {info.unexpected_keys}"
 
@@ -834,9 +877,12 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     parser.add_argument("--dit_high_noise", type=str, required=False, default=None, help="DiT checkpoint path for high noise model")
     parser.add_argument(
         "--timestep_boundary",
-        type=int,
+        type=float,
         default=None,
-        help="Timestep boundary for switching between high and low noise models, defaults to None (task specific) / 高ノイズモデルと低ノイズモデルを切り替えるタイムステップ境界。デフォルトはNone（タスク固有）",
+        help="Timestep boundary for switching between high and low noise models. "
+        "Accepts either normalized [0.0, 1.0] (e.g. 0.875) or timestep [0, 1000] (e.g. 875). "
+        "Defaults to None (task specific) / 高ノイズモデルと低ノイズモデルを切り替えるタイムステップ境界。"
+        "0.0〜1.0（例:0.875）または0〜1000（例:875）で指定できます。デフォルトはNone（タスク固有）。",
     )
     parser.add_argument(
         "--offload_inactive_dit",

@@ -190,7 +190,7 @@ def save_text_encoder_output_cache(item_info, embed, mask, is_llm):
 latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
 ```
 
-**Suggested Fix**: Verify VAE output dtype and either remove the casts or replace the uncertain comment with a definitive one.
+**Fix**: Replaced the uncertain comment with a definitive one, and made the cast conditional (`if latent.dtype != vae.dtype`) so it remains a safety net without forcing extra copies.
 
 ---
 
@@ -207,6 +207,8 @@ latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is
 attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
 ```
 
+**Fix**: Added a short `NOTE(TC-03)` comment in `t5.py` explaining why the scaling is omitted.
+
 ---
 
 #### TC-04: FP8 T5 Accelerator Usage Undocumented
@@ -216,6 +218,8 @@ attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
 **File**: `src/musubi_tuner/wan_cache_text_encoder_outputs.py:60-61`
 
 **Problem**: When `--fp8_t5` is set, an `accelerator` with `mixed_precision="bf16"` is created, then `accelerator.autocast()` wraps the T5 forward pass. The interaction between FP8 quantized weights and bf16 autocast is not explained.
+
+**Fix**: Added a `NOTE(TC-04)` comment clarifying that `Accelerator(mixed_precision=...)` controls autocast compute dtype, while `T5EncoderModel(fp8=True)` controls FP8 weight handling.
 
 ---
 
@@ -341,7 +345,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: User confusion. The current behavior (shared LoRA) is correct but non-obvious.
 
-**Suggested Fix**: Add documentation in `docs/wan.md` explaining that dual-expert LoRA uses one trainable parameter set applied to whichever expert is active for each batch.
+**Fix**: Added a short "Dual-expert LoRA note" section to `docs/wan.md` clarifying that one shared LoRA is trained across both experts (base DiT swaps; LoRA params stay shared).
 
 ---
 
@@ -355,7 +359,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: Developer confusion only. Code is correct.
 
-**Suggested Fix**: Add inline comment explaining prior + expert swap interaction.
+**Fix**: Added an inline comment near the prior-preservation teacher forward pass explaining that `call_dit()` handles expert selection and the teacher runs on the same expert as the student (with LoRA disabled).
 
 ---
 
@@ -372,7 +376,7 @@ if args.num_timestep_buckets is not None:
 
 **Impact**: Cognitive load for developers. Not a correctness issue.
 
-**Suggested Fix**: Add inline comments at each conversion point, and a section in the architecture doc explaining the representation chain.
+**Fix**: Added inline comments at boundary conversion / comparisons, and updated the WAN CLI to accept `--timestep_boundary` as a float so `0.875` works (while still supporting `875` style). Added unit tests covering parsing and normalization.
 
 ---
 
@@ -397,6 +401,8 @@ if args.num_timestep_buckets is not None:
 **Problem**: The `patch_fn` manually inserts `._orig_mod.` into state dict keys for torch.compile compatibility. This relies on torch.compile's internal naming convention, which could change.
 
 **Impact**: Minor — `strict=True` assertions will catch any breakage immediately.
+
+**Fix**: Made the key patching logic non-mutating and conditional: it remaps keys only when needed to match the active model's `state_dict()` key set, and can patch in either direction (add/remove `._orig_mod.`). Added targeted tests to ensure the inactive dict isn't modified in-place.
 
 ---
 
@@ -644,25 +650,25 @@ synchronize_device(device)
 | TT-02 | HIGH | 6 | Tests | No WAN dataset loading tests (varlen T5, batch) | FIXED |
 | TT-03 | MEDIUM | 6 | Tests | No WAN mask loss integration test (video layout) | FIXED |
 | TC-02 | LOW | 1 | Text Cache | Empty captions silently processed without logging | FIXED |
-| LC-05 | LOW | 1 | Latent Cache | Redundant dtype casts with uncertain "we are not sure" comments | OPEN |
-| TP-06 | LOW | 2 | Training | LoRA + dual-expert behavior undocumented | OPEN |
-| TP-07 | LOW | 2 | Training | Prior preservation + expert swap interaction undocumented | OPEN |
-| TP-08 | LOW | 2 | Training | Timestep convention inconsistency (0-1 vs 1-1000) | OPEN |
+| LC-05 | LOW | 1 | Latent Cache | Redundant dtype casts with uncertain "we are not sure" comments | FIXED |
+| TP-06 | LOW | 2 | Training | LoRA + dual-expert behavior undocumented | FIXED |
+| TP-07 | LOW | 2 | Training | Prior preservation + expert swap interaction undocumented | FIXED |
+| TP-08 | LOW | 2 | Training | Timestep convention inconsistency (0-1 vs 1-1000) | FIXED |
 | TP-09 | LOW | 2 | Training | Guidance scale tuple ordering not validated | FIXED |
-| TP-10 | LOW | 2 | Training | torch.compile key patching for expert swap is fragile | OPEN |
+| TP-10 | LOW | 2 | Training | torch.compile key patching for expert swap is fragile | FIXED |
 | GN-02 | LOW | 4 | Generation | CFG skip mode silently ignored without cfg_apply_ratio | FIXED |
 | GN-03 | LOW | 4 | Generation | perp_neg and cfgzerostar mutual exclusion not validated | FIXED (pre-existing in blissful_core.py) |
 | GN-04 | LOW | 4 | Generation | Lazy loading model cleanup incomplete | OPEN |
 | DS-01 | LOW | 5 | Dataset | No warning when mask_directory set without use_mask_loss | FIXED |
-| TC-03 | NOTE | 1 | Text Cache | T5 attention no-scaling not documented in code comments | OPEN |
-| TC-04 | NOTE | 1 | Text Cache | FP8 T5 accelerator interaction undocumented | OPEN |
+| TC-03 | NOTE | 1 | Text Cache | T5 attention no-scaling not documented in code comments | FIXED |
+| TC-04 | NOTE | 1 | Text Cache | FP8 T5 accelerator interaction undocumented | FIXED |
 | TP-11 | NOTE | 2 | Training | normalize_per_sample default could auto-enable with prior preservation | OPEN |
 | TP-12 | NOTE | 2 | Training | Missing EMA for LoRA training (feature request) | OPEN |
 | TP-13 | MEDIUM | R | Training | WAN 2.2 training defaults are easy-misuse traps (`--timestep_sampling sigma`, `--discrete_flow_shift 1.0`) | FIXED |
 | TP-14 | LOW | R | Training | Block swap + dual-expert: no runtime validation that both experts have identical block structure | FIXED |
 | LC-06 | LOW | R | Latent Cache | I2V mask could be constructed directly in latent space from `lat_f` instead of pixel→latent reshape trick | FIXED |
 | DOC-01 | HIGH | R | Architecture Doc | I2V pseudocode in `wan22_architecture.md` has inverted mask convention and wrong image conditioning | FIXED |
-| CF-01 | NOTE | R | Design | Cache format evolution: proposed fixes (TC-01, LC-01 auto-pad) change on-disk format — need compatibility stance | OPEN |
+| CF-01 | NOTE | R | Design | Cache format evolution: proposed fixes (TC-01, LC-01 auto-pad) change on-disk format — need compatibility stance | FIXED |
 
 ### Review-Round Issues (added post-audit from reviewer feedback)
 
@@ -742,10 +748,7 @@ This is equivalent, more readable, and eliminates the fragile `view(1, shape[1]/
 
 There is no documented compatibility stance: Can old caches be used after code updates? Should cache files be versioned? Is re-caching always expected?
 
-**Suggested Fix**: Document a stance in code comments or a brief section in `docs/dataset_config.md`:
-- Option A: "Always re-cache after code changes" (simplest, current implicit behavior)
-- Option B: Add version key to cache files, validate on load
-- Option C: Read-time migration (detect old format, convert in memory)
+**Fix**: Documented the recommended stance in `docs/dataset_config.md`: treat caches as disposable artifacts and re-cache after repo updates or cache-affecting option changes (formats are not explicitly versioned).
 
 ---
 

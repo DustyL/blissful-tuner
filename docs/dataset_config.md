@@ -399,6 +399,10 @@ caption_extension = ".txt"
 - Changing caption text requires recaching text encoder outputs
 - Recommended: use a separate `cache_directory` per caption strategy/model
 
+**Stale caches after updating Blissful Tuner / Musubi Tuner:**
+- Cache formats are not explicitly versioned. Updates to cache scripts or model code may add/remove keys or change tensor shapes/dtypes.
+- Recommended: treat caches as disposable artifacts. If you update the repo (or change relevant cache options like VAE/T5 weights, precision, or frame count policies), delete the dataset's `cache_directory` and re-run the cache scripts.
+
 **Caption not found at runtime despite passing filter:**
 - Possible case sensitivity mismatch (Linux is case-sensitive; macOS/Windows often aren't)
 - Possible Unicode normalization issue (different tools produce visually-identical but binary-different filenames)
@@ -462,6 +466,10 @@ caption_extension = ".txt"
 **キャプション変更後の古いTEキャッシュ:**
 - キャプションテキストを変更した場合、テキストエンコーダー出力の再キャッシュが必要です
 - 推奨：キャプション戦略/モデルごとに別の`cache_directory`を使用
+
+**Blissful Tuner / Musubi Tuner更新後にキャッシュが古い:**
+- キャッシュ形式には明示的なバージョンがありません。キャッシュスクリプトやモデル側の更新で、キーの追加/削除やテンソルのshape/dtypeが変わる場合があります。
+- 推奨：キャッシュは使い捨ての成果物として扱ってください。リポジトリを更新した場合（またはVAE/T5重み、精度、フレーム数ポリシーなどの関連オプションを変更した場合）は、該当データセットの`cache_directory`を削除してキャッシュを再生成してください。
 
 #### プラットフォームに関する注意
 

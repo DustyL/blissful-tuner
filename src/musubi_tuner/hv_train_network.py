@@ -2466,6 +2466,10 @@ class NetworkTrainer:
                         with torch.no_grad():
                             # Note: must unwrap network for set_enabled() to work with DDP/accelerator wrapping
                             with self.prior_model_context(accelerator.unwrap_model(network)):
+                                # TP-07: Dual-expert note (WAN 2.2).
+                                # call_dit() is responsible for expert selection/swap based on `timesteps`.
+                                # Because we reuse the exact same timesteps for the teacher forward pass, the
+                                # prior prediction runs on the same expert as the student, with LoRA disabled.
                                 # Use exact same inputs (noisy_model_input, timesteps, etc.)
                                 prior_pred_raw, _ = self.call_dit(
                                     args,

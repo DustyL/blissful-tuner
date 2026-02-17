@@ -112,7 +112,9 @@ class T5Attention(nn.Module):
             mask = mask.view(b, 1, 1, -1) if mask.ndim == 2 else mask.unsqueeze(1)
             attn_bias.masked_fill_(mask == 0, torch.finfo(x.dtype).min)
 
-        # compute attention (T5 does not use scaling)
+        # compute attention
+        # NOTE(TC-03): T5 attention deliberately omits the 1/sqrt(d_k) scaling used by "Attention is All You Need".
+        # This matches the original T5 implementation/paper; do not add scaling here.
         attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
         attn = F.softmax(attn.float(), dim=-1).type_as(attn)
         x = torch.einsum("bnij,bjnc->binc", attn, v)

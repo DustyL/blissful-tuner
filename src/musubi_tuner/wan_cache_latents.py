@@ -100,7 +100,10 @@ def encode_and_save_batch(
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
         latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
     latent = torch.stack(latent, dim=0)  # B, C, F, H, W
-    latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
+    # Autocast usually returns `vae.dtype`, but some ops may promote to fp32 for stability.
+    # Ensure cached latents use the VAE dtype to avoid unexpected cache bloat / mixed dtypes downstream.
+    if latent.dtype != vae.dtype:
+        latent = latent.to(dtype=vae.dtype)
 
     if i2v:
         # extract first frame of contents
@@ -129,7 +132,8 @@ def encode_and_save_batch(
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
             y = vae.encode(images_padded)
         y = torch.stack(y, dim=0)  # B, C, lat_f, H, W
-        y = y.to(vae.dtype)
+        if y.dtype != vae.dtype:
+            y = y.to(dtype=vae.dtype)
 
         # Concatenate mask + image latent → 20-channel I2V conditioning tensor
         y = torch.concat([msk, y], dim=1)  # B, 4 + C, lat_f, H, W
@@ -157,7 +161,8 @@ def encode_and_save_batch(
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
             control_latent = vae.encode(control_contents)  # list of Tensor[C, F, H, W]
         control_latent = torch.stack(control_latent, dim=0)  # B, C, F, H, W
-        control_latent = control_latent.to(vae.dtype)  # convert to bfloat16
+        if control_latent.dtype != vae.dtype:
+            control_latent = control_latent.to(dtype=vae.dtype)
     else:
         control_latent = None
 
@@ -246,7 +251,8 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
             latent.append(torch.cat(l, dim=2))  # B, C, F, H, W
         latent = torch.cat(latent, dim=0)  # B, C, F, H, W
 
-    latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
+    if latent.dtype != vae.dtype:
+        latent = latent.to(dtype=vae.dtype)
     control_latent = latent[:, :, :-1, :, :]
     target_latent = latent[:, :, -1:, :, :]
 
