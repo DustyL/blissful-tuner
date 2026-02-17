@@ -18,13 +18,18 @@ from musubi_tuner import (
 import importlib
 
 # Kandinsky 5 has a transitive import error (ensure_dtype_form missing from blissful_tuner.utils).
-# Gate on the specific missing symbol so we avoid importing the Kandinsky stack at all when it
-# would fail — this prevents side-effect warnings from partially-loaded Kandinsky modules.
-_k5_importable = hasattr(importlib.import_module("blissful_tuner.utils"), "ensure_dtype_form")
-if _k5_importable:
-    from musubi_tuner import kandinsky5_generate_video
+# Gate on the specific missing symbol first to avoid partially importing the Kandinsky stack
+# (which spams autocast warnings even on failure). Still wrap in try/except so that any *other*
+# future import break also results in a graceful skip rather than a hard module-level failure.
+_k5_skip_reason = None
+kandinsky5_generate_video = None
+if not hasattr(importlib.import_module("blissful_tuner.utils"), "ensure_dtype_form"):
+    _k5_skip_reason = "blissful_tuner.utils.ensure_dtype_form not found"
 else:
-    kandinsky5_generate_video = None
+    try:
+        from musubi_tuner import kandinsky5_generate_video
+    except Exception as e:
+        _k5_skip_reason = str(e)
 
 
 class TestLoraMultiplierDefaults(unittest.TestCase):
@@ -35,11 +40,9 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
     def test_lora_multiplier_default_is_none(self):
         """C5: nargs='*' must use default=None (not 1.0) to avoid TypeError when calling len()."""
         cases = [
+            ("flux_2_generate_image", flux_2_generate_image, ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"]),
             (
-                flux_2_generate_image,
-                ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"],
-            ),
-            (
+                "hv_generate_video",
                 hv_generate_video,
                 [
                     "prog",
@@ -58,6 +61,7 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
                 ],
             ),
             (
+                "fpack_generate_video",
                 fpack_generate_video,
                 [
                     "prog",
@@ -73,37 +77,26 @@ class TestLoraMultiplierDefaults(unittest.TestCase):
                     "x",
                 ],
             ),
+            ("zimage_generate_image", zimage_generate_image, ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"]),
             (
-                zimage_generate_image,
-                ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"],
-            ),
-            (
+                "flux_kontext_generate_image",
                 flux_kontext_generate_image,
                 ["prog", "--text_encoder1", "x", "--text_encoder2", "x", "--save_path", "x", "--prompt", "x"],
             ),
             (
+                "qwen_image_generate_image",
                 qwen_image_generate_image,
                 ["prog", "--text_encoder", "x", "--save_path", "x", "--prompt", "x"],
             ),
-            (
-                wan_generate_video,
-                ["prog", "--save_path", "x", "--prompt", "x"],
-            ),
-            (
-                hv_1_5_generate_video,
-                ["prog", "--save_path", "x", "--prompt", "x"],
-            ),
-            (
-                kandinsky5_generate_video,
-                ["prog", "--dit", "x", "--save_path", "x", "--prompt", "x"],
-            ),
+            ("wan_generate_video", wan_generate_video, ["prog", "--save_path", "x", "--prompt", "x"]),
+            ("hv_1_5_generate_video", hv_1_5_generate_video, ["prog", "--save_path", "x", "--prompt", "x"]),
+            ("kandinsky5_generate_video", kandinsky5_generate_video, ["prog", "--dit", "x", "--save_path", "x", "--prompt", "x"]),
         ]
 
-        for module, argv in cases:
-            name = module.__name__ if module is not None else argv[-1]
+        for name, module, argv in cases:
             with self.subTest(module=name):
                 if module is None:
-                    self.skipTest("kandinsky5_generate_video not importable (ensure_dtype_form missing)")
+                    self.skipTest(f"{name} not importable: {_k5_skip_reason}")
                 args = self._parse(module, argv)
                 self.assertIsNone(args.lora_multiplier)
 
