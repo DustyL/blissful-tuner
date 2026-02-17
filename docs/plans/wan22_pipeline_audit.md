@@ -414,7 +414,7 @@ if args.num_timestep_buckets is not None:
 
 **Problem**: `normalize_per_sample` defaults to False but docs recommend True when prior preservation is enabled. The recommended mode isn't the default.
 
-**Suggested Fix**: Auto-enable when `prior_preservation_weight > 0` and user hasn't explicitly set the flag.
+**Fix**: Added a warning in `validate_mask_loss_args()` when `prior_preservation_weight > 0` and `normalize_per_sample` is False, advising users to consider enabling it. Default behavior unchanged — the warning is informational only.
 
 ---
 
@@ -547,6 +547,8 @@ synchronize_device(device)
 
 **Problem**: After lazy loading, only the current active model is deleted. Other models in the list may remain in VRAM.
 
+**Status**: BY DESIGN — In lazy-loading mode, `load_dit_models()` returns `[None, None]` (placeholder list). The real model is only ever held in the local `model` variable, which is `del`'d + `gc.collect()`'d + `clean_memory_on_device()`'d at each expert boundary switch (line 1599-1620) and at the end of the loop (line 1697-1700). The "other models in the list" are just `None` references. For non-lazy offload mode, the inactive model is explicitly moved to CPU at the switch point (line 1609).
+
 ---
 
 ## Round 5: Dataset Config + Mask Loss
@@ -646,7 +648,7 @@ synchronize_device(device)
 | TP-04 | MEDIUM | 2 | Training | Gradient accumulation + expert swap edge case | FIXED |
 | TP-05 | MEDIUM | 2 | Training | Block swap + dual-expert interaction undertested | FIXED |
 | GN-01 | MEDIUM | 4 | Generation | Hardcoded 5s sleep for block swap sync — fragile | FIXED |
-| TT-01 | HIGH | 6 | Tests | No WAN dual-expert training tests (critical gap) | PARTIAL (basic tests exist, block-swap gap remains) |
+| TT-01 | HIGH | 6 | Tests | No WAN dual-expert training tests (critical gap) | FIXED (basic + block-swap swap tests) |
 | TT-02 | HIGH | 6 | Tests | No WAN dataset loading tests (varlen T5, batch) | FIXED |
 | TT-03 | MEDIUM | 6 | Tests | No WAN mask loss integration test (video layout) | FIXED |
 | TC-02 | LOW | 1 | Text Cache | Empty captions silently processed without logging | FIXED |
@@ -658,11 +660,11 @@ synchronize_device(device)
 | TP-10 | LOW | 2 | Training | torch.compile key patching for expert swap is fragile | FIXED |
 | GN-02 | LOW | 4 | Generation | CFG skip mode silently ignored without cfg_apply_ratio | FIXED |
 | GN-03 | LOW | 4 | Generation | perp_neg and cfgzerostar mutual exclusion not validated | FIXED (pre-existing in blissful_core.py) |
-| GN-04 | LOW | 4 | Generation | Lazy loading model cleanup incomplete | OPEN |
+| GN-04 | LOW | 4 | Generation | Lazy loading model cleanup incomplete | BY DESIGN |
 | DS-01 | LOW | 5 | Dataset | No warning when mask_directory set without use_mask_loss | FIXED |
 | TC-03 | NOTE | 1 | Text Cache | T5 attention no-scaling not documented in code comments | FIXED |
 | TC-04 | NOTE | 1 | Text Cache | FP8 T5 accelerator interaction undocumented | FIXED |
-| TP-11 | NOTE | 2 | Training | normalize_per_sample default could auto-enable with prior preservation | OPEN |
+| TP-11 | NOTE | 2 | Training | normalize_per_sample default could auto-enable with prior preservation | FIXED |
 | TP-12 | NOTE | 2 | Training | Missing EMA for LoRA training (feature request) | OPEN |
 | TP-13 | MEDIUM | R | Training | WAN 2.2 training defaults are easy-misuse traps (`--timestep_sampling sigma`, `--discrete_flow_shift 1.0`) | FIXED |
 | TP-14 | LOW | R | Training | Block swap + dual-expert: no runtime validation that both experts have identical block structure | FIXED |

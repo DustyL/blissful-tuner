@@ -245,5 +245,103 @@ class TestExpertSwap(unittest.TestCase):
             self.assertTrue(torch.equal(model.state_dict()[k], original_sd[k]))
 
 
+class TestExpertSwapBlockSwapBranch(unittest.TestCase):
+    """Test swap_high_low_weights with blocks_to_swap > 0 (TT-01 block-swap gap)."""
+
+    def _make_trainer(self, *, blocks_to_swap: int = 4) -> WanNetworkTrainer:
+        trainer = WanNetworkTrainer.__new__(WanNetworkTrainer)
+        trainer.blocks_to_swap = blocks_to_swap
+        trainer.current_model_is_high_noise = False
+        trainer.next_model_is_high_noise = True
+        return trainer
+
+    def _make_args(self, *, compile: bool = False) -> argparse.Namespace:
+        # offload_inactive_dit is always False when blocks_to_swap > 0 (enforced by handle_model_specific_args)
+        return argparse.Namespace(compile=compile, offload_inactive_dit=False)
+
+    # --- Test 1: Block-swap branch round-trip preserves weights ---
+
+    def test_block_swap_round_trip(self) -> None:
+        """blocks_to_swap > 0 branch should still do a correct round-trip exchange."""
+        model = _make_simple_model(BLOCK_KEYS, seed=42)
+        original_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+        gen = torch.Generator().manual_seed(99)
+        high_sd = OrderedDict()
+        for k, v in model.state_dict().items():
+            high_sd[k] = torch.randn_like(v, generator=gen)
+
+        trainer = self._make_trainer()
+        trainer.dit_inactive_state_dict = high_sd
+        args = self._make_args()
+        accelerator = MagicMock()
+
+        # Swap 1: low → high
+        trainer.swap_high_low_weights(args, accelerator, model)
+        self.assertTrue(trainer.current_model_is_high_noise)
+        for k in BLOCK_KEYS:
+            self.assertTrue(torch.equal(model.state_dict()[k], high_sd[k]))
+
+        # Swap 2: high → low
+        trainer.next_model_is_high_noise = False
+        trainer.swap_high_low_weights(args, accelerator, model)
+        self.assertFalse(trainer.current_model_is_high_noise)
+        for k in BLOCK_KEYS:
+            self.assertTrue(torch.equal(model.state_dict()[k], original_sd[k]))
+
+    # --- Test 2: Block-swap branch exchange invariant ---
+
+    def test_block_swap_exchange_invariant(self) -> None:
+        """After swap, inactive state dict holds previously active weights (block-swap branch)."""
+        model = _make_simple_model(BLOCK_KEYS, seed=42)
+        original_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+        gen = torch.Generator().manual_seed(99)
+        high_sd = OrderedDict()
+        for k, v in model.state_dict().items():
+            high_sd[k] = torch.randn_like(v, generator=gen)
+        high_sd_copy = {k: v.clone() for k, v in high_sd.items()}
+
+        trainer = self._make_trainer()
+        trainer.dit_inactive_state_dict = high_sd
+        args = self._make_args()
+        accelerator = MagicMock()
+
+        trainer.swap_high_low_weights(args, accelerator, model)
+
+        # Model has high-noise weights
+        for k in BLOCK_KEYS:
+            self.assertTrue(torch.equal(model.state_dict()[k], high_sd_copy[k]))
+        # Inactive has old low-noise weights
+        for k in BLOCK_KEYS:
+            self.assertTrue(torch.equal(trainer.dit_inactive_state_dict[k], original_sd[k]))
+
+    # --- Test 3: Block-swap with compile key patching ---
+
+    def test_block_swap_with_compile(self) -> None:
+        """Block-swap branch should work with torch.compile key remapping."""
+        compile_keys = [
+            "blocks.0._orig_mod.weight",
+            "blocks.0._orig_mod.bias",
+            "blocks.1._orig_mod.weight",
+            "blocks.1._orig_mod.bias",
+            "head.weight",
+        ]
+        model = _make_simple_model(compile_keys, seed=42)
+
+        gen = torch.Generator().manual_seed(99)
+        inactive_sd = OrderedDict()
+        for k in BLOCK_KEYS:
+            inactive_sd[k] = torch.randn(4, 4, generator=gen)
+
+        trainer = self._make_trainer(blocks_to_swap=8)
+        trainer.dit_inactive_state_dict = inactive_sd
+        args = self._make_args(compile=True)
+        accelerator = MagicMock()
+
+        trainer.swap_high_low_weights(args, accelerator, model)
+        self.assertTrue(trainer.current_model_is_high_noise)
+
+
 if __name__ == "__main__":
     unittest.main()
