@@ -33,8 +33,18 @@ def create_arch_network(
     else:
         exclude_patterns = ast.literal_eval(exclude_patterns)
 
-    # exclude if 'norm' in the name of the module
-    exclude_patterns.append(r".*(_modulation|_refiner).*")
+    # Always exclude _modulation (adaLN low-rank projections — training these causes instability).
+    # By default also exclude _refiner (noise_refiner / context_refiner layers). Override with
+    # `include_refiner=True` in `network_args` to target them (matches diffusers' LoRA behaviour).
+    include_refiner = kwargs.pop("include_refiner", False)
+    if isinstance(include_refiner, str):
+        include_refiner = ast.literal_eval(include_refiner)
+
+    if include_refiner:
+        exclude_patterns.append(r".*_modulation.*")
+        logger.info("Z-Image LoRA: including noise_refiner / context_refiner layers (include_refiner=True)")
+    else:
+        exclude_patterns.append(r".*(_modulation|_refiner).*")
 
     kwargs["exclude_patterns"] = exclude_patterns
 

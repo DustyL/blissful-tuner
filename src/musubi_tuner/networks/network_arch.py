@@ -89,6 +89,7 @@ ARCH_CONFIGS = {
     },
     ARCHITECTURE_Z_IMAGE: {
         "target_modules": ZIMAGE_TARGET_REPLACE_MODULES,
+        # LoRA supports include_refiner=True via network_args to target _refiner layers.
         "exclude_patterns": [r".*(_modulation|_refiner).*"],
     },
     ARCHITECTURE_KANDINSKY5: {
