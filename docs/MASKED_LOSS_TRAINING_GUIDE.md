@@ -242,10 +242,12 @@ resolution = [1024, 1024]
 
 When you run the cache latents script, masks are:
 
-1. **Loaded** from `mask_directory` (matched by filename)
+1. **Loaded** from `mask_directory` (matched by filename) or extracted from RGBA alpha channel
 2. **Normalized** from 0-255 to 0.0-1.0
 3. **Downsampled** to latent space dimensions (8x smaller)
-4. **Saved** alongside latents in the cache file
+4. **Saved** alongside latents in the cache file as **raw [0.0, 1.0] values**
+
+> **Important**: Masks are stored in their raw form — `--mask_gamma` and `--mask_min_weight` are **not** applied during caching. These transformations are applied at training time by the mask loss module. This is intentional: it allows you to experiment with different gamma/min-weight values without recaching latents. You only need to recache when the mask images themselves change or when switching between `alpha_mask` / `mask_directory` sources.
 
 ```bash
 # For WAN 2.2

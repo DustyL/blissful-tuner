@@ -204,7 +204,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="RCM (Reference Consistency Mask) threshold, default is None (disabled). Lower values mean larger inpainting region. "
-        "Typical values are 0.1 to 0.5 for relative threshold, 0.01 to 0.1 for absolute threshold.",
+        "Typical values are 0.1 to 0.5 for relative threshold. For absolute threshold, start around 0.5-2.0 "
+        "(latent magnitudes are typically ~3.0, so very small values like 0.01 will mask almost everything).",
     )
     parser.add_argument(
         "--rcm_relative_threshold",
@@ -625,6 +626,7 @@ def decode_latent(
     Returns:
     - pixels: (L, 3, H, W) or (1, 3, H, W)
     """
+    assert latent.shape[0] == 1, f"decode_latent expects batch_size=1, got {latent.shape[0]}"
     logger.info(f"Decoding image. Latent shape {latent.shape}, device {device}")
     if latent.ndim == 4:  # 1 C H W
         latent = latent.unsqueeze(2)  # add frame dimension, becomes 1 C 1 H W

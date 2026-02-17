@@ -27,7 +27,9 @@ SCHEDULER_BASE_SHIFT = 0.5
 SCHEDULER_MAX_IMAGE_SEQ_LEN = 8192
 SCHEDULER_MAX_SHIFT = 0.9
 
-VAE_SCALE_FACTOR = 8  # Qwen Image uses 8x compression
+VAE_SCALE_FACTOR = 8  # Qwen-Image VAE spatial compression ratio (pixel_dim / latent_dim). All current
+# Qwen-Image variants use 8x. If a future variant changes this, update here — it propagates to
+# mask downsampling, latent dimension calculations, and shift formula inputs.
 
 # endregion constants
 

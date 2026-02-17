@@ -461,7 +461,8 @@ def save_latent_cache_wan(
         sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions (F, H, W) as float32 for precision
+        # Save mask weights in latent space dimensions (F, H, W) as float32 for precision.
+        # F = number of video frames (WAN/HV) or number of layers (Qwen-Image Layered).
         # Single transfer: detach → device/dtype conversion (avoids redundant copies)
         mask_dtype_str = dtype_to_str(torch.float32)
         sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
@@ -590,7 +591,9 @@ def save_latent_cache_qwen_image(
             sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions (1, F, H, W) as float32 for precision
+        # Save mask weights in latent space dimensions (1, F, H, W) as float32 for precision.
+        # F = 1 for standard/Edit images; for Layered, F = number of layers (mask is expanded
+        # identically across all layers — per-layer masks are not currently supported).
         # Single transfer: detach → device/dtype conversion (avoids redundant copies)
         _, F, H, W = latent.shape
         mask_dtype_str = dtype_to_str(torch.float32)
