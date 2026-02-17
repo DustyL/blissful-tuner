@@ -78,9 +78,10 @@ _DEFAULT_INFER_STEPS: dict[str, int] = {
 
 def resolve_infer_steps(args: argparse.Namespace) -> int:
     """Fill ``infer_steps`` with model-version-aware defaults when the user did not set it."""
-    if args.infer_steps is not None:
-        return args.infer_steps
-    args.infer_steps = _DEFAULT_INFER_STEPS.get(getattr(args, "model_version", "original"), 50)
+    if args.infer_steps is None:
+        args.infer_steps = _DEFAULT_INFER_STEPS.get(getattr(args, "model_version", "original"), 50)
+    if args.infer_steps < 1:
+        raise ValueError(f"--infer_steps must be >= 1, got {args.infer_steps}")
     return args.infer_steps
 
 

@@ -468,6 +468,14 @@ class QwenImageNetworkTrainer(NetworkTrainer):
                     num_control_images += 1
                 else:
                     break
+            # Sanity-check: Edit-original uses 1 control image; Edit-2509/2511 can use more.
+            # An unreasonable count (>16) likely indicates a malformed latent cache.
+            if num_control_images > 16:
+                raise ValueError(
+                    f"Found {num_control_images} control images in batch — this is likely a malformed latent cache. "
+                    f"Expected 1 for Edit or a small number for Edit-2509/2511."
+                )
+
             if num_control_images == 0:
                 if getattr(args, "allow_edit_fallback_to_t2i", False):
                     logger.warning(
