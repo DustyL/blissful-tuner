@@ -37,6 +37,16 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         self.is_layered = None
         self.vae_frame_stride = 1  # for Qwen-Image, frame stride is 1
 
+    def _map_continuous_t_to_sigma_and_timesteps(self, t, timesteps):
+        """Inference-aligned: sigma and timesteps both map to [0.001, 1.0].
+
+        Maps t ∈ [0, 1] → timesteps ∈ [1, 1000] → sigma = timesteps/1000 ∈ [0.001, 1.0].
+        Guarantees sigma == timesteps/1000 by construction (no float drift risk).
+        """
+        timesteps = (t * 999.0 + 1.0).clamp(1.0, 1000.0)
+        sigma = timesteps / 1000.0
+        return sigma, timesteps
+
     # region model specific
 
     @property
