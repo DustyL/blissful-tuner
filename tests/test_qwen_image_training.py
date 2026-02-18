@@ -6,7 +6,7 @@ import torch
 
 from musubi_tuner.hv_train_network import NetworkTrainer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
+from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer, _round_up_to_multiple
 
 
 class _FakeAccelerator:
@@ -244,6 +244,133 @@ class TestTimestepSigmaConsistency(unittest.TestCase):
         # And both should be in [0.001, 1.0]
         self.assertGreaterEqual(actual_sigma_mix, 0.001 - 1e-7)
         self.assertLessEqual(actual_sigma_mix, 1.0 + 1e-7)
+
+
+class TestRoundUpToMultiple(unittest.TestCase):
+    """Tests for the _round_up_to_multiple helper."""
+
+    def test_round_up_basic(self):
+        self.assertEqual(_round_up_to_multiple(70, 16), 80)
+
+    def test_already_aligned(self):
+        self.assertEqual(_round_up_to_multiple(64, 16), 64)
+
+    def test_small_value(self):
+        self.assertEqual(_round_up_to_multiple(1, 16), 16)
+
+    def test_disabled_with_zero(self):
+        self.assertEqual(_round_up_to_multiple(70, 0), 70)
+
+    def test_disabled_with_negative(self):
+        self.assertEqual(_round_up_to_multiple(70, -1), 70)
+
+
+class TestTextEmbedPadding(unittest.TestCase):
+    """Tests for text sequence padding in call_dit."""
+
+    def test_padding_produces_aligned_shape(self):
+        """Stacked text embeddings should have seq_len as multiple of 16 when enabled."""
+        vl_embed = [
+            torch.zeros(35, 8),
+            torch.zeros(70, 8),
+        ]
+        max_len = max(x.shape[0] for x in vl_embed)  # 70
+        max_len = _round_up_to_multiple(max_len, 16)  # 80
+        padded = [torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in vl_embed]
+        stacked = torch.stack(padded, dim=0)
+        self.assertEqual(stacked.shape, (2, 80, 8))
+        self.assertEqual(stacked.shape[1] % 16, 0)
+
+    def test_padding_creates_mask_for_bsize_1(self):
+        """When padding adds tail zeros with bsize=1, vl_mask must be created."""
+        trainer = QwenImageNetworkTrainer()
+        trainer.is_edit = False
+        trainer.is_layered = False
+
+        # seq_len=35 will round to 48 with pad_multiple=16
+        bsz, channels, height, width = 1, 16, 4, 4
+        latents = torch.zeros(bsz, channels, 1, height, width, dtype=torch.float32)
+        noise = torch.zeros_like(latents)
+        noisy_model_input = torch.zeros_like(latents)
+        timesteps = torch.zeros(bsz, dtype=torch.float32)
+        batch = {
+            "latents": latents,
+            "vl_embed": [torch.zeros(35, 8, dtype=torch.float32)],
+        }
+
+        args = SimpleNamespace(
+            is_layered=False,
+            remove_first_image_from_target=False,
+            split_attn=False,
+            gradient_checkpointing=False,
+            pad_text_seq_len_multiple=16,
+            compile=False,
+        )
+        accelerator = _FakeAccelerator()
+        model = _CapturingDummyQwenImageModel()
+
+        trainer.call_dit(
+            args=args,
+            accelerator=accelerator,
+            transformer=model,
+            latents=latents,
+            batch=batch,
+            noise=noise,
+            noisy_model_input=noisy_model_input,
+            timesteps=timesteps,
+            network_dtype=torch.float32,
+        )
+
+        # vl_mask should be created even with bsize=1 because padding added tail zeros
+        mask = model.last_kwargs["encoder_hidden_states_mask"]
+        self.assertIsNotNone(mask)
+        # First 35 positions should be True, rest False
+        self.assertTrue(mask[0, :35].all())
+        self.assertFalse(mask[0, 35:].any())
+        # Total length should be padded to 48
+        self.assertEqual(mask.shape[1], 48)
+
+    def test_no_padding_no_mask_for_bsize_1(self):
+        """Without padding and bsize=1, vl_mask should be None (legacy behavior)."""
+        trainer = QwenImageNetworkTrainer()
+        trainer.is_edit = False
+        trainer.is_layered = False
+
+        bsz, channels, height, width = 1, 16, 4, 4
+        latents = torch.zeros(bsz, channels, 1, height, width, dtype=torch.float32)
+        noise = torch.zeros_like(latents)
+        noisy_model_input = torch.zeros_like(latents)
+        timesteps = torch.zeros(bsz, dtype=torch.float32)
+        batch = {
+            "latents": latents,
+            "vl_embed": [torch.zeros(35, 8, dtype=torch.float32)],
+        }
+
+        args = SimpleNamespace(
+            is_layered=False,
+            remove_first_image_from_target=False,
+            split_attn=False,
+            gradient_checkpointing=False,
+            pad_text_seq_len_multiple=None,
+            compile=False,
+        )
+        accelerator = _FakeAccelerator()
+        model = _CapturingDummyQwenImageModel()
+
+        trainer.call_dit(
+            args=args,
+            accelerator=accelerator,
+            transformer=model,
+            latents=latents,
+            batch=batch,
+            noise=noise,
+            noisy_model_input=noisy_model_input,
+            timesteps=timesteps,
+            network_dtype=torch.float32,
+        )
+
+        # No padding, bsize=1 → vl_mask should be None
+        self.assertIsNone(model.last_kwargs["encoder_hidden_states_mask"])
 
 
 if __name__ == "__main__":
