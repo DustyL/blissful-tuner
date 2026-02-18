@@ -445,8 +445,9 @@ class Flux2NetworkTrainer(NetworkTrainer):
         ctx = ctx.to(device=accelerator.device, dtype=network_dtype)
         ctx_ids = ctx_ids.to(device=accelerator.device)
 
-        # use 1.0 as guidance scale for FLUX.2 training
-        guidance_vec = torch.full((bsize,), 1.0, device=accelerator.device, dtype=network_dtype)
+        # Guidance embedding scale for FLUX.2 training. (Only used by DEV; Klein variants ignore guidance embeddings.)
+        training_guidance_scale = float(getattr(args, "training_guidance_scale", 1.0))
+        guidance_vec = torch.full((bsize,), training_guidance_scale, device=accelerator.device, dtype=network_dtype)
 
         img_input = noisy_model_input
         img_input_ids = img_ids
@@ -483,6 +484,15 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--text_encoder", type=str, default=None, help="text encoder checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model (Qwen3 only)")
     parser.add_argument("--fp8_te", action="store_true", help=argparse.SUPPRESS)  # deprecated alias for config/CLI compat
+    parser.add_argument(
+        "--training_guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "guidance embedding scale used during training (DEV only; default: 1.0) / "
+            "学習時のガイダンス埋め込みスケール（DEVのみ、デフォルト: 1.0）"
+        ),
+    )
     flux2_utils.add_model_version_args(parser)
     return parser
 

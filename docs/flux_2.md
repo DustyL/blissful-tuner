@@ -97,7 +97,7 @@ python src/musubi_tuner/flux_2_cache_latents.py \
 - Use the `--model_version` option for Flux.2 Klein training.
 - The `control_images` in the dataset config is used as the reference image. See [Dataset Config](./dataset_config.md#flux1-kontext-dev) for details.
 
-**Masked Loss Training:** To enable mask-weighted loss training (e.g., face-focused LoRA), add `mask_directory` or `alpha_mask = true` to your dataset config. The caching script will bake `mask_weights` into the latent cache files. At training time, pass `--use_mask_loss` to apply the cached weights. **Important:** Always use a fresh `cache_directory` when adding or changing mask sources. See the [Masked Loss Training Guide](./MASKED_LOSS_TRAINING_GUIDE.md) for details.
+**Masked Loss Training:** To enable mask-weighted loss training (e.g., face-focused LoRA), add `mask_directory` or `alpha_mask = true` to your dataset config. The caching script will bake `mask_weights` into the latent cache files. At training time, pass `--use_mask_loss` to apply the cached weights. **Note:** for FLUX.2, `mask_weights` are cached at the model latent resolution (height//16 × width//16; e.g. 64×64 for 1024×1024), so very fine mask details will be averaged out. **Important:** Always use a fresh `cache_directory` when adding or changing mask sources. See the [Masked Loss Training Guide](./MASKED_LOSS_TRAINING_GUIDE.md) for details.
 
 <details>
 <summary>日本語</summary>
@@ -163,6 +163,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 - **Requires** specifying `--network_module networks.lora_flux_2`.
 - `--mixed_precision bf16` is recommended for FLUX.2 training.
 - `--timestep_sampling flux2_shift` is recommended for FLUX.2.
+- `--training_guidance_scale`: Guidance embedding scale used during training (DEV only). Default is `1.0` (guidance-neutral). If you usually sample DEV with `--embedded_cfg_scale 4.0`, consider training with `--training_guidance_scale 4.0` to better match the inference conditioning distribution.
+- Note: `flux2_shift` computes its shift from the *patchified* latent spatial dims; cross-trainer "seq_len" comparisons can be ambiguous unless you confirm whether other code uses pre- or post-patchify H×W.
 - Use the `--model_version` option for Flux.2 Klein training.
 - **Important**: When using reference images, `batch_size` must be 1 because reference images can have different sizes and counts per sample.
 - Memory saving options like `--fp8` (for DiT) and `--fp8_text_encoder` (for Text Encoder) are available. `--fp8_scaled` is recommended when using `--fp8` for DiT.
@@ -178,6 +180,8 @@ FLUX.2の学習は専用のスクリプト`flux_2_train_network.py`を使用し�
 - `--network_module networks.lora_flux_2`を指定する必要があります。
 - FLUX.2の学習には`--mixed_precision bf16`を推奨します。
 - FLUX.2には`--timestep_sampling flux2_shift`を推奨します。
+- 注意: `flux2_shift`のshiftはパッチ化後のlatentの空間次元（H×W）から計算されます。トレーナー間で`seq_len`を比較する際は、各実装がパッチ化前/後のどちらのH×Wを使っているかを確認してください。
+- `--training_guidance_scale`: 学習時のガイダンス埋め込みスケール（DEVのみ）。デフォルトは`1.0`（ガイダンス中立）です。DEVを通常`--embedded_cfg_scale 4.0`で推論する場合、推論時の条件付け分布に合わせる目的で`--training_guidance_scale 4.0`での学習を検討してください。
 - `--fp8`（DiT用）や`--fp8_text_encoder`（テキストエンコーダー用、Qwen3のみ）などのメモリ節約オプションが利用可能です。`--fp8_scaled`を使用することをお勧めします。
 - メモリ節約のために`--gradient_checkpointing`が利用可能です。
 
