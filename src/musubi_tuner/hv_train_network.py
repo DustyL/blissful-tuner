@@ -924,7 +924,9 @@ class NetworkTrainer:
         a, b = self.timestep_range_pool.pop()
         return random.uniform(a, b)
 
-    def _map_continuous_t_to_sigma_and_timesteps(self, t, timesteps):
+    def _map_continuous_t_to_sigma_and_timesteps(
+        self, t: torch.Tensor, timesteps: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Map continuous t ∈ [0,1] and raw timesteps to (sigma, timesteps).
 
         Called after ``timesteps = t * 1000.0``. The ``timesteps`` argument is

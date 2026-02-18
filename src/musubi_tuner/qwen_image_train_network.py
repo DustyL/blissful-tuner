@@ -44,7 +44,9 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         self.is_layered = None
         self.vae_frame_stride = 1  # for Qwen-Image, frame stride is 1
 
-    def _map_continuous_t_to_sigma_and_timesteps(self, t, timesteps):
+    def _map_continuous_t_to_sigma_and_timesteps(
+        self, t: torch.Tensor, timesteps: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Inference-aligned: sigma and timesteps both map to [0.001, 1.0].
 
         Maps t ∈ [0, 1] → timesteps ∈ [1, 1000] → sigma = timesteps/1000 ∈ [0.001, 1.0].
@@ -563,7 +565,8 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         vl_embed = [torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in vl_embed]
         vl_embed = torch.stack(vl_embed, dim=0)  # B, L, D
 
-        # if not split_attn, we need to make attention mask when sequences differ or padding added
+        # Attention mask needed when: multiple sequences in batch (different lengths) or
+        # padding rounded max_len up beyond the longest real sequence
         if not args.split_attn and (bsize > 1 or did_pad_tail):
             vl_mask = torch.zeros(bsize, max_len, dtype=torch.bool, device=vl_embed.device)
             for i, x in enumerate(txt_seq_lens):
