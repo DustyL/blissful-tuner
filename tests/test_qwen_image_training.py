@@ -373,5 +373,53 @@ class TestTextEmbedPadding(unittest.TestCase):
         self.assertIsNone(model.last_kwargs["encoder_hidden_states_mask"])
 
 
+class TestPaddingDefaultPrecedence(unittest.TestCase):
+    """Tests for padding default behavior with --compile and --pad_text_seq_len_multiple."""
+
+    def _run_call_dit_and_get_embed_shape(self, *, pad_multiple, compile_flag):
+        """Helper: run call_dit with given padding args and return encoder_hidden_states shape."""
+        trainer = QwenImageNetworkTrainer()
+        trainer.is_edit = False
+        trainer.is_layered = False
+
+        bsz, channels, height, width = 1, 16, 4, 4
+        latents = torch.zeros(bsz, channels, 1, height, width, dtype=torch.float32)
+        batch = {
+            "latents": latents,
+            "vl_embed": [torch.zeros(35, 8, dtype=torch.float32)],  # seq_len=35
+        }
+        args = SimpleNamespace(
+            is_layered=False,
+            remove_first_image_from_target=False,
+            split_attn=False,
+            gradient_checkpointing=False,
+            pad_text_seq_len_multiple=pad_multiple,
+            compile=compile_flag,
+        )
+        model = _CapturingDummyQwenImageModel()
+        trainer.call_dit(
+            args=args,
+            accelerator=_FakeAccelerator(),
+            transformer=model,
+            latents=latents,
+            batch=batch,
+            noise=torch.zeros_like(latents),
+            noisy_model_input=torch.zeros_like(latents),
+            timesteps=torch.zeros(bsz, dtype=torch.float32),
+            network_dtype=torch.float32,
+        )
+        return model.last_kwargs["encoder_hidden_states"].shape[1]
+
+    def test_compile_true_pads_to_16_by_default(self):
+        """compile=True + pad_text_seq_len_multiple=None → pads to multiple of 16."""
+        seq_len = self._run_call_dit_and_get_embed_shape(pad_multiple=None, compile_flag=True)
+        self.assertEqual(seq_len, 48)  # 35 → 48
+
+    def test_compile_true_pad_zero_disables_padding(self):
+        """compile=True + pad_text_seq_len_multiple=0 → padding disabled."""
+        seq_len = self._run_call_dit_and_get_embed_shape(pad_multiple=0, compile_flag=True)
+        self.assertEqual(seq_len, 35)  # unchanged
+
+
 if __name__ == "__main__":
     unittest.main()

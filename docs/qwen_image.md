@@ -326,6 +326,10 @@ If you specify `--split_attn`, the attention computation will be split, slightly
 
 `--discrete_flow_shift` is set quite low for Qwen-Image during inference (as described), so a lower value than other models may be preferable.
 
+**Noise sigma mapping:** Qwen-Image training uses an inference-aligned sigma range of `[0.001, 1.0]`. The noise mixing sigma and timestep embedding sigma are guaranteed to match (`sigma == timesteps/1000`), which differs from the base trainer's legacy `+1` offset. This means `t=0` maps to `sigma=0.001` (never exactly zero) and `t=1` maps to `sigma=1.0` (no overshoot beyond 1000). Runs trained with older versions used a slightly different mapping (`sigma_embed = sigma_mix + 0.001`); the practical impact on existing LoRAs is minimal but not zero.
+
+`--pad_text_seq_len_multiple N`: Pads text sequence length to a multiple of N for `torch.compile` graph stability. Defaults to 16 when `--compile` is enabled, 0 otherwise. Set to 0 to disable padding even when compiled. When padding is active, an attention mask is automatically created to prevent the model from attending to padding positions, even with `batch_size=1`.
+
 Don't forget to specify `--network_module networks.lora_qwen_image`.
 
 The appropriate settings for each parameter are unknown. Feedback is welcome.
