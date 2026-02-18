@@ -45,6 +45,7 @@ MAX_PERIOD = 10000
 
 BASE_IMAGE_SEQ_LEN = 256
 MAX_IMAGE_SEQ_LEN = 4096
+# NOTE: These are *mu* (log-shift) values used by dynamic shifting. The scheduler shift is exp(mu).
 BASE_SHIFT = 0.5
 MAX_SHIFT = 1.15
 

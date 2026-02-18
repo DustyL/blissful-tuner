@@ -301,15 +301,15 @@ class ZImageNetworkTrainer(NetworkTrainer):
         txt_seq_lens = [x.shape[0] for x in llm_embed]
 
         max_len = max(txt_seq_lens)
-        # if not split_attn, we need to make attention mask
-        if not args.split_attn and bsize > 1:
+        llm_mask = None
+        if bsize > 1:
+            # When batching multiple samples, we must mask padding tokens regardless of attention implementation.
+            # Otherwise, padded caption tokens can be treated as valid tokens (especially with --split_attn).
             padded_len = math.ceil((max_len + image_sequence_length) / zimage_config.SEQ_MULTI_OF) * zimage_config.SEQ_MULTI_OF
             max_len = int(padded_len) - image_sequence_length
             llm_mask = torch.zeros(bsize, max_len, dtype=torch.bool, device=llm_embed[0].device)
             for i, x in enumerate(txt_seq_lens):
                 llm_mask[i, :x] = True
-        else:
-            llm_mask = None  # if split_attn, vl_mask is not used
 
         llm_embed = [torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in llm_embed]
         llm_embed = torch.stack(llm_embed, dim=0)  # B, L, D
@@ -335,10 +335,12 @@ class ZImageNetworkTrainer(NetworkTrainer):
             model_pred = transformer(x=noisy_model_input, t=t_input, cap_feats=llm_embed, cap_mask=llm_mask)
 
         # model_pred: [B, C, F, H, W]
-        model_pred = model_pred.squeeze(2)  # [B, C, H, W]
+        # Standardize with inference/other trainers: negate model output and use the standard target (noise - latents).
+        # NOTE: For elementwise MSE, this is equivalent to the previous convention (no negation + inverted target),
+        # but standardizing avoids future sign bugs and keeps training/inference conventions aligned.
+        model_pred = -model_pred.squeeze(2)  # [B, C, H, W]
 
-        # Target: Opposite of usual Flow matching
-        target = latents - noise
+        target = noise - latents
 
         return model_pred, target
 

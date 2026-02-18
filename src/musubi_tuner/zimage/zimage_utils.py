@@ -280,15 +280,18 @@ def trim_pad_embeds_and_mask(
 
 
 def compute_dynamic_shift(image_seq_len: int) -> float:
-    """Compute resolution-dependent flow shift using FLUX-style linear interpolation.
+    """Compute resolution-dependent flow shift using FLUX-style dynamic shifting.
 
-    Maps image_seq_len linearly from [BASE_IMAGE_SEQ_LEN, MAX_IMAGE_SEQ_LEN] to [BASE_SHIFT, MAX_SHIFT].
-    Values outside the range are clamped.
+    This follows the same semantics as other "shift" implementations in this repo:
+    - Linearly interpolate *mu* from [BASE_IMAGE_SEQ_LEN, MAX_IMAGE_SEQ_LEN] to [BASE_SHIFT, MAX_SHIFT].
+    - Clamp mu to [BASE_SHIFT, MAX_SHIFT] to avoid extrapolation artifacts.
+    - Return shift = exp(mu), which is the value used by the Flow Matching time-shift schedule.
     """
     mu = (zimage_config.MAX_SHIFT - zimage_config.BASE_SHIFT) / (
         zimage_config.MAX_IMAGE_SEQ_LEN - zimage_config.BASE_IMAGE_SEQ_LEN
     ) * (image_seq_len - zimage_config.BASE_IMAGE_SEQ_LEN) + zimage_config.BASE_SHIFT
-    return max(zimage_config.BASE_SHIFT, min(zimage_config.MAX_SHIFT, mu))
+    mu = max(zimage_config.BASE_SHIFT, min(zimage_config.MAX_SHIFT, mu))
+    return math.exp(mu)
 
 
 def get_timesteps_sigmas(num_inference_steps: int, shift: float) -> tuple[torch.Tensor, torch.Tensor]:

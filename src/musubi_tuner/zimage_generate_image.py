@@ -4,6 +4,7 @@ import random
 import os
 import time
 import copy
+import math
 from typing import Tuple, Optional, List, Any, Dict
 
 import torch
@@ -169,9 +170,11 @@ def parse_args() -> argparse.Namespace:
         "--dynamic_shift",
         action="store_true",
         help=(
-            "Auto-compute flow_shift from resolution using FLUX-style linear interpolation "
-            f"(maps image seq len [{zimage_config.BASE_IMAGE_SEQ_LEN}, {zimage_config.MAX_IMAGE_SEQ_LEN}] "
-            f"to shift [{zimage_config.BASE_SHIFT}, {zimage_config.MAX_SHIFT}]). Overrides --flow_shift."
+            "Auto-compute flow_shift from resolution using FLUX-style dynamic shifting. "
+            f"Maps image seq len [{zimage_config.BASE_IMAGE_SEQ_LEN}, {zimage_config.MAX_IMAGE_SEQ_LEN}] "
+            f"to mu [{zimage_config.BASE_SHIFT}, {zimage_config.MAX_SHIFT}] (clamped), then uses flow_shift = exp(mu) "
+            f"(~[{math.exp(zimage_config.BASE_SHIFT):.2f}, {math.exp(zimage_config.MAX_SHIFT):.2f}]). "
+            "Overrides --flow_shift."
         ),
     )
 
