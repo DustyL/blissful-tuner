@@ -1,0 +1,104 @@
+# =============================================================================
+# Example: Z-Image Turbo LoRA training with a "training adapter" pre-merge
+# =============================================================================
+# Purpose:
+#   Some Z-Image Turbo pipelines ship a small adapter intended to be merged into
+#   the distilled Turbo DiT weights before doing flow-matching training.
+#   blissful-tuner supports this via `--base_weights` / `--base_weights_multiplier`.
+#
+# Usage:
+#   accelerate launch --num_cpu_threads_per_process 1 zimage_train_network.py \
+#     --config_file configs/examples/zimage/zimage_turbo_lora_with_training_adapter.toml
+#
+# What to edit first:
+#   - [model] paths (dit / vae / text_encoder)
+#   - [network].base_weights (adapter LoRA path)
+#   - [dataset].dataset_config (your dataset config)
+# =============================================================================
+
+# =============================================================================
+# MODEL PATHS
+# =============================================================================
+[model]
+# DiT: Use Turbo distilled weights when pairing with a training adapter.
+# If you have a De-Turbo checkpoint instead, you can just point `dit` to that
+# and remove `base_weights` below.
+dit = "/path/to/z_image_turbo_bf16.safetensors"
+
+vae = "/path/to/z_image_vae.safetensors"
+text_encoder = "/path/to/text_encoder_qwen3/00001-of-00002.safetensors"
+
+# =============================================================================
+# DATASET
+# =============================================================================
+[dataset]
+dataset_config = "configs/examples/zimage/zimage_dataset_1024.toml"
+
+# =============================================================================
+# NETWORK (Z-Image LoRA)
+# =============================================================================
+[network]
+network_module = "networks.lora_zimage"
+network_dim = 64
+network_alpha = 32
+network_args = [
+  # LoRA+ boosts LoRA-B learning rate for faster convergence
+  "loraplus_lr_ratio=8",
+  # Uncomment to also target the 2 refiner layers (experimental):
+  # "include_refiner=True",
+]
+
+# Merge a "training adapter" into the base DiT weights *before* training.
+# This uses the same network module as training (LoRA / LoHa / LoKr, etc).
+base_weights = [
+  "/path/to/zimage_turbo_training_adapter_v2.safetensors",
+]
+base_weights_multiplier = [1.0]
+
+# =============================================================================
+# OPTIMIZER
+# =============================================================================
+[optimizer]
+optimizer_type = "adamw"
+learning_rate = 8e-5
+optimizer_args = [
+  "betas=(0.9, 0.99)",
+  "weight_decay=0.01",
+  "eps=1e-8",
+]
+lr_scheduler = "cosine_with_min_lr"
+lr_warmup_steps = 100
+lr_scheduler_min_lr_ratio = 0.1
+
+# =============================================================================
+# TRAINING
+# =============================================================================
+[training]
+mixed_precision = "bf16"
+gradient_accumulation_steps = 1
+seed = 42
+
+max_train_steps = 2000
+save_every_n_steps = 250
+
+# Z-Image flow-matching timestep sampling
+timestep_sampling = "shift"
+discrete_flow_shift = 3.0
+weighting_scheme = "none"
+
+# Attention implementation (choose one for your environment)
+flash_attn = true
+
+# Memory/perf toggles
+gradient_checkpointing = false
+compile = true
+
+# =============================================================================
+# OUTPUT
+# =============================================================================
+[output]
+output_dir = "./output/examples/zimage_turbo_lora_with_training_adapter"
+output_name = "zimage_turbo_lora_adapter_example"
+logging_dir = "./output/examples/zimage_turbo_lora_with_training_adapter/logs"
+log_prefix = "zimage_turbo_lora_adapter_"
+

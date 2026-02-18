@@ -1,0 +1,31 @@
+# =============================================================================
+# Example Z-Image dataset config (single-resolution, 1024x1024)
+# =============================================================================
+# This is a template you can copy/modify for your own runs.
+#
+# Used by:
+#   - Latent caching: `zimage_cache_latents.py`
+#   - Text-encoder caching: `zimage_cache_text_encoder_outputs.py`
+#   - Training: `zimage_train_network.py` / `zimage_train.py`
+#
+# NOTE:
+# - Z-Image uses a 16-channel latent space; keep cache directories separate
+#   from other architectures to avoid mixing incompatible latents.
+# - If you enable mask-weighted loss during training, you must set
+#   `mask_directory` here AND regenerate caches so `mask_weights` are present.
+# =============================================================================
+
+[general]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+image_directory = "/path/to/images"
+cache_directory = "/path/to/cache/zimage_latents_1024"
+# Optional (only needed if you train with `use_mask_loss=true`):
+# mask_directory = "/path/to/masks"
+resolution = [1024, 1024]
+num_repeats = 1
+
