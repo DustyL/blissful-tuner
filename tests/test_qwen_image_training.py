@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
+from musubi_tuner.hv_train_network import NetworkTrainer
+from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
 
 
@@ -163,6 +165,85 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         self.assertEqual(target.shape, (bsz, num_images - 1, channels, height, width))
         # img_shapes: remaining targets (2) + control (1) == 3 entries
         self.assertEqual(len(model.last_kwargs["img_shapes"][0]), 3)
+
+
+class TestTimestepSigmaConsistency(unittest.TestCase):
+    """Tests for the _map_continuous_t_to_sigma_and_timesteps hook."""
+
+    def test_qwen_timestep_sigma_consistency(self):
+        """Verify sigma used for mixing equals timesteps/1000 (used for embedding)."""
+        trainer = QwenImageNetworkTrainer()
+        t = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+        timesteps = t * 1000.0
+        sigma, adjusted_timesteps = trainer._map_continuous_t_to_sigma_and_timesteps(t, timesteps)
+
+        sigma_embed = adjusted_timesteps / 1000.0
+        torch.testing.assert_close(sigma, sigma_embed)
+
+        # Verify range [0.001, 1.0]
+        self.assertGreaterEqual(sigma.min().item(), 0.001 - 1e-7)
+        self.assertLessEqual(sigma.max().item(), 1.0 + 1e-7)
+
+    def test_qwen_timestep_range_boundaries(self):
+        """Verify exact boundary values: t=0 → sigma=0.001, t=1 → sigma=1.0."""
+        trainer = QwenImageNetworkTrainer()
+        t = torch.tensor([0.0, 1.0])
+        timesteps = t * 1000.0
+        sigma, adjusted_timesteps = trainer._map_continuous_t_to_sigma_and_timesteps(t, timesteps)
+
+        self.assertAlmostEqual(sigma[0].item(), 0.001, places=6)
+        self.assertAlmostEqual(sigma[1].item(), 1.0, places=6)
+        self.assertAlmostEqual(adjusted_timesteps[0].item(), 1.0, places=4)
+        self.assertAlmostEqual(adjusted_timesteps[1].item(), 1000.0, places=4)
+
+    def test_base_trainer_preserves_legacy_plus_one(self):
+        """Base NetworkTrainer still adds +1 to timesteps (legacy behavior)."""
+        trainer = NetworkTrainer()
+        t = torch.tensor([0.5])
+        timesteps = t * 1000.0  # 500.0
+        sigma, adjusted_timesteps = trainer._map_continuous_t_to_sigma_and_timesteps(t, timesteps)
+
+        self.assertEqual(sigma.item(), 0.5)  # unchanged
+        self.assertEqual(adjusted_timesteps.item(), 501.0)  # +1
+
+    def test_qwen_get_noisy_model_input_uses_mapped_sigma(self):
+        """Integration: noisy_model_input from the real method uses the mapped sigma.
+
+        Uses latents=0 and noise=1 so noisy = (1-sigma)*0 + sigma*1 = sigma,
+        making the mixing sigma directly readable from the output tensor.
+        """
+        trainer = QwenImageNetworkTrainer()
+        noise_scheduler = FlowMatchDiscreteScheduler(shift=1.0, reverse=True, solver="euler")
+
+        # 4D image latents (not 5D video)
+        latents = torch.zeros(1, 16, 8, 8)
+        noise = torch.ones(1, 16, 8, 8)
+
+        args = SimpleNamespace(
+            timestep_sampling="uniform",
+            discrete_flow_shift=1.0,
+            sigmoid_scale=1.0,
+            logit_mean=0.0,
+            logit_std=1.0,
+            mode_scale=1.0,
+            min_timestep=None,
+            max_timestep=None,
+            preserve_distribution_shape=False,
+        )
+        # Pass org_timesteps=[0.5] to force t=0.5
+        noisy_model_input, returned_timesteps = trainer.get_noisy_model_input_and_timesteps(
+            args, noise, latents, timesteps=[0.5], noise_scheduler=noise_scheduler, device=torch.device("cpu"), dtype=torch.float32
+        )
+
+        # With latents=0 and noise=1: noisy[i] == sigma at every element
+        actual_sigma_mix = noisy_model_input[0, 0, 0, 0].item()
+        actual_sigma_embed = returned_timesteps[0].item() / 1000.0
+
+        # They must match
+        self.assertAlmostEqual(actual_sigma_mix, actual_sigma_embed, places=5)
+        # And both should be in [0.001, 1.0]
+        self.assertGreaterEqual(actual_sigma_mix, 0.001 - 1e-7)
+        self.assertLessEqual(actual_sigma_mix, 1.0 + 1e-7)
 
 
 if __name__ == "__main__":
