@@ -924,6 +924,27 @@ class NetworkTrainer:
         a, b = self.timestep_range_pool.pop()
         return random.uniform(a, b)
 
+    def _map_continuous_t_to_sigma_and_timesteps(self, t, timesteps):
+        """Map continuous t ∈ [0,1] and raw timesteps to (sigma, timesteps).
+
+        Called after ``timesteps = t * 1000.0``. The ``timesteps`` argument is
+        this raw pre-offset value; overrides may ignore it and rebuild timesteps
+        from sigma (as the Qwen Image override does).
+
+        Returns (sigma, timesteps) where:
+          - sigma: used for noise mixing via ``noisy = (1-sigma)*latents + sigma*noise``.
+            Must be broadcast-compatible with latents and in a valid range for the
+            architecture (typically [0, 1]).
+          - timesteps: the authoritative value used for model timestep embedding,
+            loss weighting lookups, and scheduler operations downstream.
+
+        Default: legacy +1 offset. sigma = t (unchanged), timesteps += 1.
+        Override in architecture-specific subclasses to align sigma_mix with
+        sigma_embed when the model normalizes timesteps (e.g., timesteps/1000).
+        """
+        timesteps = timesteps + 1
+        return t, timesteps
+
     def get_noisy_model_input_and_timesteps(
         self,
         args: argparse.Namespace,
@@ -1121,10 +1142,9 @@ class NetworkTrainer:
                     t = torch.stack(available_t, dim=0)  # [batch_size, ]
 
             timesteps = t * 1000.0
-            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
-            noisy_model_input = (1 - t) * latents + t * noise
-
-            timesteps += 1  # 1 to 1000
+            sigma, timesteps = self._map_continuous_t_to_sigma_and_timesteps(t, timesteps)
+            sigma = sigma.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else sigma.view(-1, 1, 1, 1)
+            noisy_model_input = (1 - sigma) * latents + sigma * noise
         else:
             # Sample a random timestep for each image
             # for weighting schemes where we sample timesteps non-uniformly
