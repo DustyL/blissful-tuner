@@ -30,6 +30,13 @@ from blissful_tuner.blissful_logger import BlissfulLogger
 logger = BlissfulLogger(__name__, "green")
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round value up to nearest multiple. Returns value unchanged if multiple <= 0."""
+    if multiple <= 0 or value % multiple == 0:
+        return value
+    return value + (multiple - value % multiple)
+
+
 class QwenImageNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -544,12 +551,21 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         txt_seq_lens = [x.shape[0] for x in vl_embed]
 
         max_len = max(txt_seq_lens)
+        # Pad to multiple for torch.compile graph stability
+        pad_multiple = (
+            args.pad_text_seq_len_multiple
+            if getattr(args, "pad_text_seq_len_multiple", None) is not None
+            else (16 if getattr(args, "compile", False) else 0)
+        )
+        padded_max_len = _round_up_to_multiple(max_len, pad_multiple)
+        did_pad_tail = padded_max_len > max_len
+        max_len = padded_max_len
         vl_embed = [torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in vl_embed]
         vl_embed = torch.stack(vl_embed, dim=0)  # B, L, D
 
-        # if not split_attn, we need to make attention mask
-        if not args.split_attn and bsize > 1:
-            vl_mask = torch.zeros(bsize, max_len, dtype=torch.bool, device=vl_embed[0].device)
+        # if not split_attn, we need to make attention mask when sequences differ or padding added
+        if not args.split_attn and (bsize > 1 or did_pad_tail):
+            vl_mask = torch.zeros(bsize, max_len, dtype=torch.bool, device=vl_embed.device)
             for i, x in enumerate(txt_seq_lens):
                 vl_mask[i, :x] = True
         else:
@@ -646,6 +662,12 @@ def qwen_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--remove_first_image_from_target",
         action="store_true",
         help="Remove the first image from the target images for layered model. / レイヤードモデルでターゲット画像から最初の画像を削除する。",
+    )
+    parser.add_argument(
+        "--pad_text_seq_len_multiple",
+        type=int,
+        default=None,
+        help="Pad text sequence length to this multiple (default: 16 when --compile is enabled; 0 to disable even when compiled)",
     )
     qwen_image_utils.add_model_version_args(parser)
     return parser
