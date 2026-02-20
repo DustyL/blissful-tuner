@@ -111,6 +111,7 @@ def main():
         encode_and_save_batch(text_embedder, batch, device)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
+        args,
         args.num_workers,
         args.skip_existing,
         args.batch_size,

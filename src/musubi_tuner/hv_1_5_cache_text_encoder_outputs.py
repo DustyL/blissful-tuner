@@ -122,6 +122,7 @@ def main():
         encode_and_save_batch(tokenizer_vlm, text_encoder_vlm, tokenizer_byt5, text_encoder_byt5, batch, device, accelerator)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
+        args,
         args.num_workers,
         args.skip_existing,
         args.batch_size,
