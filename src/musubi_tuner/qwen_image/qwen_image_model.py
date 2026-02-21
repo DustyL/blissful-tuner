@@ -1344,7 +1344,13 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        # RoPE must cover the full (possibly padded) text sequence length so that
+        # frequencies match the actual encoder_hidden_states tensor dimension.
+        # The original txt_seq_lens (real lengths) are preserved for varlen attention masking.
+        txt_rope_lens = (
+            [encoder_hidden_states.shape[1]] * encoder_hidden_states.shape[0] if txt_seq_lens is not None else txt_seq_lens
+        )
+        image_rotary_emb = self.pos_embed(img_shapes, txt_rope_lens, device=hidden_states.device)
 
         # block expects tensor instead of list
         txt_seq_lens = torch.tensor(txt_seq_lens, device=hidden_states.device) if txt_seq_lens is not None else None
