@@ -5,12 +5,68 @@ import logging
 from typing import Any, Literal
 
 import torch
+import torch.nn.functional as F
 
 
 MaskLossLayout = Literal["video", "layered"]
 
 # Module-level logger for validation warnings
 _logger = logging.getLogger(__name__)
+
+
+def _compute_default_gaussian_sigma(kernel_size: int) -> float:
+    """Compute the default Gaussian sigma used by torchvision's gaussian_blur when sigma is omitted.
+
+    Matches:
+      sigma = 0.3 * ((kernel_size - 1) * 0.5 - 1) + 0.8
+    """
+    radius = (kernel_size - 1) * 0.5
+    return 0.3 * (radius - 1.0) + 0.8
+
+
+def _gaussian_blur_compact_mask(mask: torch.Tensor, *, kernel_size: int) -> torch.Tensor:
+    """Gaussian-blur a compact mask in-place over spatial dims only.
+
+    Expects a compact 5D mask with channel dim == 1:
+      - video:   (B, 1, F, H, W)
+      - layered: (B, L, 1, H, W)
+
+    Returns a tensor with the same shape and dtype as the input.
+    """
+    if kernel_size <= 1:
+        return mask
+    if kernel_size < 0:
+        raise ValueError("--mask_blur_kernel_size must be >= 0")
+    if kernel_size % 2 == 0:
+        raise ValueError("--mask_blur_kernel_size must be odd (or 0 to disable)")
+    if mask.ndim != 5:
+        raise ValueError(f"Expected compact mask to be 5D, got {mask.ndim}D: {tuple(mask.shape)}")
+    if mask.shape[-2] <= 0 or mask.shape[-1] <= 0:
+        raise ValueError(f"Invalid mask spatial size: H={mask.shape[-2]} W={mask.shape[-1]}")
+
+    pad = kernel_size // 2
+    device = mask.device
+    dtype = mask.dtype
+
+    # Flatten all leading dimensions into batch. Channel dim is always 1, so this works
+    # for both (B,1,F,H,W) and (B,L,1,H,W) without permuting.
+    h, w = mask.shape[-2], mask.shape[-1]
+    mask_flat = mask.reshape(-1, 1, h, w)
+
+    # Compute Gaussian kernel in float32 for stability / CPU support.
+    sigma = _compute_default_gaussian_sigma(kernel_size)
+    coords = torch.arange(kernel_size, device=device, dtype=torch.float32) - (kernel_size - 1) / 2.0
+    kernel_1d = torch.exp(-(coords**2) / (2.0 * (sigma**2)))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = (kernel_1d[:, None] * kernel_1d[None, :]).to(device=device, dtype=torch.float32)
+    weight = kernel_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, k, k)
+
+    mask_float = mask_flat.to(dtype=torch.float32)
+    mask_padded = F.pad(mask_float, (pad, pad, pad, pad), mode="replicate")
+    blurred = F.conv2d(mask_padded, weight, bias=None, stride=1, padding=0)
+    blurred = blurred.clamp(0.0, 1.0).to(dtype=dtype)
+
+    return blurred.reshape(mask.shape)
 
 
 def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
@@ -38,6 +94,17 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "Values > 1.0 sharpen the mask (more binary, stronger face focus). Try 0.5-0.7 for softer or 1.5-2.0 for sharper. "
         "/ マスク重みのガンマ補正（デフォルト：1.0）。1.0未満はマスクを柔らかくし、1.0超はマスクを鋭くして顔への集中を強める。",
     )
+    parser.add_argument(
+        "--mask_blur_kernel_size",
+        "--mask_blur_radius",
+        dest="mask_blur_kernel_size",
+        type=int,
+        default=0,
+        help="Optional: Apply a Gaussian blur to mask weights before gamma/min_weight (default: 0 = disabled). "
+        "This feathers mask boundaries and can reduce halo/edge artifacts. Value is kernel size in latent-space pixels "
+        "(must be odd if > 0). Recommended: 3 or 5. "
+        "Note: --mask_blur_radius is an alias for this option.",
+    )
 
     # Prior preservation arguments
     parser.add_argument(
@@ -58,6 +125,15 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "Default: None (continuous mode - prior preservation scales with inverse mask). "
         "Set to 0.05-0.1 to preserve only true background while body/hair still train to target. "
         "/ 事前保存を適用するマスクしきい値（オプション）。",
+    )
+    parser.add_argument(
+        "--prior_preservation_timestep_threshold",
+        type=float,
+        default=None,
+        help="Optional: Skip the teacher forward pass unless diffusion timesteps are above this value (0-1000). "
+        "This can significantly reduce compute/VRAM overhead by running prior preservation only at high-noise "
+        "structural timesteps (when hallucinations tend to lock in). Example: --prior_preservation_timestep_threshold 300. "
+        "Default: None (always compute teacher when prior preservation is enabled).",
     )
     parser.add_argument(
         "--normalize_per_sample",
@@ -103,6 +179,39 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
         if prior_preservation_weight <= 0:
             _logger.warning(f"--prior_mask_threshold={prior_mask_threshold} has no effect without --prior_preservation_weight > 0")
 
+    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+    if prior_timestep_threshold is not None:
+        try:
+            prior_timestep_threshold = float(prior_timestep_threshold)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError("--prior_preservation_timestep_threshold must be a number") from e
+
+        if prior_timestep_threshold < 0 or prior_timestep_threshold > 1000:
+            raise ValueError("--prior_preservation_timestep_threshold must be in range [0, 1000]")
+
+        if prior_preservation_weight <= 0:
+            _logger.warning(
+                f"--prior_preservation_timestep_threshold={prior_timestep_threshold} has no effect without --prior_preservation_weight > 0"
+            )
+        else:
+            # Optional guidance: large flow shifts can heavily concentrate the timestep distribution at high noise,
+            # which makes low gating thresholds (e.g. 300) skip very few teacher passes.
+            timestep_sampling = getattr(args, "timestep_sampling", None)
+            discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
+            if isinstance(timestep_sampling, str) and timestep_sampling.endswith("shift") and discrete_flow_shift is not None:
+                try:
+                    discrete_flow_shift = float(discrete_flow_shift)
+                except Exception:  # noqa: BLE001
+                    discrete_flow_shift = None
+
+                if discrete_flow_shift is not None and discrete_flow_shift > 5.0:
+                    _logger.warning(
+                        f"--prior_preservation_timestep_threshold={prior_timestep_threshold} with "
+                        f"--timestep_sampling={timestep_sampling} and --discrete_flow_shift={discrete_flow_shift}: "
+                        "High shift values can concentrate most sampled timesteps at high noise, so gating may skip "
+                        "very few teacher passes. Use --show_timesteps console to calibrate a threshold."
+                    )
+
     if not use_mask_loss:
         return
 
@@ -113,6 +222,12 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     mask_min_weight = float(getattr(args, "mask_min_weight", 0.0))
     if mask_min_weight < 0 or mask_min_weight >= 1.0:
         raise ValueError("--mask_min_weight must be in range [0, 1)")
+
+    mask_blur_kernel_size = int(getattr(args, "mask_blur_kernel_size", 0) or 0)
+    if mask_blur_kernel_size < 0:
+        raise ValueError("--mask_blur_kernel_size must be >= 0")
+    if mask_blur_kernel_size > 0 and mask_blur_kernel_size % 2 == 0:
+        raise ValueError("--mask_blur_kernel_size must be odd (or 0 to disable)")
 
     if prior_preservation_weight > 0 and mask_min_weight > 0:
         _logger.warning(
@@ -136,7 +251,9 @@ def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str 
 
     prior_weight = float(getattr(args, "prior_preservation_weight", 0.0))
     prior_threshold = getattr(args, "prior_mask_threshold", None)
+    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
     mask_min_weight = float(getattr(args, "mask_min_weight", 0.0))
+    mask_blur_kernel_size = int(getattr(args, "mask_blur_kernel_size", 0) or 0)
     normalize_per_sample = getattr(args, "normalize_per_sample", False)
 
     logger.info("=" * 60)
@@ -146,6 +263,7 @@ def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str 
         logger.info("MASK-WEIGHTED LOSS TRAINING ENABLED")
     logger.info("=" * 60)
     logger.info(f"  mask_min_weight: {mask_min_weight}")
+    logger.info(f"  mask_blur_kernel_size: {mask_blur_kernel_size}")
     logger.info(f"  mask_gamma: {getattr(args, 'mask_gamma', 1.0)}")
     if prior_weight > 0:
         logger.info(f"  prior_preservation_weight: {prior_weight}")
@@ -153,10 +271,16 @@ def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str 
             logger.info(f"  prior_mask_threshold: {prior_threshold} (threshold mode)")
         else:
             logger.info("  prior_mask_threshold: None (continuous mode)")
+        if prior_timestep_threshold is not None:
+            logger.info(f"  prior_preservation_timestep_threshold: {prior_timestep_threshold} (teacher gated)")
         logger.info(f"  normalize_per_sample: {normalize_per_sample}")
         logger.info("-" * 60)
         logger.info("PRIOR PRESERVATION: Unmasked regions will match base model.")
-        logger.info("                    Expect ~1.3-1.7x training time.")
+        if prior_timestep_threshold is not None:
+            logger.info("                    Teacher pass is gated by timestep threshold (reduced overhead).")
+        else:
+            logger.info("                    Expect ~1.3-1.7x training time.")
+            logger.info("                    Tip: try --prior_preservation_timestep_threshold 300 for a speed/quality tradeoff.")
         if mask_min_weight > 0:
             logger.warning(f"  NOTE: mask_min_weight={mask_min_weight} reduces prior effect.")
             logger.warning("        Recommend --mask_min_weight 0.0 with prior preservation.")
@@ -329,7 +453,20 @@ def apply_masked_loss_with_prior(
 
     # Keep raw mask for thresholding (before gamma/min_weight).
     # All mask processing stays on compact tensor to save VRAM.
-    mask_raw = mask_weights.clamp(0.0, 1.0)
+    mask_raw_unblurred = mask_weights.clamp(0.0, 1.0)
+
+    # Optional: blur mask boundaries before gamma/min_weight to reduce halo artifacts.
+    # This is intentionally applied to the compact mask tensor to keep VRAM minimal.
+    mask_blur_kernel_size = int(getattr(args, "mask_blur_kernel_size", 0) or 0)
+    if mask_blur_kernel_size < 0:
+        raise ValueError("--mask_blur_kernel_size must be >= 0")
+    if mask_blur_kernel_size > 0 and mask_blur_kernel_size % 2 == 0:
+        raise ValueError("--mask_blur_kernel_size must be odd (or 0 to disable)")
+    mask_raw_for_processing = (
+        _gaussian_blur_compact_mask(mask_raw_unblurred, kernel_size=mask_blur_kernel_size)
+        if mask_blur_kernel_size > 1
+        else mask_raw_unblurred
+    )
 
     # Apply gamma and min_weight to get processed mask for target loss
     mask_gamma = float(getattr(args, "mask_gamma", 1.0))
@@ -340,7 +477,7 @@ def apply_masked_loss_with_prior(
     if mask_min_weight < 0 or mask_min_weight >= 1.0:
         raise ValueError("--mask_min_weight must be in range [0, 1)")
 
-    mask_processed = mask_raw
+    mask_processed = mask_raw_for_processing
     if mask_gamma != 1.0:
         mask_processed = mask_processed**mask_gamma
     if mask_min_weight > 0:
@@ -353,7 +490,7 @@ def apply_masked_loss_with_prior(
     prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
     if prior_mask_threshold is not None:
         # Binarize: full prior preservation where raw mask < threshold
-        prior_mask = (mask_raw < prior_mask_threshold).float()
+        prior_mask = (mask_raw_unblurred < prior_mask_threshold).float()
         # Prevent target/prior overlap: zero out target where prior applies
         mask_processed = mask_processed * (1 - prior_mask)
 

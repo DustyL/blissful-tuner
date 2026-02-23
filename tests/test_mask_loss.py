@@ -64,6 +64,53 @@ class TestMaskedLossWithPrior(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, rtol=0, atol=1e-5))
 
+    def test_mask_blur_kernel_size_changes_weighted_mean(self) -> None:
+        # Hard mask boundary: without blur, only last 3 pixels contribute.
+        # With blur, boundary pixels get fractional weights.
+        loss = torch.tensor([[[[[1.0, 2.0, 3.0, 4.0, 5.0]]]]])  # (B=1,C=1,F=1,H=1,W=5)
+        mask_weights = torch.tensor([[[[0.0, 0.0, 1.0, 1.0, 1.0]]]])  # (B=1,F=1,H=1,W=5)
+
+        args_no_blur = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+            mask_blur_kernel_size=0,
+        )
+        args_blur = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+            mask_blur_kernel_size=3,
+        )
+
+        out_no_blur = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args_no_blur, layout="video")
+        out_blur = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args_blur, layout="video")
+
+        # Without blur: mean([3,4,5]) = 4.0
+        self.assertTrue(torch.allclose(out_no_blur, torch.tensor(4.0), rtol=0, atol=1e-6))
+
+        # With blur (k=3): matches the Gaussian kernel that torchvision would use by default.
+        # For kernel_size=3, sigma = 0.3*((1)-1)+0.8 = 0.8, kernel = exp(-x^2/(2*sigma^2)) normalized.
+        kernel_size = 3
+        sigma = 0.3 * (((kernel_size - 1) * 0.5) - 1.0) + 0.8
+        coords = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        kernel_1d = torch.exp(-(coords**2) / (2.0 * (sigma**2)))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+
+        a = kernel_1d[0]
+        b = kernel_1d[1]
+        # Because H=1 and padding is replicate, 2D blur reduces to 1D along W.
+        blurred_mask = torch.tensor([0.0, a, a + b, 1.0, 1.0], dtype=torch.float32)
+        expected = (loss.flatten() * blurred_mask).sum() / blurred_mask.sum()
+
+        self.assertTrue(torch.allclose(out_blur, expected, rtol=0, atol=1e-5))
+
     def test_threshold_mode_prevents_target_prior_overlap(self) -> None:
         # Background would normally get mask_min_weight, but threshold-mode should zero it for target loss.
         loss = torch.tensor([[[[[1.0, 1.0, 1.0, 1.0]]]]])  # (B=1,C=1,F=1,H=1,W=4)
@@ -91,6 +138,27 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(actual, expected, rtol=0, atol=1e-5))
+
+    def test_prior_mask_threshold_uses_unblurred_mask_when_blur_enabled(self) -> None:
+        # If prior_mask_threshold were applied to the blurred mask, the first pixel would no longer be < threshold
+        # (replicate padding + Gaussian blur will make it > 0.1). We intentionally threshold on the raw/unblurred mask.
+        loss = torch.ones(1, 1, 1, 1, 3, dtype=torch.float32)
+        prior_loss = torch.ones_like(loss) * 10.0
+        mask_weights = torch.tensor([[[[0.0, 1.0, 1.0]]]], dtype=torch.float32)  # (B=1,F=1,H=1,W=3)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=3,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=0.1,
+            normalize_per_sample=False,
+        )
+
+        out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=prior_loss, args=args, layout="video")
+        # L_target = 1, L_prior = 10 * 1.0
+        self.assertTrue(torch.allclose(out, torch.tensor(11.0), rtol=0, atol=1e-5))
 
     def test_continuous_mode_matches_manual_weighted_means(self) -> None:
         # Continuous mode uses complementary masks:
@@ -404,6 +472,19 @@ class TestValidateMaskLossArgs(unittest.TestCase):
 
         # Should not raise
         validate_mask_loss_args(args)
+
+    def test_raises_error_for_even_mask_blur_kernel_size(self) -> None:
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=4,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+        )
+
+        with self.assertRaises(ValueError, msg="odd (or 0 to disable)"):
+            validate_mask_loss_args(args)
 
 
 if __name__ == "__main__":

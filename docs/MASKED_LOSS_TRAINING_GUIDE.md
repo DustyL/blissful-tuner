@@ -247,7 +247,7 @@ When you run the cache latents script, masks are:
 3. **Downsampled** to latent space dimensions (8x smaller)
 4. **Saved** alongside latents in the cache file as **raw [0.0, 1.0] values**
 
-> **Important**: Masks are stored in their raw form — `--mask_gamma` and `--mask_min_weight` are **not** applied during caching. These transformations are applied at training time by the mask loss module. This is intentional: it allows you to experiment with different gamma/min-weight values without recaching latents. You only need to recache when the mask images themselves change or when switching between `alpha_mask` / `mask_directory` sources.
+> **Important**: Masks are stored in their raw form — `--mask_blur_kernel_size` (`--mask_blur_radius`), `--mask_gamma`, and `--mask_min_weight` are **not** applied during caching. These transformations are applied at training time by the mask loss module. This is intentional: it allows you to experiment with different blur/gamma/min-weight values without recaching latents. You only need to recache when the mask images themselves change or when switching between `alpha_mask` / `mask_directory` sources.
 
 ```bash
 # For WAN 2.2
@@ -346,6 +346,29 @@ mask_weight = mask_weight * (1.0 - mask_min_weight) + mask_min_weight
 - Hair: 0.31 → 0.28 + 0.1 = 0.38
 - Background: 0.0 → 0.0 + 0.1 = 0.1
 
+### `--mask_blur_kernel_size` / `--mask_blur_radius` (Boundary Feathering)
+
+**Type:** Int (optional)  
+**Default:** 0 (disabled)  
+**Valid values:** 0 (disabled) or odd integer (3, 5, 7, ...)
+
+Applies a **Gaussian blur** to the mask weights *before* `--mask_gamma` and `--mask_min_weight`.
+
+This feathers hard 0→1 transitions at mask boundaries, which can reduce “halo” / seam artifacts around the subject.
+
+```bash
+# Subtle feathering (recommended starting point)
+--mask_blur_kernel_size 3
+
+# Equivalent (alias)
+--mask_blur_radius 3
+```
+
+**When this helps most:**
+- Binary masks (SAM/YOLO) with hard edges
+- `--mask_min_weight 0.0` (very sharp subject→background transition)
+- Small subject masks / fine detail masks where boundary artifacts are noticeable
+
 ---
 
 ## Masked Prior Preservation (Optional)
@@ -412,6 +435,30 @@ This is recommended when using prior preservation so `--prior_preservation_weigh
 --normalize_per_sample
 ```
 
+### `--prior_preservation_timestep_threshold` (Speed / Compute Optimization)
+
+**Type:** Float (optional)  
+**Default:** None (disabled)
+
+By default, Masked Prior Preservation runs a **teacher** forward pass on every step, which can be ~1.3–1.7× slower.
+
+This option gates the teacher pass to run **only** when the sampled diffusion timesteps are above a threshold (high-noise structural steps),
+which is often where out-of-mask hallucinations like “phantom limbs” get locked in.
+
+```bash
+# Recommended starting point (tune per model / schedule):
+--prior_preservation_timestep_threshold 300
+```
+
+> **Note:** The gating check is `all(timesteps > threshold)` within a batch.  
+> This is ideal for `batch_size=1` (common in video training). For larger batches, the teacher pass may trigger less often.
+
+> **Important:** The threshold is compared against the **raw scheduler timesteps** (roughly `0–1000`), after each architecture’s internal mapping.  
+> The effective skip rate depends on your timestep sampling distribution (`--timestep_sampling`, `--weighting_scheme`, and any shift parameters).
+
+> **WAN 2.2 note:** For `--timestep_sampling shift --discrete_flow_shift 12.0` (WAN 2.2 T2V default), timesteps are heavily concentrated in the high-noise region.  
+> A low threshold like `300` may skip very few teacher passes (minimal speedup). Use `--show_timesteps console` to inspect your actual sampled distribution and choose a threshold that matches your speed/quality trade-off.
+
 ### Argument Validation
 
 All mask-related arguments are validated early in training. Invalid values will raise clear errors (some settings may also emit warnings):
@@ -420,8 +467,10 @@ All mask-related arguments are validated early in training. Invalid values will 
 |----------|-------------|------------------|
 | `--mask_gamma` | > 0 | `--mask_gamma must be > 0` |
 | `--mask_min_weight` | [0, 1) | `--mask_min_weight must be in range [0, 1)` |
+| `--mask_blur_kernel_size` | odd or 0 | `--mask_blur_kernel_size must be odd (or 0 to disable)` |
 | `--prior_preservation_weight` | >= 0 | `--prior_preservation_weight must be >= 0` |
 | `--prior_mask_threshold` | (0, 1) | `--prior_mask_threshold must be in range (0, 1)` |
+| `--prior_preservation_timestep_threshold` | [0, 1000] | `--prior_preservation_timestep_threshold must be in range [0, 1000]` |
 
 ---
 
@@ -823,8 +872,10 @@ python wan_train_network.py --dataset_config config.toml --use_mask_loss
 | `--use_mask_loss` | flag | disabled | Enable mask-weighted loss |
 | `--mask_gamma` | float | 1.0 | Gamma correction (< 1 softer, > 1 sharper) |
 | `--mask_min_weight` | float | 0.0 | Minimum weight for all regions |
+| `--mask_blur_kernel_size` | int | 0 | Optional Gaussian blur kernel size for mask feathering (odd; alias: `--mask_blur_radius`) |
 | `--prior_preservation_weight` | float | 0.0 | Prior preservation weight (0.0 disables) |
 | `--prior_mask_threshold` | float | none | Optional threshold mode for prior mask (e.g. 0.05–0.15) |
+| `--prior_preservation_timestep_threshold` | float | none | Optional teacher-pass gating by timestep (e.g. 300) |
 | `--normalize_per_sample` | flag | disabled | Normalize masked loss per-sample (recommended with prior) |
 
 ### Our Weighted Mask Values
@@ -839,6 +890,12 @@ python wan_train_network.py --dataset_config config.toml --use_mask_loss
 ---
 
 ## Changelog
+
+### 2026-02-23
+- **NEW:** Mask boundary feathering via Gaussian blur (`--mask_blur_kernel_size` / `--mask_blur_radius`) to reduce halo artifacts
+
+### 2026-02-22
+- **NEW:** Prior preservation timestep gating (`--prior_preservation_timestep_threshold`) to reduce teacher-pass overhead
 
 ### 2026-01-29
 - **NEW:** Masked Prior Preservation (`--prior_preservation_weight`, `--prior_mask_threshold`, `--normalize_per_sample`)

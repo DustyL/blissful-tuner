@@ -2470,6 +2470,14 @@ class NetworkTrainer:
                         prior_preservation_weight > 0 and getattr(args, "use_mask_loss", False) and mask_weights is not None
                     )
 
+                    # Optional speed optimization: only run the teacher forward pass at high-noise (structural) timesteps.
+                    # This is most effective when batch_size=1 (common for video); for larger batches, this requires *all*
+                    # samples in the batch to be above the threshold to avoid mixing teacher/no-teacher within a step.
+                    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+                    if need_prior and prior_timestep_threshold is not None:
+                        is_structural_timestep = bool((timesteps > float(prior_timestep_threshold)).all().item())
+                        need_prior = need_prior and is_structural_timestep
+
                     if need_prior:
                         # Optimization: skip teacher forward if mask is all ones (prior_mask will be all zeros)
                         mask_min = float(mask_weights.min())
