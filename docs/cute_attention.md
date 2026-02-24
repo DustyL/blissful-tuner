@@ -7,13 +7,27 @@ CuTE (“CUDA Templates”) is an attention backend exposed via `flash_attn.cute
 In blissful-tuner, CuTE is enabled with `--cute` (or `cute = true` in a TOML config), and is supported in:
 - WAN 2.1/2.2 (`src/musubi_tuner/wan/modules/attention.py`)
 - HunyuanVideo + Qwen-Image (`src/musubi_tuner/hunyuan_model/attention.py`)
+- HunyuanVideo 1.5 + Z-Image (`src/musubi_tuner/modules/attention.py`)
 
 ## Requirements
 
 - GPU: Hopper (SM 9.0+) or Blackwell (SM 10.0+). B300 = SM 10.3.
 - `flash-attention` with CuTE enabled (example in this repo: `2.8.3+varlen.sm103`)
 - CuTE runtime deps:
-  - `quack-kernels==0.2.4` (includes CUTLASS DSL runtime)
+  - `quack-kernels>=0.2.10`
+  - `nvidia-cutlass-dsl>=4.4.0`
+  - `apache-tvm-ffi>=0.1.5,<0.2`
+  - `torch-c-dlpack-ext`
+
+### Important Limitation (Hopper / SM90)
+
+Upstream CuTE currently does **not** support **variable-length (varlen) backward** on Hopper (SM90). In practice:
+- Inference: varlen CuTE is fine (`torch.no_grad()` / no backward).
+- Training: if your model uses CuTE varlen (e.g. to handle padded sequences), it will fail on SM90 during backward.
+
+Workarounds:
+- Use `--split_attn` (forces per-sample fixed-length attention).
+- Or switch to `--flash-attn` / `--sage-attn` for varlen training on SM90.
 
 Quick checks:
 ```bash
@@ -81,11 +95,10 @@ See: `docs/MASKED_LOSS_TRAINING_GUIDE.md`
 ## Troubleshooting
 
 - `ImportError: CuTE not available`:
-  - Install CuTE deps: `pip install 'quack-kernels==0.2.4'`
+  - Install CuTE deps: `pip install 'quack-kernels>=0.2.10' 'nvidia-cutlass-dsl>=4.4.0' 'apache-tvm-ffi>=0.1.5,<0.2' torch-c-dlpack-ext`
   - Confirm `from flash_attn.cute import flash_attn_func` works
 - Performance worse than FA2:
   - CuTE tends to win at longer sequence lengths (often >= 1024)
   - Ensure dtype is bf16/fp16 and head_dim is supported (commonly 128 in these models)
 - Want to rollback:
   - Switch to `--flash-attn` (FA2) or `--sdpa` (PyTorch)
-

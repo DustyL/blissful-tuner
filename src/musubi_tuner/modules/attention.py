@@ -26,6 +26,47 @@ try:
 except ImportError:
     xops = None
 
+try:
+    from flash_attn.cute.interface import flash_attn_func as cute_flash_attn_func
+    from flash_attn.cute.interface import flash_attn_varlen_func as cute_flash_attn_varlen_func
+
+    CUTE_AVAILABLE = True
+except ImportError:
+    CUTE_AVAILABLE = False
+    cute_flash_attn_func = None
+    cute_flash_attn_varlen_func = None
+
+
+@torch.compiler.disable
+def _cute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool = False):
+    """CuTE fixed-length attention (graph-break wrapper for torch.compile)."""
+    return cute_flash_attn_func(q, k, v, causal=causal)
+
+
+@torch.compiler.disable
+def _cute_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool = False,
+):
+    """CuTE variable-length attention (graph-break wrapper for torch.compile)."""
+    return cute_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+    )
+
 
 @dataclass
 class AttentionParams:
@@ -85,6 +126,7 @@ def attention(
     v: Optional[torch.Tensor] = None,
     attn_params: Optional[AttentionParams] = None,
     drop_rate: float = 0.0,
+    causal: bool = False,
 ) -> torch.Tensor:
     """
     Compute scaled dot-product attention with variable sequence lengths.
@@ -164,7 +206,7 @@ def attention(
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
+                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate, is_causal=causal)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -173,10 +215,16 @@ def attention(
             q, k, v = None, None, None
 
         else:
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
+            if causal and attn_params.attention_mask is not None:
+                raise ValueError("Causal attention is not supported with an explicit attention_mask in unified attention.")
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate, is_causal=causal
+            )
             q, k, v = None, None, None
 
     elif attn_params.attn_mode == "xformers":
+        if causal:
+            raise ValueError("Causal attention is not currently supported for xformers in unified attention.")
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
@@ -193,6 +241,8 @@ def attention(
             q, k, v = None, None, None
 
     elif attn_params.attn_mode == "sageattn":
+        if causal:
+            raise ValueError("Causal attention is not currently supported for sageattention in unified attention.")
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
@@ -228,7 +278,10 @@ def attention(
             x = []
             for i in range(len(q)):
                 # HND seems to cause an error
-                x_i = flash_attn_func(q[i], k[i], v[i], drop_rate)  # B, L, H, D
+                if causal:
+                    x_i = flash_attn_func(q[i], k[i], v[i], drop_rate, causal=True)  # B, L, H, D
+                else:
+                    x_i = flash_attn_func(q[i], k[i], v[i], drop_rate)  # B, L, H, D
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -236,7 +289,10 @@ def attention(
             x = torch.cat(x, dim=0)
             q, k, v = None, None, None
         elif attn_params.cu_seqlens is None:  # all tokens are valid
-            x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
+            if causal:
+                x = flash_attn_func(q, k, v, drop_rate, causal=True)  # B, L, H, D
+            else:
+                x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
             q, k, v = None, None, None
         else:
             # Reshape to [(bxs), a, d]
@@ -246,13 +302,100 @@ def attention(
             v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv
-            x = flash_attn_varlen_func(
-                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen, drop_rate
-            )
+            if causal:
+                x = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    attn_params.cu_seqlens,
+                    attn_params.cu_seqlens,
+                    attn_params.max_seqlen,
+                    attn_params.max_seqlen,
+                    drop_rate,
+                    causal=True,
+                )
+            else:
+                x = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    attn_params.cu_seqlens,
+                    attn_params.cu_seqlens,
+                    attn_params.max_seqlen,
+                    attn_params.max_seqlen,
+                    drop_rate,
+                )
             q, k, v = None, None, None
 
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
+
+    elif attn_params.attn_mode == "cute":
+        if not CUTE_AVAILABLE:
+            raise ImportError(
+                "CuTE not available. Requires flash-attention built with CuTE support (flash_attn.cute.interface). "
+                "See docs/cute_attention.md for requirements."
+            )
+        if drop_rate != 0.0:
+            raise ValueError("CuTE attention does not support dropout. Set attention dropout to 0.0.")
+
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                out, _ = _cute_attention(q[i], k[i], v[i], causal=causal)  # B=1, L, H, D
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(out, attn_params.max_seqlen))  # B, L, H, D
+            x = torch.cat(x, dim=0)
+            q, k, v = None, None, None
+        elif attn_params.cu_seqlens is None:  # all tokens are valid
+            out, _ = _cute_attention(q, k, v, causal=causal)  # B, L, H, D
+            x = out
+            q, k, v = None, None, None
+        else:
+            # If there is no padding, bypass the varlen path entirely (and avoid SM90 varlen-backward limits).
+            no_padding = (
+                attn_params.seqlens is not None
+                and attn_params.max_seqlen is not None
+                and torch.all(attn_params.seqlens == attn_params.max_seqlen)
+            )
+            if no_padding:
+                out, _ = _cute_attention(q, k, v, causal=causal)  # B, L, H, D
+                x = out
+                q, k, v = None, None, None
+            else:
+                # Hopper (SM90) does not currently support CuTE varlen backward.
+                requires_backward = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
+                if requires_backward and q.is_cuda:
+                    major, _minor = torch.cuda.get_device_capability(q.device)
+                    if major == 9:
+                        raise ValueError(
+                            "CuTE varlen backward is not supported on Hopper (SM90). "
+                            "Use --split_attn (forces fixed-length CuTE per-sample) or switch to --flash_attn/--sage_attn."
+                        )
+
+                # Reshape to [(bxs), a, d]
+                batch_size, seqlen = q.shape[0], q.shape[1]
+                q = q.view(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
+                k = k.view(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
+                v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
+
+                # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv.
+                out, _ = _cute_attention_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=attn_params.cu_seqlens,
+                    cu_seqlens_k=attn_params.cu_seqlens,
+                    max_seqlen_q=attn_params.max_seqlen,
+                    max_seqlen_k=attn_params.max_seqlen,
+                    causal=causal,
+                )
+                q, k, v = None, None, None
+
+                # Reshape out with shape [(bxs), a, d] to [b, s, a, d]
+                x = out.view(batch_size, seqlen, out.shape[-2], out.shape[-1])  # B, L, H, D
 
     else:
         # Currently only PyTorch SDPA and xformers are implemented

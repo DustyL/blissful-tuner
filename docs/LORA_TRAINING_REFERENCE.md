@@ -565,7 +565,13 @@ cute = true
 **Requirements:**
 - NVIDIA Blackwell (SM 10.3) or Hopper (SM 9.0+)
 - flash-attention 2.8.3+ with CuTE support
-- quack-kernels >= 0.2.4
+- quack-kernels >= 0.2.10
+- nvidia-cutlass-dsl >= 4.4.0
+- apache-tvm-ffi >= 0.1.5,<0.2
+- torch-c-dlpack-ext
+
+**Note (Hopper/SM90):** Upstream CuTE currently does not support varlen backward on SM90. If your training path needs varlen,
+use `--split_attn` or switch to `--flash_attn` / `--sage_attn`.
 
 **Environment setup:**
 ```bash

@@ -491,7 +491,11 @@ def parse_args():
         "--device", type=str, default=None, help="device to use for inference. If None, use CUDA if available, otherwise use CPU"
     )
     parser.add_argument(
-        "--attn_mode", type=str, default="torch", choices=["flash", "torch", "sageattn", "xformers", "sdpa"], help="attention mode"
+        "--attn_mode",
+        type=str,
+        default="torch",
+        choices=["flash", "cute", "torch", "sageattn", "xformers", "sdpa"],
+        help="attention mode",
     )
     parser.add_argument(
         "--split_attn", action="store_true", help="use split attention, default is False. if True, --split_uncond becomes True"

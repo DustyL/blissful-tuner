@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "flash2", "flash3", "torch", "sageattn", "xformers", "sdpa"],
+        choices=["flash", "flash2", "flash3", "cute", "torch", "sageattn", "xformers", "sdpa"],
         help="attention mode",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")

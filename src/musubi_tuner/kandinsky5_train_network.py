@@ -542,6 +542,12 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
+        if attn_mode == "cute":
+            raise ValueError(
+                "CuTE attention is not currently supported for Kandinsky 5 in this repo. "
+                "Use --sdpa, --flash_attn, --flash3, --sage_attn, or --xformers instead."
+            )
+
         def _detect_fp8_checkpoint(path: str, disable_numpy_memmap: bool = False) -> bool:
             with MemoryEfficientSafeOpen(path, disable_numpy_memmap=disable_numpy_memmap) as f:
                 for key in f.keys():

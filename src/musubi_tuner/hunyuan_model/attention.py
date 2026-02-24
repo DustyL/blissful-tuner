@@ -293,18 +293,39 @@ def attention(
                 "CuTE not available. Requires flash-attention built with CuTE support "
                 "(flash_attn.cute.interface). See docs/cute_attention.md for requirements."
             )
-        out, _ = _cute_attention_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_kv,
-            causal=causal,
-        )
+        if drop_rate != 0:
+            raise ValueError("CuTE attention does not support dropout. Set drop_rate=0.0.")
+        # If there is no padding, we can bypass the varlen path entirely (and avoid SM90 varlen-backward limits).
+        no_padding = cu_seqlens_q is not None and torch.all(cu_seqlens_q[1::2] == cu_seqlens_q[2::2])
+        if no_padding:
+            q_fix = q.view(batch_size, max_seqlen_q, q.shape[-2], q.shape[-1])
+            k_fix = k.view(batch_size, max_seqlen_kv, k.shape[-2], k.shape[-1])
+            v_fix = v.view(batch_size, max_seqlen_kv, v.shape[-2], v.shape[-1])
+            out, _ = _cute_attention(q_fix, k_fix, v_fix, causal=causal)
+            x = out
+        else:
+            # Hopper (SM90) does not currently support CuTE varlen backward.
+            # Raise early with a clear message instead of failing later inside the CuTE autograd kernel.
+            requires_backward = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
+            if requires_backward and q.is_cuda:
+                major, _minor = torch.cuda.get_device_capability(q.device)
+                if major == 9:
+                    raise ValueError(
+                        "CuTE varlen backward is not supported on Hopper (SM90). "
+                        "Use --split_attn (forces fixed-length CuTE per-sample) or switch to --flash-attn/--sage-attn."
+                    )
+            out, _ = _cute_attention_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_kv,
+                causal=causal,
+            )
+            x = out.view(batch_size, max_seqlen_q, out.shape[-2], out.shape[-1])
         del q, k, v
-        x = out.view(batch_size, max_seqlen_q, out.shape[-2], out.shape[-1])
 
     elif mode == "cute_fixlen":
         # CuTE fixed-length attention (no cu_seqlens)
@@ -313,6 +334,8 @@ def attention(
                 "CuTE not available. Requires flash-attention built with CuTE support "
                 "(flash_attn.cute.interface). See docs/cute_attention.md for requirements."
             )
+        if drop_rate != 0:
+            raise ValueError("CuTE attention does not support dropout. Set drop_rate=0.0.")
         if split_attn:
             x = []
             for i in range(len(q)):

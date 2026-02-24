@@ -30,6 +30,16 @@ try:
 except ImportError:
     XFORMERS_AVAILABLE = False
 
+try:
+    from flash_attn.cute.interface import flash_attn_func as cute_flash_attn_func
+    from flash_attn.cute.interface import flash_attn_varlen_func as cute_flash_attn_varlen_func
+
+    CUTE_AVAILABLE = True
+except ImportError:
+    CUTE_AVAILABLE = False
+    cute_flash_attn_func = None
+    cute_flash_attn_varlen_func = None
+
 
 import warnings
 
@@ -37,6 +47,51 @@ __all__ = [
     "flash_attention",
     "attention",
 ]
+
+
+@torch.compiler.disable
+def _cute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, softmax_scale, causal, window_size, deterministic):
+    """CuTE fixed-length attention (graph-break wrapper for torch.compile)."""
+    return cute_flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        deterministic=deterministic,
+    )
+
+
+@torch.compiler.disable
+def _cute_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale,
+    causal,
+    window_size,
+    deterministic,
+):
+    """CuTE variable-length attention (graph-break wrapper for torch.compile)."""
+    return cute_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        deterministic=deterministic,
+    )
 
 
 def flash_attention(
@@ -80,9 +135,20 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    def _normalize_cute_window_size(win):
+        # WAN uses (-1, -1) to mean "no local attention"; CuTE uses (None, None).
+        if win is None:
+            return (None, None)
+        left, right = win
+        if left == -1 and right == -1:
+            return (None, None)
+        left = None if left == -1 else int(left)
+        right = None if right == -1 else int(right)
+        return (left, right)
+
     # We cannot test Flash attention 3 in musubi tuner, so keep the original code.
     # Customized code (except for flash attention 3) is not supported q_lens and k_lens.
-    if attn_mode != "flash3" and attn_mode != "sageattn":
+    if attn_mode not in {"flash3", "sageattn", "cute"}:
         assert q_lens is None, "q_lens is not supported except for flash attention 3."
         assert k_lens is None or (
             min(k_lens) == max(k_lens) and k_lens[0] == lk
@@ -140,6 +206,55 @@ def flash_attention(
         del q, k, v
         return x.type(out_dtype)
 
+    # CuTE (CUDA Templates): fixed-length path. Varlen is handled below.
+    if attn_mode == "cute":
+        if not CUTE_AVAILABLE:
+            raise ImportError(
+                "CuTE not available. Requires flash-attention built with CuTE support (flash_attn.cute.interface). "
+                "See docs/cute_attention.md for requirements."
+            )
+        if dropout_p != 0.0:
+            raise ValueError("CuTE attention does not support dropout. Set dropout_p=0.0.")
+
+        # If variable lengths are present, defer to the varlen path below.
+        is_q_varlen = q_lens is not None and not (min(q_lens) == max(q_lens) and q_lens[0] == lq)
+        is_kv_varlen = k_lens is not None and not (min(k_lens) == max(k_lens) and k_lens[0] == lk)
+        if not (is_q_varlen or is_kv_varlen):
+            if q_scale is not None:
+                q = q * q_scale
+            q = half(q)
+            k = half(k)
+            v = half(v)
+
+            cute_window_size = _normalize_cute_window_size(window_size)
+            if not split_attn:
+                out, _ = _cute_attention(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=cute_window_size,
+                    deterministic=deterministic,
+                )
+                x = out
+            else:
+                x = torch.empty_like(q)
+                for i in range(q.size(0)):
+                    out, _ = _cute_attention(
+                        q[i : i + 1],
+                        k[i : i + 1],
+                        v[i : i + 1],
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=cute_window_size,
+                        deterministic=deterministic,
+                    )
+                    x[i : i + 1] = out
+
+            del q, k, v
+            return x.type(out_dtype)
+
     # xformers
     if attn_mode == "xformers":
         assert not deterministic, "deterministic is not supported in xformers."
@@ -175,7 +290,7 @@ def flash_attention(
     #     del q, k, v
     #     return x.type(out_dtype)
 
-    assert not split_attn, "split_attn is not supported in flash attention 3 or sage attention."
+    assert not split_attn, "split_attn is not supported in flash attention 3, sage attention, or CuTE varlen attention."
 
     # preprocess query: in Wan 2.1, q_lens is always None.
     if q_lens is None:
@@ -257,6 +372,40 @@ def flash_attention(
             max_seqlen_k=lk,
             sm_scale=softmax_scale,
         ).unflatten(0, (b, lq))
+    elif attn_mode == "cute":
+        if not CUTE_AVAILABLE:
+            raise ImportError(
+                "CuTE not available. Requires flash-attention built with CuTE support (flash_attn.cute.interface). "
+                "See docs/cute_attention.md for requirements."
+            )
+        if dropout_p != 0.0:
+            raise ValueError("CuTE attention does not support dropout. Set dropout_p=0.0.")
+
+        # Hopper (SM90) does not currently support CuTE varlen backward.
+        requires_backward = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
+        if requires_backward and q.is_cuda:
+            major, _minor = torch.cuda.get_device_capability(q.device)
+            if major == 9:
+                raise ValueError(
+                    "CuTE varlen backward is not supported on Hopper (SM90). "
+                    "Use --flash3/--sageattn, or ensure fixed-length sequences (no padding)."
+                )
+
+        cute_window_size = _normalize_cute_window_size(window_size)
+        out, _ = _cute_attention_varlen(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
+            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True),
+            max_seqlen_q=lq,
+            max_seqlen_k=lk,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=cute_window_size,
+            deterministic=deterministic,
+        )
+        x = out.unflatten(0, (b, lq))
     else:
         raise ValueError(f"Unknown attention mode: {attn_mode}")
 
