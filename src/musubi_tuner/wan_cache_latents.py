@@ -199,7 +199,8 @@ def encode_and_save_batch(
             mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # 1, 1, H, W
 
             # Normalize mask from 0-255 to 0-1
-            mask = mask.float() / 255.0
+            mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(mask)
 
             # Downsample mask to latent space dimensions using area interpolation
             mask = F.interpolate(mask, size=(lat_h, lat_w), mode="area")  # 1, 1, lat_h, lat_w
@@ -313,7 +314,8 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
 
         mask_weights_i = None
         if item.mask_content is not None and target_j is not None:
-            mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0).float() / 255.0  # 1, 1, H, W
+            mask = (torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0).float() / 255.0).clamp_(0.0, 1.0)  # 1, 1, H, W
+            mask = cache_latents.apply_cache_mask_transforms(mask)
             mask = F.interpolate(mask, size=(lat_h, lat_w), mode="area")  # 1, 1, lat_h, lat_w
 
             mask_weights_i = torch.ones(1, num_frames, lat_h, lat_w, dtype=torch.float32)

@@ -461,11 +461,12 @@ def save_latent_cache_wan(
         sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions (F, H, W) as float32 for precision.
+        # Save mask weights in latent space dimensions (F, H, W) as float16 to reduce cache size / I/O.
+        # Mask weights originate from 8-bit masks and are clamped to [0,1], so float16 is sufficient.
         # F = number of video frames (WAN/HV) or number of layers (Qwen-Image Layered).
         # Single transfer: detach → device/dtype conversion (avoids redundant copies)
-        mask_dtype_str = dtype_to_str(torch.float32)
-        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
@@ -560,11 +561,11 @@ def save_latent_cache_flux_2(
             sd[f"latents_control_{i}_{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions (1, 1, H, W) as float32 for precision
+        # Save mask weights in latent space dimensions (1, 1, H, W) as float16 to reduce cache size / I/O.
         # Shape matches layout="video" with F=1: (B, 1, F, H, W) -> per-item (1, 1, H, W)
         _, H, W = latent.shape
-        mask_dtype_str = dtype_to_str(torch.float32)
-        sd[f"mask_weights_{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, arch_full)
 
@@ -591,13 +592,13 @@ def save_latent_cache_qwen_image(
             sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions (1, F, H, W) as float32 for precision.
+        # Save mask weights in latent space dimensions (1, F, H, W) as float16 to reduce cache size / I/O.
         # F = 1 for standard/Edit images; for Layered, F = number of layers (mask is expanded
         # identically across all layers — per-layer masks are not currently supported).
         # Single transfer: detach → device/dtype conversion (avoids redundant copies)
         _, F, H, W = latent.shape
-        mask_dtype_str = dtype_to_str(torch.float32)
-        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
@@ -719,10 +720,10 @@ def save_latent_cache_z_image(
             sd[f"siglip_{i}_{sig_dtype}"] = sig.detach().cpu().contiguous()
 
     if mask_weights is not None:
-        # Save mask weights in latent space dimensions as float32 for precision.
+        # Save mask weights in latent space dimensions as float16 to reduce cache size / I/O.
         # Common convention in this repo is per-item mask shape like (1, 1, H, W) (then stacked to (B, 1, 1, H, W)).
-        mask_dtype_str = dtype_to_str(torch.float32)
-        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float32)
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
@@ -757,6 +758,19 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
 
+    # Record cache-time mask preprocessing parameters for transparency and training-time safety checks.
+    #
+    # Note: these are globals set by cache scripts via `musubi_tuner.cache_latents.set_cache_mask_transform_args(args)`.
+    # Import is runtime-local to avoid circular imports (cache_latents imports this module).
+    try:
+        import musubi_tuner.cache_latents as cache_latents  # noqa: PLC0415
+
+        metadata["cache_mask_gamma"] = repr(float(getattr(cache_latents, "CACHE_MASK_GAMMA", 1.0)))
+        metadata["cache_mask_min_weight"] = repr(float(getattr(cache_latents, "CACHE_MASK_MIN_WEIGHT", 0.0)))
+    except Exception:  # noqa: BLE001
+        # Cache metadata is optional; older/foreign caches may omit it.
+        pass
+
     for key, value in sd.items():
         # 1) Ensure contiguous FIRST to avoid overlapping memory issues on expanded views
         if not value.is_contiguous():
@@ -773,6 +787,69 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     os.makedirs(latent_dir, exist_ok=True)
 
     save_file(sd, item_info.latent_cache_path, metadata=metadata)
+
+
+def read_cache_mask_transform_metadata(cache_path: str) -> tuple[float | None, float | None]:
+    """Read cache-time mask preprocessing parameters from a latent cache safetensors file.
+
+    Returns:
+        (cache_mask_gamma, cache_mask_min_weight) as floats if present, otherwise (None, None).
+    """
+    try:
+        with safetensors_utils.MemoryEfficientSafeOpen(cache_path) as f:
+            metadata = f.metadata()
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    gamma_str = metadata.get("cache_mask_gamma")
+    min_weight_str = metadata.get("cache_mask_min_weight")
+    if gamma_str is None or min_weight_str is None:
+        return None, None
+
+    try:
+        return float(gamma_str), float(min_weight_str)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def scan_cache_mask_transform_metadata(
+    datasets: Sequence["BaseDataset"],
+    *,
+    max_files_per_dataset: int = 16,
+) -> tuple[set[tuple[float, float]], int, int]:
+    """Scan a small sample of latent cache files and collect cache-time mask transforms.
+
+    This is intended to be called once at training startup (not per-step) to provide
+    transparency and to prevent common traps (double application, prior threshold vs min_weight).
+
+    Returns:
+        (pairs, num_files_with_metadata, num_files_checked)
+    """
+    pairs: set[tuple[float, float]] = set()
+    num_files_checked = 0
+    num_files_with_metadata = 0
+
+    for ds in datasets:
+        cache_dir = getattr(ds, "cache_directory", None)
+        arch = getattr(ds, "architecture", None)
+        if not cache_dir or not arch:
+            continue
+
+        pattern = os.path.join(cache_dir, f"*_{arch}.safetensors")
+        sampled = 0
+        for cache_path in glob.iglob(pattern):
+            if sampled >= max_files_per_dataset:
+                break
+            sampled += 1
+            num_files_checked += 1
+
+            gamma, min_weight = read_cache_mask_transform_metadata(cache_path)
+            if gamma is None or min_weight is None:
+                continue
+            num_files_with_metadata += 1
+            pairs.add((gamma, min_weight))
+
+    return pairs, num_files_with_metadata, num_files_checked
 
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):

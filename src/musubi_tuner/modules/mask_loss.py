@@ -105,6 +105,15 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "(must be odd if > 0). Recommended: 3 or 5. "
         "Note: --mask_blur_radius is an alias for this option.",
     )
+    parser.add_argument(
+        "--mask_area_scale_beta",
+        type=float,
+        default=0.0,
+        help="Optional: Scale masked target loss by (mask_mean ** beta) to reduce gradient spikes on tiny masks. "
+        "beta=0.0 keeps strict weighted-mean normalization (current behavior). "
+        "beta=1.0 approximates global mean behavior (safer but more diluted). "
+        "Try 0.5 as a middle-ground. Default: 0.0.",
+    )
 
     # Prior preservation arguments
     parser.add_argument(
@@ -116,6 +125,29 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "phantom limbs and background hallucinations. Recommended: 0.5-1.0. "
         "NOTE: Recommend --mask_min_weight 0.0 when using this. Requires LoRA training. "
         "/ マスク外領域での事前保存損失の重み（デフォルト：0.0=無効）。",
+    )
+    parser.add_argument(
+        "--prior_decay_schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear", "cosine"],
+        help="Optional: Timestep-adaptive scaling schedule for prior preservation weight (default: constant). "
+        "When enabled, w_prior stays at maximum at high noise and decays toward 0 at low noise "
+        "(see --prior_decay_timestep_start). Requires --normalize_per_sample for correctness.",
+    )
+    parser.add_argument(
+        "--prior_decay_timestep_start",
+        type=float,
+        default=300.0,
+        help="Pivot timestep for prior decay schedule (default: 300). For timesteps >= pivot, prior weight stays at max. "
+        "For timesteps < pivot, the schedule decays toward 0 at t=0.",
+    )
+    parser.add_argument(
+        "--prior_decay_warmup_ratio",
+        type=float,
+        default=0.0,
+        help="Optional: Warm up prior preservation weight from 0 to full value over this fraction of total train steps "
+        "(default: 0.0). This applies before the timestep schedule. Requires --normalize_per_sample when non-zero.",
     )
     parser.add_argument(
         "--prior_mask_threshold",
@@ -134,6 +166,30 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "This can significantly reduce compute/VRAM overhead by running prior preservation only at high-noise "
         "structural timesteps (when hallucinations tend to lock in). Example: --prior_preservation_timestep_threshold 300. "
         "Default: None (always compute teacher when prior preservation is enabled).",
+    )
+    parser.add_argument(
+        "--prior_teacher_eval",
+        action="store_true",
+        help="Optional: Run the teacher forward pass with the base transformer in eval() mode (disables dropout / uses eval behavior). "
+        "This makes teacher targets deterministic if the architecture ever introduces stochastic layers. "
+        "Default: disabled (teacher runs in train() mode for OneTrainer compatibility). "
+        "Note: toggling train/eval may reduce torch.compile effectiveness.",
+    )
+    parser.add_argument(
+        "--prior_teacher_mode",
+        type=str,
+        default="base",
+        choices=["base", "ema"],
+        help="Teacher mode for prior preservation (default: base). "
+        "'base' disables adapters to use the pristine base model as teacher. "
+        "'ema' uses an EMA-smoothed copy of adapter weights as teacher (adapters remain enabled), which can reduce stylistic clash.",
+    )
+    parser.add_argument(
+        "--prior_teacher_ema_decay",
+        type=float,
+        default=0.999,
+        help="EMA decay for --prior_teacher_mode=ema (default: 0.999). "
+        "EMA is applied to adapter (LoRA) parameters only, not the base transformer.",
     )
     parser.add_argument(
         "--normalize_per_sample",
@@ -212,6 +268,32 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
                         "very few teacher passes. Use --show_timesteps console to calibrate a threshold."
                     )
 
+    prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
+    if prior_teacher_eval and prior_preservation_weight <= 0:
+        _logger.warning("--prior_teacher_eval has no effect without --prior_preservation_weight > 0")
+
+    prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base"))
+    if prior_teacher_mode not in ("base", "ema"):
+        raise ValueError("--prior_teacher_mode must be one of: base, ema")
+
+    prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
+    if prior_teacher_ema_decay <= 0.0 or prior_teacher_ema_decay >= 1.0:
+        raise ValueError("--prior_teacher_ema_decay must be in range (0, 1)")
+    if prior_teacher_mode == "ema" and prior_preservation_weight <= 0:
+        _logger.warning("--prior_teacher_mode=ema has no effect without --prior_preservation_weight > 0")
+
+    prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
+    if prior_decay_schedule not in ("constant", "linear", "cosine"):
+        raise ValueError("--prior_decay_schedule must be one of: constant, linear, cosine")
+
+    prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
+    if prior_decay_timestep_start <= 0.0 or prior_decay_timestep_start > 1000.0:
+        raise ValueError("--prior_decay_timestep_start must be in range (0, 1000]")
+
+    prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
+    if prior_decay_warmup_ratio < 0.0 or prior_decay_warmup_ratio > 1.0:
+        raise ValueError("--prior_decay_warmup_ratio must be in range [0, 1]")
+
     if not use_mask_loss:
         return
 
@@ -229,6 +311,10 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     if mask_blur_kernel_size > 0 and mask_blur_kernel_size % 2 == 0:
         raise ValueError("--mask_blur_kernel_size must be odd (or 0 to disable)")
 
+    mask_area_scale_beta = float(getattr(args, "mask_area_scale_beta", 0.0))
+    if mask_area_scale_beta < 0:
+        raise ValueError("--mask_area_scale_beta must be >= 0")
+
     if prior_preservation_weight > 0 and mask_min_weight > 0:
         _logger.warning(
             f"--prior_preservation_weight={prior_preservation_weight} with --mask_min_weight={mask_min_weight}: "
@@ -244,17 +330,44 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
             "Consider adding --normalize_per_sample for more predictable behavior."
         )
 
+    schedule_enabled = (prior_decay_schedule != "constant") or (prior_decay_warmup_ratio > 0.0)
+    if schedule_enabled and not normalize_per_sample:
+        raise ValueError(
+            "Timestep-adaptive prior scheduling requires --normalize_per_sample for correctness. "
+            f"Got --prior_decay_schedule={prior_decay_schedule} and --prior_decay_warmup_ratio={prior_decay_warmup_ratio} "
+            "without --normalize_per_sample."
+        )
+    if schedule_enabled and prior_preservation_weight <= 0:
+        _logger.warning(
+            f"--prior_decay_schedule={prior_decay_schedule} / --prior_decay_warmup_ratio={prior_decay_warmup_ratio} "
+            "has no effect without --prior_preservation_weight > 0"
+        )
 
-def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str | None = None) -> None:
+
+def log_mask_loss_banner(
+    logger: Any,
+    args: argparse.Namespace,
+    cache_hint: str | None = None,
+    *,
+    cache_mask_transform_pairs: set[tuple[float, float]] | None = None,
+    cache_mask_metadata_coverage: tuple[int, int] | None = None,
+) -> None:
     if not getattr(args, "use_mask_loss", False):
         return
 
     prior_weight = float(getattr(args, "prior_preservation_weight", 0.0))
     prior_threshold = getattr(args, "prior_mask_threshold", None)
     prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+    prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
+    prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
+    prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
+    prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base"))
+    prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
     mask_min_weight = float(getattr(args, "mask_min_weight", 0.0))
     mask_blur_kernel_size = int(getattr(args, "mask_blur_kernel_size", 0) or 0)
+    mask_area_scale_beta = float(getattr(args, "mask_area_scale_beta", 0.0))
     normalize_per_sample = getattr(args, "normalize_per_sample", False)
+    mask_gamma = float(getattr(args, "mask_gamma", 1.0))
 
     logger.info("=" * 60)
     if prior_weight > 0:
@@ -264,15 +377,94 @@ def log_mask_loss_banner(logger: Any, args: argparse.Namespace, cache_hint: str 
     logger.info("=" * 60)
     logger.info(f"  mask_min_weight: {mask_min_weight}")
     logger.info(f"  mask_blur_kernel_size: {mask_blur_kernel_size}")
-    logger.info(f"  mask_gamma: {getattr(args, 'mask_gamma', 1.0)}")
+    logger.info(f"  mask_area_scale_beta: {mask_area_scale_beta}")
+    logger.info(f"  mask_gamma: {mask_gamma}")
+    logger.info(
+        f"  Applying training-time mask gamma/min_weight: gamma={mask_gamma}, min_weight={mask_min_weight}. "
+        "(Note: If you already baked these into your latents during caching, keep these at 1.0 and 0.0 to avoid double-application.)"
+    )
+
+    # Cache-time mask preprocessing transparency / safety.
+    #
+    # Cache-time transforms are applied BEFORE latent downsampling, so they change the numerical mask values
+    # that training sees as "raw" when using threshold-mode prior preservation.
+    if cache_mask_transform_pairs is not None:
+        if cache_mask_metadata_coverage is not None:
+            with_meta, checked = cache_mask_metadata_coverage
+            logger.info(f"  cache_mask_metadata_coverage: {with_meta}/{checked} sampled cache files")
+
+        if len(cache_mask_transform_pairs) == 0:
+            logger.warning(
+                "  No cache mask metadata found in sampled caches. "
+                "This usually means you are using older caches created before cache metadata tracking existed."
+            )
+        elif len(cache_mask_transform_pairs) == 1:
+            baked_gamma, baked_min_weight = next(iter(cache_mask_transform_pairs))
+            logger.info(f"  cache_mask_gamma (baked): {baked_gamma}")
+            logger.info(f"  cache_mask_min_weight (baked): {baked_min_weight}")
+
+            # Double application warning.
+            if baked_gamma != 1.0 and mask_gamma != 1.0:
+                logger.warning(
+                    f"  WARNING: Cache has baked gamma={baked_gamma}, but training also applies --mask_gamma={mask_gamma}. "
+                    "This will apply gamma twice (once in cache-time pixel space, once at training time in latent space). "
+                    "If you baked gamma into the cache, keep --mask_gamma=1.0."
+                )
+            if baked_min_weight != 0.0 and mask_min_weight != 0.0:
+                logger.warning(
+                    f"  WARNING: Cache has baked min_weight={baked_min_weight}, but training also applies --mask_min_weight={mask_min_weight}. "
+                    "This will apply a floor twice. If you baked min_weight into the cache, keep --mask_min_weight=0.0."
+                )
+
+            # Threshold-mode safety: floor trap.
+            if prior_weight > 0 and prior_threshold is not None and baked_min_weight >= float(prior_threshold):
+                logger.warning(
+                    "  CRITICAL: Threshold-mode prior preservation may be disabled by baked min_weight. "
+                    f"You are using --prior_mask_threshold={prior_threshold}, but cached masks have baked min_weight={baked_min_weight}. "
+                    "Because background becomes >= min_weight, (mask < threshold) will be empty or near-empty. "
+                    "Fix: set --cache_mask_min_weight=0.0 when using threshold-mode prior, or increase --prior_mask_threshold above baked min_weight."
+                )
+
+            if prior_weight > 0 and prior_threshold is not None and (baked_gamma != 1.0 or baked_min_weight != 0.0):
+                logger.info(
+                    "  NOTE: --prior_mask_threshold is evaluated on the cached mask values. "
+                    "If you baked cache-time gamma/min_weight, you may need to adjust the threshold accordingly "
+                    "(monotonic transform)."
+                )
+        else:
+            # Mixed caches: usually means stale caches were kept via --skip_existing or cache dirs were reused.
+            pairs_str = ", ".join(f"(gamma={g}, min_weight={m})" for g, m in sorted(cache_mask_transform_pairs))
+            logger.warning(
+                "  WARNING: Mixed cache mask metadata detected across sampled cache files: " + pairs_str + ". "
+                "This can cause inconsistent masking behavior across items. "
+                "Recommendation: use a fresh cache_directory and recache latents to make these consistent."
+            )
+
+            if prior_weight > 0 and prior_threshold is not None:
+                max_baked_min_weight = max(m for _, m in cache_mask_transform_pairs)
+                if max_baked_min_weight >= float(prior_threshold):
+                    logger.warning(
+                        "  CRITICAL: Some cached masks have baked min_weight that can disable threshold-mode prior preservation. "
+                        f"--prior_mask_threshold={prior_threshold}, max baked min_weight in sample={max_baked_min_weight}. "
+                        "Fix: recache with consistent settings and keep baked min_weight < threshold (or avoid threshold mode)."
+                    )
     if prior_weight > 0:
         logger.info(f"  prior_preservation_weight: {prior_weight}")
+        logger.info(f"  prior_decay_schedule: {prior_decay_schedule}")
+        if prior_decay_schedule != "constant" or prior_decay_warmup_ratio > 0.0:
+            logger.info(f"  prior_decay_timestep_start: {prior_decay_timestep_start}")
+            logger.info(f"  prior_decay_warmup_ratio: {prior_decay_warmup_ratio}")
         if prior_threshold is not None:
             logger.info(f"  prior_mask_threshold: {prior_threshold} (threshold mode)")
         else:
             logger.info("  prior_mask_threshold: None (continuous mode)")
         if prior_timestep_threshold is not None:
             logger.info(f"  prior_preservation_timestep_threshold: {prior_timestep_threshold} (teacher gated)")
+        prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
+        logger.info(f"  prior_teacher_eval: {prior_teacher_eval}")
+        logger.info(f"  prior_teacher_mode: {prior_teacher_mode}")
+        if prior_teacher_mode == "ema":
+            logger.info(f"  prior_teacher_ema_decay: {prior_teacher_ema_decay}")
         logger.info(f"  normalize_per_sample: {normalize_per_sample}")
         logger.info("-" * 60)
         logger.info("PRIOR PRESERVATION: Unmasked regions will match base model.")
@@ -367,8 +559,6 @@ def _prepare_tensors(
     elif mask_weights.ndim != 5:
         raise ValueError(f"Unexpected mask_weights shape: {tuple(mask_weights.shape)}")
 
-    mask_weights = mask_weights.to(loss.device, dtype=loss.dtype)
-
     # Layout-specific handling
     if layout == "video":
         # loss: (B, C, F, H, W), mask: (B, 1, F, H, W)
@@ -403,6 +593,8 @@ def apply_masked_loss_with_prior(
     mask_weights: torch.Tensor | None,
     *,
     prior_loss_unreduced: torch.Tensor | None = None,
+    prior_sample_mask: torch.Tensor | None = None,
+    prior_weight_per_sample: torch.Tensor | None = None,
     args: argparse.Namespace,
     layout: MaskLossLayout = "video",
     drop_base_frame: bool = False,
@@ -421,6 +613,11 @@ def apply_masked_loss_with_prior(
         loss: Unreduced loss tensor (B, C, F, H, W) or (B, C, H, W)
         mask_weights: Mask weights tensor, or None to use uniform weights
         prior_loss_unreduced: Unreduced prior loss tensor (same shape as loss), or None
+        prior_sample_mask: Optional per-sample mask (shape: (B,)) that gates prior preservation
+            on/off per item in the batch (useful for timestep-gated teacher passes).
+        prior_weight_per_sample: Optional per-sample prior weight tensor (shape: (B,)). When provided,
+            prior preservation uses per-sample weights (e.g., timestep-adaptive scheduling).
+            Requires --normalize_per_sample.
         args: Namespace with mask_gamma, mask_min_weight, prior_preservation_weight,
               prior_mask_threshold, normalize_per_sample
         layout: "video" or "layered"
@@ -445,6 +642,22 @@ def apply_masked_loss_with_prior(
 
     # Handle tensor shapes — mask returned in compact form (B,1,F,H,W) or (B,L,1,H,W)
     loss, mask_weights = _prepare_tensors(loss, mask_weights, layout, drop_base_frame)
+
+    if prior_weight_per_sample is not None:
+        if not normalize_per_sample:
+            raise ValueError("prior_weight_per_sample requires --normalize_per_sample (per-sample reduction).")
+        if prior_weight_per_sample.ndim != 1 or prior_weight_per_sample.shape[0] != loss.shape[0]:
+            raise ValueError(
+                "prior_weight_per_sample must be a 1D tensor with shape (B,), got "
+                f"{tuple(prior_weight_per_sample.shape)} for B={loss.shape[0]}"
+            )
+        if (prior_weight_per_sample < 0).any().item():
+            raise ValueError("prior_weight_per_sample must be >= 0 for all samples")
+        prior_weight_per_sample = prior_weight_per_sample.to(device=loss.device, dtype=torch.float32)
+
+    # Ensure mask weights match loss device/dtype to prevent mixed-precision collisions.
+    # Note: mask_weights may be stored as float16 in cache files to reduce disk I/O.
+    mask_weights = mask_weights.to(loss.device, dtype=loss.dtype)
 
     # Compact mask is broadcast-compatible with loss; compute channel factor for weight sums.
     # Video: mask (B,1,F,H,W), loss (B,C,F,H,W) → C = loss.shape[1]
@@ -483,20 +696,37 @@ def apply_masked_loss_with_prior(
     if mask_min_weight > 0:
         mask_processed = mask_processed * (1.0 - mask_min_weight) + mask_min_weight
 
-    # Compute prior mask (complement of processed mask)
-    prior_mask = 1 - mask_processed
-
     # Optional: threshold on RAW mask (before gamma/min_weight)
     prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
     if prior_mask_threshold is not None:
         # Binarize: full prior preservation where raw mask < threshold
         prior_mask = (mask_raw_unblurred < prior_mask_threshold).float()
+    else:
+        # Continuous mode: prior is the complement of processed mask
+        prior_mask = 1 - mask_processed
+
+    # Optional: gate prior preservation per-sample (e.g., timestep-based teacher gating).
+    # IMPORTANT: This must happen BEFORE overlap prevention so target masks are not modified for gated-off samples.
+    if prior_sample_mask is not None:
+        if prior_sample_mask.ndim != 1 or prior_sample_mask.shape[0] != loss.shape[0]:
+            raise ValueError(
+                f"prior_sample_mask must be a 1D tensor with shape (B,), got {tuple(prior_sample_mask.shape)} for B={loss.shape[0]}"
+            )
+        gate = prior_sample_mask.to(device=loss.device, dtype=loss.dtype).view(loss.shape[0], *([1] * (prior_mask.ndim - 1)))
+        prior_mask = prior_mask * gate
+
+    # Prevent target/prior overlap in threshold mode only
+    if prior_mask_threshold is not None:
         # Prevent target/prior overlap: zero out target where prior applies
         mask_processed = mask_processed * (1 - prior_mask)
 
     # === Target Loss (inside mask) ===
     # Broadcasting: loss (B,C,F,H,W) * compact mask (B,1,F,H,W) → (B,C,F,H,W)
     target_loss_weighted = loss * mask_processed
+
+    mask_area_scale_beta = float(getattr(args, "mask_area_scale_beta", 0.0))
+    if mask_area_scale_beta < 0:
+        raise ValueError("--mask_area_scale_beta must be >= 0")
 
     if normalize_per_sample:
         # Per-sample weighted mean, then average over batch
@@ -507,6 +737,9 @@ def apply_masked_loss_with_prior(
         # Handle samples with zero target weight: treat as 0 contribution
         valid_target = target_weight > 1e-8
         per_sample_target = torch.where(valid_target, target_sum / target_weight.clamp_min(1e-8), torch.zeros_like(target_sum))
+        if mask_area_scale_beta > 0.0:
+            area_ratio = mask_processed.mean(dim=reduce_dims, dtype=torch.float32).clamp(0.0, 1.0)
+            per_sample_target = per_sample_target * (area_ratio**mask_area_scale_beta)
         L_target = per_sample_target.mean()
     else:
         # Global weighted mean; weight sum scaled by channels (compact mask has 1 where loss has C)
@@ -519,9 +752,13 @@ def apply_masked_loss_with_prior(
             L_target = loss.new_zeros((), dtype=torch.float32)
         else:
             L_target = target_loss_weighted.sum(dtype=torch.float32) / target_weight_sum
+            if mask_area_scale_beta > 0.0:
+                area_ratio = mask_processed.mean(dtype=torch.float32).clamp(0.0, 1.0)
+                L_target = L_target * (area_ratio**mask_area_scale_beta)
 
     # === Prior Loss (outside mask) ===
-    if prior_preservation_weight > 0 and prior_loss_unreduced is not None:
+    use_prior_term = prior_loss_unreduced is not None and (prior_preservation_weight > 0 or prior_weight_per_sample is not None)
+    if use_prior_term:
         # Check if prior mask is effectively all zeros (skip computation)
         # Use float32 for the sum so clamp_min(1e-8) is meaningful under fp16/bf16
         prior_mask_sum = prior_mask.sum(dtype=torch.float32) * num_channels
@@ -549,7 +786,10 @@ def apply_masked_loss_with_prior(
                 # Handle samples with zero prior weight: treat as 0 contribution
                 valid_prior = prior_weight > 1e-8
                 per_sample_prior = torch.where(valid_prior, prior_sum / prior_weight.clamp_min(1e-8), torch.zeros_like(prior_sum))
-                L_prior = per_sample_prior.mean() * prior_preservation_weight
+                if prior_weight_per_sample is not None:
+                    L_prior = (per_sample_prior * prior_weight_per_sample).mean()
+                else:
+                    L_prior = per_sample_prior.mean() * prior_preservation_weight
             else:
                 L_prior = (prior_loss_weighted.sum(dtype=torch.float32) / prior_mask_sum) * prior_preservation_weight
     else:

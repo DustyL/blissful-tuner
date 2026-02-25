@@ -16,6 +16,7 @@ from safetensors.torch import save_file
 from musubi_tuner import zimage_train_network
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.zimage import zimage_model
 from musubi_tuner.hv_train_network import (
@@ -545,7 +546,14 @@ class ZImageTrainer(ZImageNetworkTrainer):
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, dit_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(dit_dtype), target.to(dit_dtype), reduction="none")
+                    loss_type = getattr(args, "loss_type", "mse")
+                    loss_delta = getattr(args, "loss_delta", 1.0)
+                    loss = compute_unreduced_target_loss(
+                        model_pred.to(dit_dtype),
+                        target.to(dit_dtype),
+                        loss_type=loss_type,
+                        loss_delta=loss_delta,
+                    )
 
                     if weighting is not None:
                         loss = loss * weighting

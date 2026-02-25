@@ -435,6 +435,7 @@ def append_section_idx_to_latent_cache_path(latent_cache_path: str, section_idx:
 
 
 def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace):
+    cache_latents.set_cache_mask_transform_args(args)
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")

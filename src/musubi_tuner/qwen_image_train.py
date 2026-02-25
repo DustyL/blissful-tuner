@@ -16,12 +16,14 @@ from safetensors.torch import save_file
 from musubi_tuner import qwen_image_train_network
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.dataset.image_video_dataset import scan_cache_mask_transform_metadata
 from musubi_tuner.modules.mask_loss import (
     apply_masked_loss_with_prior,
     log_mask_loss_banner,
     require_mask_weights_if_enabled,
     validate_mask_loss_args,
 )
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
 from musubi_tuner.hv_train_network import (
@@ -459,6 +461,11 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
             dataset_metadata = dataset.get_metadata()
             datasets_metadata.append(dataset_metadata)
 
+        # Inspect cache metadata once (cheap header read) to surface cache-time mask transforms and prevent traps.
+        cache_mask_pairs, cache_mask_with_meta, cache_mask_checked = scan_cache_mask_transform_metadata(
+            train_dataset_group.datasets
+        )
+
         metadata["ss_datasets"] = json.dumps(datasets_metadata)
 
         # model name and hash
@@ -613,6 +620,8 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
             logger,
             args,
             cache_hint="If you see 'no mask_weights' error, recache with alpha_mask or mask_directory.",
+            cache_mask_transform_pairs=cache_mask_pairs,
+            cache_mask_metadata_coverage=(cache_mask_with_meta, cache_mask_checked),
         )
 
         optimizer_train_fn()
@@ -652,7 +661,14 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, dit_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(dit_dtype), target, reduction="none")
+                    loss_type = getattr(args, "loss_type", "mse")
+                    loss_delta = getattr(args, "loss_delta", 1.0)
+                    loss = compute_unreduced_target_loss(
+                        model_pred.to(dit_dtype),
+                        target.to(dit_dtype),
+                        loss_type=loss_type,
+                        loss_delta=loss_delta,
+                    )
 
                     if weighting is not None:
                         loss = loss * weighting

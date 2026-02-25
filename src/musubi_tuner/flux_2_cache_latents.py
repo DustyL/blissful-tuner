@@ -91,7 +91,8 @@ def encode_and_save_batch(ae: flux2_models.AutoEncoder, batch: List[ItemInfo]):
             mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
 
             # Normalize mask from 0-255 to 0-1
-            mask = mask.float() / 255.0
+            mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(mask)
 
             # Downsample mask to latent space dimensions using area interpolation
             lat_h, lat_w = target_latent.shape[-2:]

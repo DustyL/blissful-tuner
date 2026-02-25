@@ -2,7 +2,7 @@
 
 A comprehensive reference for understanding and using weighted mask loss training in blissful-tuner for WAN2.2 and Qwen Image LoRA training.
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-02-25
 
 ---
 
@@ -58,6 +58,20 @@ weighted_masks/
 ```
 
 One static mask image is used for all frames of each video. Per-frame mask videos are not supported.
+
+> **CRITICAL (Spatiotemporal video masking limitation):** VideoDataset currently uses a **single static 2D mask**
+> broadcast across all frames. The mask does **not** track the subject over time.
+>
+> If your subject moves outside the masked region, training can become unstable and (with masked prior preservation enabled)
+> the teacher signal may actively treat those pixels as “background,” pushing the subject toward the base-model prediction.
+> This can cause ghosting/identity collapse or partial subject erasure.
+>
+> **Workarounds:**
+> - Ensure the subject remains relatively stationary within the mask.
+> - Use a larger mask that covers the subject’s full motion path.
+> - Crop videos tighter so the subject stays in-frame and inside the mask.
+> - If your dataset has significant motion, consider disabling prior preservation (or raising the mask floor via `--mask_min_weight`)
+>   until spatiotemporal / per-frame masks are supported.
 
 #### One-Frame Mode (`--one_frame`)
 
@@ -247,7 +261,19 @@ When you run the cache latents script, masks are:
 3. **Downsampled** to latent space dimensions (8x smaller)
 4. **Saved** alongside latents in the cache file as **raw [0.0, 1.0] values**
 
-> **Important**: Masks are stored in their raw form — `--mask_blur_kernel_size` (`--mask_blur_radius`), `--mask_gamma`, and `--mask_min_weight` are **not** applied during caching. These transformations are applied at training time by the mask loss module. This is intentional: it allows you to experiment with different blur/gamma/min-weight values without recaching latents. You only need to recache when the mask images themselves change or when switching between `alpha_mask` / `mask_directory` sources.
+> **Important**: By default, masks are stored in their raw form (normalized `[0.0, 1.0]` at latent resolution).
+> Training-time transforms (`--mask_blur_kernel_size` / `--mask_blur_radius`, `--mask_gamma`, `--mask_min_weight`)
+> are applied by the mask loss module, so you can experiment with different values without recaching latents.
+> You only need to recache when the mask images themselves change or when switching between `alpha_mask` / `mask_directory` sources.
+>
+> **Optional (advanced): Cache-time baking for exact boundary math.** If you want gamma/min-weight applied in
+> **high-resolution pixel space before the 8× latent downsample** (avoids non-commutativity artifacts at boundaries),
+> you can bake them into the cache:
+> - `--cache_mask_gamma <float>` (default `1.0`)
+> - `--cache_mask_min_weight <float>` (default `0.0`)
+>
+> When baked, these values are stored in the cache metadata and shown in the training banner. If you bake them,
+> keep training-time `--mask_gamma=1.0` and `--mask_min_weight=0.0` to avoid double-application.
 
 ```bash
 # For WAN 2.2
@@ -356,6 +382,15 @@ Applies a **Gaussian blur** to the mask weights *before* `--mask_gamma` and `--m
 
 This feathers hard 0→1 transitions at mask boundaries, which can reduce “halo” / seam artifacts around the subject.
 
+> **Important (latent space):** This blur runs on the **latent-resolution** mask, not the original pixel mask.
+> Most VAEs used here have an 8× spatial downsample, so as a rule of thumb:
+> - Effective pixel-space radius ≈ `((kernel_size - 1) / 2) * 8`
+> - Effective pixel-space span ≈ `kernel_size * 8`
+>
+> Examples:
+> - `kernel_size=3` → radius ≈ 8px, span ≈ 24px
+> - `kernel_size=5` → radius ≈ 16px, span ≈ 40px
+
 ```bash
 # Subtle feathering (recommended starting point)
 --mask_blur_kernel_size 3
@@ -369,6 +404,32 @@ This feathers hard 0→1 transitions at mask boundaries, which can reduce “hal
 - `--mask_min_weight 0.0` (very sharp subject→background transition)
 - Small subject masks / fine detail masks where boundary artifacts are noticeable
 
+### `--mask_area_scale_beta` (Tiny Mask Stabilizer)
+
+**Type:** Float (optional)  
+**Default:** 0.0 (disabled)  
+**Valid values:** >= 0
+
+Strict weighted-mean normalization (`sum(loss * w) / sum(w)`) is mathematically correct, but it can produce **very large gradients**
+when a mask covers only a tiny fraction of the image (because you effectively divide by a very small `sum(w)`).
+
+This option scales the masked **target** loss by a factor based on mask coverage:
+
+```python
+L_target = L_target * (mask_mean ** beta)
+```
+
+Where `mask_mean` is the mean of the processed mask weights (after blur/gamma/min_weight and any threshold-mode overlap exclusion).
+
+Recommended values:
+- `0.0` (default): strict weighted mean (maximum focus, can spike on tiny masks)
+- `0.5`: safer middle-ground for small masks
+- `1.0`: approximates global-mean behavior (very stable, but more diluted)
+
+> **Warning (tiny masks):** If your mask covers only a few latent pixels (e.g., distant faces / small subjects),
+> strict weighted-mean can amplify gradients roughly proportional to `1 / mask_area`. If you see instability, loss spikes,
+> or NaNs when training on tiny masks, try `--mask_area_scale_beta 0.5`.
+
 ---
 
 ## Masked Prior Preservation (Optional)
@@ -378,7 +439,14 @@ Masked Prior Preservation adds a second objective to masked training:
 - **Inside mask:** train toward the normal target (current behavior)
 - **Outside mask:** train toward the **base model** prediction (teacher), which reduces phantom limbs / background drift
 
-This requires an additional forward pass with LoRA temporarily disabled (under `torch.no_grad()`), so it is slower than normal masked training.
+This requires an additional forward pass (teacher) under `torch.no_grad()`, so it is slower than normal masked training.
+
+> **Teacher signal note (anti self-hallucination):** By default, the teacher prediction is computed with LoRA adapters
+> temporarily disabled (`--prior_teacher_mode base`), so the prior target comes from a pristine base model.
+> This helps prevent recursive self-hallucination that can happen if the teacher includes the current LoRA.
+>
+> If you want a teacher that slowly follows your LoRA’s style while remaining stable, use the EMA teacher mode
+> (`--prior_teacher_mode ema`), which swaps adapter weights to an EMA-smoothed copy for the teacher forward pass.
 
 > **Note:** Masked Prior Preservation requires **LoRA training** (adapters must be temporarily disabled to compute the teacher prediction).  
 > It is not available for **full fine-tuning** runs without adapters (e.g. `qwen_image_train.py` full fine-tune mode).
@@ -419,6 +487,8 @@ Controls how the prior mask is constructed:
 **Notes:**
 - Thresholding is applied to the **latent-resolution** mask (after caching-time resizing/interpolation), not the original pixel mask.
 - In threshold mode, target/prior overlap is prevented by zeroing the target mask wherever the prior mask applies.
+- Thresholding is applied to the cached **raw / unblurred** mask values (before `--mask_blur_kernel_size`, `--mask_gamma`, and `--mask_min_weight`).
+  This means blur/gamma affect the *softness* of the target region, but do not move the hard prior boundary.
 
 **Recommended values:** `0.05–0.15` (start at `0.1`)
 
@@ -450,14 +520,30 @@ which is often where out-of-mask hallucinations like “phantom limbs” get loc
 --prior_preservation_timestep_threshold 300
 ```
 
-> **Note:** The gating check is `all(timesteps > threshold)` within a batch.  
-> This is ideal for `batch_size=1` (common in video training). For larger batches, the teacher pass may trigger less often.
+> **Note:** Teacher gating is evaluated **per-sample**.  
+> The teacher forward pass runs if **any** sample in the batch exceeds the threshold, and the prior loss is then **gated per-sample**
+> so only those structural samples receive the prior term. This keeps behavior correct for `batch_size > 1`, but compute overhead is still
+> batch-coupled (if any sample triggers teacher, the teacher forward runs for the whole batch).
 
 > **Important:** The threshold is compared against the **raw scheduler timesteps** (roughly `0–1000`), after each architecture’s internal mapping.  
 > The effective skip rate depends on your timestep sampling distribution (`--timestep_sampling`, `--weighting_scheme`, and any shift parameters).
 
 > **WAN 2.2 note:** For `--timestep_sampling shift --discrete_flow_shift 12.0` (WAN 2.2 T2V default), timesteps are heavily concentrated in the high-noise region.  
 > A low threshold like `300` may skip very few teacher passes (minimal speedup). Use `--show_timesteps console` to inspect your actual sampled distribution and choose a threshold that matches your speed/quality trade-off.
+
+### `--prior_teacher_eval` (Deterministic Teacher)
+
+**Type:** Flag (boolean)  
+**Default:** Disabled
+
+If enabled, the teacher forward pass runs with the base transformer in `eval()` mode:
+
+```bash
+--prior_teacher_eval
+```
+
+This makes teacher targets deterministic if a future architecture introduces Dropout (or other train-mode-only stochasticity).
+For current DiT-style models, this is usually unnecessary. Note that toggling train/eval can reduce `torch.compile` effectiveness.
 
 ### Argument Validation
 
@@ -468,6 +554,7 @@ All mask-related arguments are validated early in training. Invalid values will 
 | `--mask_gamma` | > 0 | `--mask_gamma must be > 0` |
 | `--mask_min_weight` | [0, 1) | `--mask_min_weight must be in range [0, 1)` |
 | `--mask_blur_kernel_size` | odd or 0 | `--mask_blur_kernel_size must be odd (or 0 to disable)` |
+| `--mask_area_scale_beta` | >= 0 | `--mask_area_scale_beta must be >= 0` |
 | `--prior_preservation_weight` | >= 0 | `--prior_preservation_weight must be >= 0` |
 | `--prior_mask_threshold` | (0, 1) | `--prior_mask_threshold must be in range (0, 1)` |
 | `--prior_preservation_timestep_threshold` | [0, 1000] | `--prior_preservation_timestep_threshold must be in range [0, 1000]` |
@@ -716,7 +803,8 @@ High-level steps performed:
 
 3. **Batch Alignment**: If a batch contains mixed items (some with masks, some without), items without masks are assigned `torch.ones_like()` (full weight everywhere).
 
-4. **Float32 Precision**: Mask weights are saved in float32 in cache files for numerical precision.
+4. **Cache dtype**: Cached `mask_weights` are stored as `float16` to reduce cache footprint / disk I/O (masks are clamped to `[0,1]`, so float16 is sufficient).
+   At training time, masks are explicitly cast to match the loss tensor dtype to avoid mixed-precision collisions.
 
 5. **Mask Resizing Interpolation**: When resizing masks to bucket resolution:
    - **Downscaling** uses `INTER_AREA` (preserves average weight correctly)
@@ -873,9 +961,11 @@ python wan_train_network.py --dataset_config config.toml --use_mask_loss
 | `--mask_gamma` | float | 1.0 | Gamma correction (< 1 softer, > 1 sharper) |
 | `--mask_min_weight` | float | 0.0 | Minimum weight for all regions |
 | `--mask_blur_kernel_size` | int | 0 | Optional Gaussian blur kernel size for mask feathering (odd; alias: `--mask_blur_radius`) |
+| `--mask_area_scale_beta` | float | 0.0 | Optional stabilization for tiny masks (scales target loss by mask coverage) |
 | `--prior_preservation_weight` | float | 0.0 | Prior preservation weight (0.0 disables) |
 | `--prior_mask_threshold` | float | none | Optional threshold mode for prior mask (e.g. 0.05–0.15) |
 | `--prior_preservation_timestep_threshold` | float | none | Optional teacher-pass gating by timestep (e.g. 300) |
+| `--prior_teacher_eval` | flag | disabled | Optional: run teacher forward in eval() mode (deterministic teacher) |
 | `--normalize_per_sample` | flag | disabled | Normalize masked loss per-sample (recommended with prior) |
 
 ### Our Weighted Mask Values
@@ -890,6 +980,14 @@ python wan_train_network.py --dataset_config config.toml --use_mask_loss
 ---
 
 ## Changelog
+
+### 2026-02-25
+- **NEW:** Optional cache-time mask baking (`--cache_mask_gamma`, `--cache_mask_min_weight`) to apply non-linear transforms before latent downsampling
+- **NEW:** Cache metadata tracking + training-time safety warnings for baked masks (prevents double-application and threshold traps)
+- **CHANGED:** Cached `mask_weights` are stored as float16 (reduced cache footprint / disk I/O)
+- **CHANGED:** Prior timestep gating is per-sample for `batch_size > 1` (teacher runs if any sample triggers; prior term gated per-sample)
+- **NEW:** Tiny-mask stabilization via `--mask_area_scale_beta`
+- **NEW:** Deterministic teacher option via `--prior_teacher_eval`
 
 ### 2026-02-23
 - **NEW:** Mask boundary feathering via Gaussian blur (`--mask_blur_kernel_size` / `--mask_blur_radius`) to reduce halo artifacts
@@ -935,5 +1033,5 @@ python wan_train_network.py --dataset_config config.toml --use_mask_loss
 ---
 
 *Document created: 2026-01-13*
-*Last updated: 2026-01-29*
+*Last updated: 2026-02-25*
 *Based on blissful-tuner codebase analysis*

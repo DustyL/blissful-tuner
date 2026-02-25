@@ -42,6 +42,8 @@ import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
 from musubi_tuner.modules.lr_schedulers import RexLR
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
+from musubi_tuner.modules.lora_ema_teacher import LoRAEmaTeacher
 from musubi_tuner.modules.mask_loss import (
     add_mask_loss_args,
     apply_masked_loss_with_prior,
@@ -49,10 +51,15 @@ from musubi_tuner.modules.mask_loss import (
     require_mask_weights_if_enabled,
     validate_mask_loss_args as validate_mask_loss_args_impl,
 )
+from musubi_tuner.modules.prior_scheduling import compute_prior_weight_per_sample
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
-from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO, ARCHITECTURE_HUNYUAN_VIDEO_FULL
+from musubi_tuner.dataset.image_video_dataset import (
+    ARCHITECTURE_HUNYUAN_VIDEO,
+    ARCHITECTURE_HUNYUAN_VIDEO_FULL,
+    scan_cache_mask_transform_metadata,
+)
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, resize_image_to_bucket, encode_to_latents
 
 from blissful_tuner.blissful_logger import BlissfulLogger
@@ -478,12 +485,13 @@ class NetworkTrainer:
     @contextmanager
     def prior_model_context(self, network):
         """
-        Context manager to temporarily disable LoRA for computing prior predictions.
+                Context manager to temporarily disable LoRA for computing prior predictions.
 
-        Design decision: Keep model in train() mode during teacher forward.
-        - Matches OneTrainer behavior
-        - DiT models (WAN, FLUX, etc.) typically have no dropout, so train/eval makes no difference
-        - If a future model has dropout, train mode gives "realistic" teacher predictions
+                Design decision: Keep model in train() mode during teacher forward.
+                - Matches OneTrainer behavior
+                - DiT models (WAN, FLUX, etc.) typically have no dropout, so train/eval makes no difference
+                - If a future model has dropout, train mode gives "realistic" teacher predictions
+                - If you want deterministic teacher targets, use --prior_teacher_eval (toggles transformer.eval() around the teacher pass)
 
         Usage:
             with self.prior_model_context(network):
@@ -2271,6 +2279,11 @@ class NetworkTrainer:
             dataset_metadata = dataset.get_metadata()
             datasets_metadata.append(dataset_metadata)
 
+        # Inspect cache metadata once (cheap header read) to surface cache-time mask transforms and prevent traps.
+        cache_mask_pairs, cache_mask_with_meta, cache_mask_checked = scan_cache_mask_transform_metadata(
+            train_dataset_group.datasets
+        )
+
         metadata["ss_datasets"] = json.dumps(datasets_metadata)
 
         # add extra args
@@ -2406,11 +2419,24 @@ class NetworkTrainer:
             logger,
             args,
             cache_hint="If you see 'no mask_weights' error, recache with alpha_mask or mask_directory.",
+            cache_mask_transform_pairs=cache_mask_pairs,
+            cache_mask_metadata_coverage=(cache_mask_with_meta, cache_mask_checked),
         )
 
         clean_memory_on_device(accelerator.device)
 
         optimizer_train_fn()  # Set training mode
+
+        # === Prior scheduling / EMA teacher configuration ===
+        prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
+        prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
+        prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
+        prior_schedule_enabled = (prior_decay_schedule != "constant") or (prior_decay_warmup_ratio > 0.0)
+        prior_decay_warmup_steps = int(args.max_train_steps * prior_decay_warmup_ratio) if prior_decay_warmup_ratio > 0 else 0
+
+        prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base"))
+        prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
+        prior_lora_ema: LoRAEmaTeacher | None = None
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -2466,24 +2492,88 @@ class NetworkTrainer:
                     prior_preservation_weight = getattr(args, "prior_preservation_weight", 0.0)
                     mask_weights = batch.get("mask_weights")
 
-                    need_prior = (
+                    need_prior_base = (
                         prior_preservation_weight > 0 and getattr(args, "use_mask_loss", False) and mask_weights is not None
                     )
 
-                    # Optional speed optimization: only run the teacher forward pass at high-noise (structural) timesteps.
-                    # This is most effective when batch_size=1 (common for video); for larger batches, this requires *all*
-                    # samples in the batch to be above the threshold to avoid mixing teacher/no-teacher within a step.
-                    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
-                    if need_prior and prior_timestep_threshold is not None:
-                        is_structural_timestep = bool((timesteps > float(prior_timestep_threshold)).all().item())
-                        need_prior = need_prior and is_structural_timestep
+                    # Optional: Timestep-adaptive prior weight scheduling (per-sample).
+                    #
+                    # For timesteps >= --prior_decay_timestep_start, weight stays at max.
+                    # For timesteps < pivot, weight decays toward 0 at t=0 (linear or cosine).
+                    prior_weight_per_sample = None
+                    if need_prior_base and prior_schedule_enabled:
+                        prior_weight_per_sample = compute_prior_weight_per_sample(
+                            timesteps,
+                            base_weight=float(prior_preservation_weight),
+                            schedule=prior_decay_schedule,
+                            pivot_timestep=prior_decay_timestep_start,
+                            global_step=global_step,
+                            warmup_steps=prior_decay_warmup_steps,
+                        )
 
-                    if need_prior:
-                        # Optimization: skip teacher forward if mask is all ones (prior_mask will be all zeros)
+                    # Optional: initialize EMA teacher once warmup completes.
+                    if (
+                        need_prior_base
+                        and prior_teacher_mode == "ema"
+                        and prior_lora_ema is None
+                        and global_step >= prior_decay_warmup_steps
+                    ):
+                        prior_lora_ema = LoRAEmaTeacher(decay=prior_teacher_ema_decay)
+                        prior_lora_ema.init_from(accelerator.unwrap_model(network))
+
+                    # Optional speed optimization: only run the teacher forward pass at high-noise (structural) timesteps.
+                    #
+                    # NOTE: We gate the *application* of the prior term per-sample (in mask_loss.py) to avoid
+                    # denominator dilution and threshold-mode overlap issues when batch_size > 1.
+                    prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+                    prior_sample_mask = None
+                    need_prior = need_prior_base
+                    if need_prior and (prior_timestep_threshold is not None or prior_weight_per_sample is not None):
+                        # Per-sample structural gating. Teacher forward is run if ANY sample needs it.
+                        # Prior loss application is gated per-sample in apply_masked_loss_with_prior().
+                        if prior_timestep_threshold is not None:
+                            do_prior = timesteps > float(prior_timestep_threshold)  # (B,)
+                        else:
+                            do_prior = torch.ones_like(timesteps, dtype=torch.bool)  # (B,)
+
+                        # If scheduled weights are provided, treat zero-weight samples as "prior disabled".
+                        if prior_weight_per_sample is not None:
+                            do_prior = do_prior & (prior_weight_per_sample > 0)
+
+                        # Optimization: skip teacher forward if the prior region would be empty for all structural samples.
+                        # This mirrors prior_mask construction rules in mask_loss.py but uses a cheap per-sample min check.
+                        if mask_weights is not None:
+                            if mask_weights.ndim == 5:
+                                mask_min_per_sample = mask_weights.amin(dim=(1, 2, 3, 4))
+                            elif mask_weights.ndim == 4:
+                                mask_min_per_sample = mask_weights.amin(dim=(1, 2, 3))
+                            else:
+                                mask_min_per_sample = mask_weights.view(mask_weights.shape[0], -1).amin(dim=1)
+                        else:
+                            mask_min_per_sample = None
+
+                        prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
+                        if mask_min_per_sample is not None:
+                            if prior_mask_threshold is not None:
+                                # Threshold mode: prior applies only where raw mask < threshold
+                                has_prior_region = mask_min_per_sample < float(prior_mask_threshold)
+                            else:
+                                # Continuous mode: prior_mask = 1 - mask_processed, so only all-ones masks produce zero prior.
+                                has_prior_region = mask_min_per_sample < (1.0 - 1e-6)
+                            # mask_weights may be on CPU while timesteps are on accelerator.device.
+                            # Ensure device alignment before boolean ops.
+                            has_prior_region = has_prior_region.to(device=do_prior.device)
+                            do_prior = do_prior & has_prior_region
+
+                        prior_sample_mask = do_prior
+                        need_prior = bool(do_prior.any().item())
+                    elif need_prior:
+                        # No timestep gating: preserve the original optimization that skips the teacher when
+                        # the prior region would be empty for the entire batch.
                         mask_min = float(mask_weights.min())
                         prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
                         if prior_mask_threshold is not None:
-                            # Threshold mode: prior applies only where raw mask < threshold
+                            # Threshold mode: prior applies only where raw mask < threshold.
                             # If the minimum mask value is >= threshold, prior_mask would be all zeros.
                             if mask_min >= float(prior_mask_threshold):
                                 need_prior = False
@@ -2493,32 +2583,56 @@ class NetworkTrainer:
                                 need_prior = False  # No prior loss contribution possible
 
                     if need_prior:
-                        with torch.no_grad():
-                            # Note: must unwrap network for set_enabled() to work with DDP/accelerator wrapping
-                            with self.prior_model_context(accelerator.unwrap_model(network)):
-                                # TP-07: Dual-expert note (WAN 2.2).
-                                # call_dit() is responsible for expert selection/swap based on `timesteps`.
-                                # Because we reuse the exact same timesteps for the teacher forward pass, the
-                                # prior prediction runs on the same expert as the student, with LoRA disabled.
-                                # Use exact same inputs (noisy_model_input, timesteps, etc.)
-                                prior_pred_raw, _ = self.call_dit(
-                                    args,
-                                    accelerator,
-                                    transformer,
-                                    latents,
-                                    batch,
-                                    noise,
-                                    noisy_model_input,
-                                    timesteps,
-                                    network_dtype,
+                        prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
+                        transformer_was_training = transformer.training if prior_teacher_eval else None
+                        if prior_teacher_eval:
+                            transformer.eval()
+                        try:
+                            with torch.no_grad():
+                                # Note: must unwrap network for set_enabled() to work with DDP/accelerator wrapping
+                                unwrapped_network = accelerator.unwrap_model(network)
+                                prior_teacher_uses_ema = prior_teacher_mode == "ema" and prior_lora_ema is not None
+                                prior_context = (
+                                    prior_lora_ema.apply_to(unwrapped_network)
+                                    if prior_teacher_uses_ema
+                                    else self.prior_model_context(unwrapped_network)
                                 )
-                        prior_pred = prior_pred_raw.detach()
+                                with prior_context:
+                                    # TP-07: Dual-expert note (WAN 2.2).
+                                    # call_dit() is responsible for expert selection/swap based on `timesteps`.
+                                    # Because we reuse the exact same timesteps for the teacher forward pass, the
+                                    # prior prediction runs on the same expert as the student:
+                                    #   - base teacher: LoRA disabled
+                                    #   - EMA teacher:  LoRA enabled but weights swapped to EMA values
+                                    # Use exact same inputs (noisy_model_input, timesteps, etc.)
+                                    prior_pred_raw, _ = self.call_dit(
+                                        args,
+                                        accelerator,
+                                        transformer,
+                                        latents,
+                                        batch,
+                                        noise,
+                                        noisy_model_input,
+                                        timesteps,
+                                        network_dtype,
+                                    )
+                            prior_pred = prior_pred_raw.detach()
+                        finally:
+                            if prior_teacher_eval and transformer_was_training:
+                                transformer.train()
 
                     # Compute model prediction (with LoRA enabled)
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    loss_type = getattr(args, "loss_type", "mse")
+                    loss_delta = getattr(args, "loss_delta", 1.0)
+                    loss = compute_unreduced_target_loss(
+                        model_pred.to(network_dtype),
+                        target.to(network_dtype),
+                        loss_type=loss_type,
+                        loss_delta=loss_delta,
+                    )
 
                     if weighting is not None:
                         loss = loss * weighting
@@ -2541,6 +2655,8 @@ class NetworkTrainer:
                         loss,
                         mask_weights,
                         prior_loss_unreduced=prior_loss_unreduced,
+                        prior_sample_mask=prior_sample_mask,
+                        prior_weight_per_sample=prior_weight_per_sample,
                         args=args,
                         layout=layout,
                         drop_base_frame=drop_base_frame,
@@ -2562,6 +2678,10 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # EMA teacher update: update once per optimizer step (sync_gradients=True).
+                    if accelerator.sync_gradients and prior_lora_ema is not None:
+                        prior_lora_ema.update(accelerator.unwrap_model(network))
 
                 keys_scaled, mean_norm, maximum_norm = None, None, None
                 if args.scale_weight_norms and accelerator.sync_gradients:
@@ -3175,6 +3295,21 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         choices=["image", "console"],
         help="show timesteps in image or console, and return to console / タイムステップを画像またはコンソールに表示し、コンソールに戻る",
+    )
+
+    # loss settings
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "huber"],
+        help="Target loss type (default: mse). Use 'huber' for boundary robustness / 目標損失の種類（デフォルト: mse）。",
+    )
+    parser.add_argument(
+        "--loss_delta",
+        type=float,
+        default=1.0,
+        help="Huber delta (only used when --loss_type huber). Default: 1.0.",
     )
 
     # mask loss settings

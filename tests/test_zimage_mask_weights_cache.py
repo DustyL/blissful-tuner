@@ -32,7 +32,9 @@ class TestZImageMaskWeightsCaching(unittest.TestCase):
                 self.assertEqual(len(mask_keys), 1)
 
                 loaded_mask = f.get_tensor(mask_keys[0])
-                self.assertEqual(loaded_mask.dtype, torch.float32)
+                # Mask weights are bounded [0,1] and originate from 8-bit masks, so caches store them as float16
+                # to reduce disk size / I/O.
+                self.assertEqual(loaded_mask.dtype, torch.float16)
                 self.assertEqual(tuple(loaded_mask.shape), tuple(mask_weights.shape))
 
 

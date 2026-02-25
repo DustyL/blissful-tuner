@@ -20,6 +20,70 @@ from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = BlissfulLogger(__name__, "green")
 
+# Cache-time mask preprocessing parameters.
+#
+# Rationale: Non-linear transforms (gamma/min_weight) do NOT commute with area downsampling.
+# If we want "apply gamma/min_weight at pixel resolution, then downsample to latent space",
+# we need cache-time knobs so users can bake the exact math into the cache.
+CACHE_MASK_GAMMA: float = 1.0
+CACHE_MASK_MIN_WEIGHT: float = 0.0
+
+
+def set_cache_mask_transform_args(args: argparse.Namespace) -> None:
+    """Configure cache-time mask preprocessing (gamma/min_weight) from CLI args."""
+    global CACHE_MASK_GAMMA, CACHE_MASK_MIN_WEIGHT
+
+    gamma = float(getattr(args, "cache_mask_gamma", 1.0))
+    min_weight = float(getattr(args, "cache_mask_min_weight", 0.0))
+
+    if gamma <= 0:
+        raise ValueError("--cache_mask_gamma must be > 0")
+    if min_weight < 0 or min_weight >= 1.0:
+        raise ValueError("--cache_mask_min_weight must be in range [0, 1)")
+
+    prev = (CACHE_MASK_GAMMA, CACHE_MASK_MIN_WEIGHT)
+    CACHE_MASK_GAMMA = gamma
+    CACHE_MASK_MIN_WEIGHT = min_weight
+
+    if (gamma != 1.0 or min_weight != 0.0) and (gamma, min_weight) != prev:
+        logger.info(
+            "Baking cache-time mask transforms BEFORE latent downsample: "
+            f"--cache_mask_gamma={gamma}, --cache_mask_min_weight={min_weight}. "
+            "If you already baked these into your latents, keep training-time --mask_gamma=1.0 and --mask_min_weight=0.0 "
+            "to avoid double application."
+        )
+
+
+def apply_cache_mask_transforms(
+    mask: torch.Tensor,
+    *,
+    cache_mask_gamma: float | None = None,
+    cache_mask_min_weight: float | None = None,
+) -> torch.Tensor:
+    """Apply cache-time mask gamma/min_weight in float32, returning a clamped [0,1] tensor."""
+    gamma = CACHE_MASK_GAMMA if cache_mask_gamma is None else float(cache_mask_gamma)
+    min_weight = CACHE_MASK_MIN_WEIGHT if cache_mask_min_weight is None else float(cache_mask_min_weight)
+
+    if gamma <= 0:
+        raise ValueError("--cache_mask_gamma must be > 0")
+    if min_weight < 0 or min_weight >= 1.0:
+        raise ValueError("--cache_mask_min_weight must be in range [0, 1)")
+
+    if not mask.is_floating_point():
+        mask = mask.float()
+    if mask.dtype != torch.float32:
+        mask = mask.to(dtype=torch.float32)
+
+    # Clamp first to prevent NaNs for fractional gamma if any rogue values slip in.
+    mask = mask.clamp(0.0, 1.0)
+
+    if gamma != 1.0:
+        mask = mask**gamma
+    if min_weight > 0.0:
+        mask = mask * (1.0 - min_weight) + min_weight
+
+    return mask.clamp(0.0, 1.0)
+
 
 def show_image(
     image: Union[list[Union[Image.Image, np.ndarray], Union[Image.Image, np.ndarray]]],
@@ -219,15 +283,23 @@ def preprocess_contents(batch: list[ItemInfo]) -> tuple[int, int, torch.Tensor]:
                 item_contents[i] = c[..., :3]  # remove alpha channel from content
 
                 alpha = c[..., 3]  # extract alpha channel
-                mask_image = Image.fromarray(alpha, mode="L")
+                mask_f = alpha.astype(np.float32) / 255.0  # [0,1] float32 at bucket resolution
+
+                # Apply cache-time preprocessing BEFORE downsampling (non-linear ops don't commute with averaging).
+                if CACHE_MASK_GAMMA != 1.0:
+                    mask_f = mask_f**CACHE_MASK_GAMMA
+                if CACHE_MASK_MIN_WEIGHT > 0.0:
+                    mask_f = mask_f * (1.0 - CACHE_MASK_MIN_WEIGHT) + CACHE_MASK_MIN_WEIGHT
+                mask_f = np.clip(mask_f, 0.0, 1.0)
+
+                mask_image = Image.fromarray(mask_f, mode="F")
                 width, height = mask_image.size
-                mask_image = mask_image.resize((width // 8, height // 8), Image.LANCZOS)
-                mask_image = np.array(mask_image)  # PIL to numpy, HWC
-                mask_image = torch.from_numpy(mask_image).float() / 255.0  # 0 to 1.0, HWC
-                mask_image = mask_image.squeeze(-1)  # HWC -> HW
-                mask_image = mask_image.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # HW -> 111HW (BCFHW)
-                mask_image = mask_image.to(torch.float32)
-                content_mask = mask_image
+                # Downsample alpha mask to latent resolution (stride=8).
+                # Use BOX (area average) to avoid Lanczos ringing on stepped/binary masks.
+                mask_image = mask_image.resize((width // 8, height // 8), Image.BOX)
+                mask_f = np.array(mask_image, dtype=np.float32)  # PIL -> numpy float32, already [0,1]
+                mask_t = torch.from_numpy(mask_f).clamp_(0.0, 1.0)  # HW
+                content_mask = mask_t.unsqueeze(0).unsqueeze(0).unsqueeze(0).to(torch.float32)  # 111HW (BCFHW)
             else:
                 content_mask = None
 
@@ -290,6 +362,7 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
 
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace, supports_alpha: bool = False):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
+    set_cache_mask_transform_args(args)
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
@@ -407,6 +480,20 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="debug mode: not interactive, number of images to show for each dataset",
+    )
+    parser.add_argument(
+        "--cache_mask_gamma",
+        type=float,
+        default=1.0,
+        help="Cache-time mask gamma applied in pixel space BEFORE downsampling to latent space. "
+        "Use 1.0 to disable. If you bake this into your cache, keep training-time --mask_gamma=1.0.",
+    )
+    parser.add_argument(
+        "--cache_mask_min_weight",
+        type=float,
+        default=0.0,
+        help="Cache-time mask min_weight floor applied in pixel space BEFORE downsampling to latent space. "
+        "Use 0.0 to disable. If you bake this into your cache, keep training-time --mask_min_weight=0.0.",
     )
     parser.add_argument(
         "--disable_cudnn_backend", action="store_true", help="Disable CUDNN PyTorch backend. May be useful for AMD GPUs."

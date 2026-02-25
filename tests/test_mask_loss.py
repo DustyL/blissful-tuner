@@ -286,6 +286,32 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         self.assertEqual(out.dtype, torch.float32)
         self.assertEqual(out.ndim, 0)
 
+    def test_bfloat16_loss_accepts_float16_mask_weights(self) -> None:
+        """Regression: cache may store masks as float16 even when training uses bfloat16."""
+        loss = torch.ones(1, 1, 1, 2, 2, dtype=torch.bfloat16)
+        mask_weights = torch.full((1, 1, 2, 2), 0.5, dtype=torch.float16)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        out = apply_masked_loss_with_prior(
+            loss,
+            mask_weights,
+            prior_loss_unreduced=None,
+            args=args,
+            layout="video",
+        )
+        self.assertTrue(torch.isfinite(out).all().item())
+        self.assertEqual(out.dtype, torch.float32)
+        # Weighted mean of all-ones loss with constant 0.5 mask is still 1.0
+        self.assertTrue(torch.allclose(out, torch.tensor(1.0), rtol=0, atol=1e-6))
+
     def test_layered_layout_matches_apply_masked_loss(self) -> None:
         loss = torch.tensor([[[[[1.0]]], [[[3.0]]]]])  # (B=1,L=2,C=1,H=1,W=1)
         mask_weights = torch.tensor([[[[[0.0]], [[1.0]], [[0.5]]]]])  # (B=1,1,F=3,H=1,W=1)
@@ -427,6 +453,78 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         expected = torch.tensor(1.05 + 5.0)
         self.assertTrue(torch.allclose(result, expected, rtol=0, atol=1e-5))
 
+    def test_prior_weight_per_sample_scales_per_sample_prior_term(self) -> None:
+        """Per-sample prior weights should scale the per-sample prior term before batch mean."""
+        # Two samples with different prior losses; only sample 0 should receive prior weight.
+        loss = torch.tensor(
+            [
+                [[[[1.0, 999.0]]]],  # sample 0: target pixel = 1.0
+                [[[[3.0, 999.0]]]],  # sample 1: target pixel = 3.0
+            ],
+            dtype=torch.float32,
+        )  # (B=2,C=1,F=1,H=1,W=2)
+        prior_loss = torch.tensor(
+            [
+                [[[[10.0, 10.0]]]],  # sample 0 prior value
+                [[[[20.0, 20.0]]]],  # sample 1 prior value
+            ],
+            dtype=torch.float32,
+        )
+        mask_weights = torch.tensor(
+            [
+                [[[1.0, 0.0]]],  # sample 0: first pixel target, second pixel prior
+                [[[1.0, 0.0]]],  # sample 1: same split
+            ],
+            dtype=torch.float32,
+        )  # (B=2,F=1,H=1,W=2)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,  # ignored when prior_weight_per_sample is provided
+            prior_mask_threshold=0.1,
+            normalize_per_sample=True,
+        )
+
+        prior_weight_per_sample = torch.tensor([1.0, 0.0], dtype=torch.float32)
+        out = apply_masked_loss_with_prior(
+            loss,
+            mask_weights,
+            prior_loss_unreduced=prior_loss,
+            prior_weight_per_sample=prior_weight_per_sample,
+            args=args,
+            layout="video",
+        )
+
+        # Target term: mean([1.0, 3.0]) = 2.0
+        # Prior term:  mean([10.0*1.0, 20.0*0.0]) = 5.0
+        self.assertTrue(torch.allclose(out, torch.tensor(7.0), rtol=0, atol=1e-6))
+
+    def test_prior_weight_per_sample_requires_normalize_per_sample(self) -> None:
+        loss = torch.ones(1, 1, 1, 1, 1, dtype=torch.float32)
+        prior_loss = torch.ones_like(loss)
+        mask_weights = torch.ones(1, 1, 1, 1, dtype=torch.float32)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=0.1,
+            normalize_per_sample=False,
+        )
+
+        with self.assertRaises(ValueError, msg="requires --normalize_per_sample"):
+            apply_masked_loss_with_prior(
+                loss,
+                mask_weights,
+                prior_loss_unreduced=prior_loss,
+                prior_weight_per_sample=torch.tensor([1.0]),
+                args=args,
+                layout="video",
+            )
+
     def test_all_zero_mask_emits_warning(self) -> None:
         """V1: All-zero masks should warn that training signal is zero."""
         loss = torch.ones(1, 1, 1, 1, 1, dtype=torch.float32)
@@ -446,6 +544,143 @@ class TestMaskedLossWithPrior(unittest.TestCase):
 
         self.assertTrue(any("All-zero mask" in m for m in cm.output), cm.output)
         self.assertTrue(torch.allclose(result, torch.tensor(0.0), atol=1e-6))
+
+    def test_mask_weights_are_clamped_before_gamma(self) -> None:
+        """Ensure out-of-range masks can't produce NaNs with fractional gamma."""
+        loss = torch.tensor([[[[[1.0, 3.0]]]]], dtype=torch.float32)  # (B=1,C=1,F=1,H=1,W=2)
+        # Out of range values: negative + >1.0. Should clamp to [0,1] before gamma.
+        mask_weights = torch.tensor([[[[-0.5, 2.0]]]], dtype=torch.float32)  # (B=1,F=1,H=1,W=2)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=0.5,  # fractional gamma would NaN on negative values without clamping
+            mask_min_weight=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
+        self.assertTrue(torch.isfinite(out).all().item())
+        # After clamp: mask -> [0,1], gamma keeps [0,1], weighted mean -> 3.0
+        self.assertTrue(torch.allclose(out, torch.tensor(3.0), rtol=0, atol=1e-6))
+
+    def test_prior_sample_mask_gates_threshold_overlap_and_denominator(self) -> None:
+        """Per-sample prior gating must happen before threshold-mode overlap prevention."""
+        # Two samples, same raw mask. We gate prior ON for sample 0, OFF for sample 1.
+        # Threshold mode + mask_min_weight makes overlap-prevention observable:
+        #   - With prior active: background is removed from target mask.
+        #   - With prior gated off: background keeps its min_weight contribution.
+        loss = torch.tensor(
+            [
+                [[[[1.0, 5.0]]]],  # sample 0
+                [[[[1.0, 5.0]]]],  # sample 1
+            ],
+            dtype=torch.float32,
+        )  # (B=2,C=1,F=1,H=1,W=2)
+        prior_loss = torch.ones_like(loss) * 10.0
+        mask_weights = torch.tensor(
+            [
+                [[[1.0, 0.0]]],
+                [[[1.0, 0.0]]],
+            ],
+            dtype=torch.float32,
+        )  # (B=2,F=1,H=1,W=2)
+        prior_sample_mask = torch.tensor([True, False])
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.2,
+            mask_area_scale_beta=0.0,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=0.1,
+            normalize_per_sample=True,
+        )
+
+        out = apply_masked_loss_with_prior(
+            loss,
+            mask_weights,
+            prior_loss_unreduced=prior_loss,
+            prior_sample_mask=prior_sample_mask,
+            args=args,
+            layout="video",
+        )
+
+        # Sample 0 (prior ON): target uses only first pixel -> 1.0. Prior uses second pixel -> 10.0.
+        # Sample 1 (prior OFF): target uses min_weight background -> (1 + 5*0.2) / (1 + 0.2) = 2/1.2.
+        # Per-sample mean: L_target = (1 + 2/1.2)/2, L_prior = (10 + 0)/2
+        expected = torch.tensor(((1.0 + (2.0 / 1.2)) / 2.0) + 5.0, dtype=torch.float32)
+        self.assertTrue(torch.allclose(out, expected, rtol=0, atol=1e-5))
+
+    def test_mask_area_scale_beta_scales_tiny_masks(self) -> None:
+        """mask_area_scale_beta should scale L_target by (mask_mean ** beta)."""
+        loss = torch.ones(1, 1, 1, 1, 4, dtype=torch.float32) * 2.0  # (B=1,C=1,F=1,H=1,W=4)
+        mask_weights = torch.tensor([[[[1.0, 1.0, 0.0, 0.0]]]], dtype=torch.float32)  # mask_mean=0.5
+
+        args_no_scale = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_area_scale_beta=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+        args_scale = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_area_scale_beta=1.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        out_no_scale = apply_masked_loss_with_prior(
+            loss, mask_weights, prior_loss_unreduced=None, args=args_no_scale, layout="video"
+        )
+        out_scale = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args_scale, layout="video")
+
+        # Without scaling: strict weighted mean over masked pixels => 2.0
+        self.assertTrue(torch.allclose(out_no_scale, torch.tensor(2.0), rtol=0, atol=1e-6))
+        # With beta=1: scaled by mask_mean=0.5 => 1.0
+        self.assertTrue(torch.allclose(out_scale, torch.tensor(1.0), rtol=0, atol=1e-6))
+
+    def test_mask_area_scale_beta_is_per_sample_when_normalize_per_sample(self) -> None:
+        # Sample 0: mask_mean=0.5, per-sample target mean=2.0
+        # Sample 1: mask_mean=0.25, per-sample target mean=4.0
+        # With beta=1 and per-sample normalization, scaled per-sample losses become:
+        #   s0: 2.0 * 0.5 = 1.0
+        #   s1: 4.0 * 0.25 = 1.0
+        # => mean = 1.0
+        loss = torch.tensor(
+            [
+                [[[[2.0, 2.0, 2.0, 2.0]]]],
+                [[[[4.0, 4.0, 4.0, 4.0]]]],
+            ],
+            dtype=torch.float32,
+        )  # (B=2,C=1,F=1,H=1,W=4)
+        mask_weights = torch.tensor(
+            [
+                [[[1.0, 1.0, 0.0, 0.0]]],  # mean=0.5
+                [[[1.0, 0.0, 0.0, 0.0]]],  # mean=0.25
+            ],
+            dtype=torch.float32,
+        )  # (B=2,F=1,H=1,W=4)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_area_scale_beta=1.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=True,
+        )
+
+        out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
+        self.assertTrue(torch.allclose(out, torch.tensor(1.0), rtol=0, atol=1e-6))
 
 
 class TestValidateMaskLossArgs(unittest.TestCase):
@@ -473,6 +708,20 @@ class TestValidateMaskLossArgs(unittest.TestCase):
         # Should not raise
         validate_mask_loss_args(args)
 
+    def test_raises_error_for_negative_mask_area_scale_beta(self) -> None:
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=0,
+            mask_area_scale_beta=-0.1,
+        )
+
+        with self.assertRaises(ValueError, msg="--mask_area_scale_beta must be >= 0"):
+            validate_mask_loss_args(args)
+
     def test_raises_error_for_even_mask_blur_kernel_size(self) -> None:
         args = argparse.Namespace(
             use_mask_loss=True,
@@ -485,6 +734,25 @@ class TestValidateMaskLossArgs(unittest.TestCase):
 
         with self.assertRaises(ValueError, msg="odd (or 0 to disable)"):
             validate_mask_loss_args(args)
+
+    def test_prior_decay_schedule_requires_normalize_per_sample(self) -> None:
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=None,
+            prior_decay_schedule="cosine",
+            prior_decay_timestep_start=300.0,
+            prior_decay_warmup_ratio=0.0,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            normalize_per_sample=False,
+        )
+
+        with self.assertRaises(ValueError, msg="requires --normalize_per_sample"):
+            validate_mask_loss_args(args)
+
+        args.normalize_per_sample = True
+        validate_mask_loss_args(args)
 
 
 if __name__ == "__main__":

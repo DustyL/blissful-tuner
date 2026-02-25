@@ -36,6 +36,7 @@ from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_e
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae
 import musubi_tuner.hunyuan_model.vae as vae_module
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
@@ -1080,7 +1081,14 @@ class FineTuningTrainer:
                     # flow matching loss
                     target = noise - latents
 
-                    loss = torch.nn.functional.mse_loss(model_pred.to(dit_dtype), target, reduction="none")
+                    loss_type = getattr(args, "loss_type", "mse")
+                    loss_delta = getattr(args, "loss_delta", 1.0)
+                    loss = compute_unreduced_target_loss(
+                        model_pred.to(dit_dtype),
+                        target.to(dit_dtype),
+                        loss_type=loss_type,
+                        loss_delta=loss_delta,
+                    )
 
                     if weighting is not None:
                         loss = loss * weighting
@@ -1506,6 +1514,19 @@ def setup_parser() -> argparse.ArgumentParser:
         default="none",
         choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
         help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "huber"],
+        help="Target loss type (default: mse). Use 'huber' for robustness to boundary spikes / 目標損失の種類（デフォルト: mse）。",
+    )
+    parser.add_argument(
+        "--loss_delta",
+        type=float,
+        default=1.0,
+        help="Huber delta (only used when --loss_type huber). Default: 1.0.",
     )
     parser.add_argument(
         "--logit_mean",

@@ -1459,9 +1459,10 @@ def generate_with_one_frame_inference(
     def get_latent_mask(mask_image: Image.Image) -> torch.Tensor:
         if mask_image.mode != "L":
             mask_image = mask_image.convert("L")
-        mask_image = mask_image.resize((width // 8, height // 8), Image.LANCZOS)
-        mask_image = np.array(mask_image)  # PIL to numpy, HWC
-        mask_image = torch.from_numpy(mask_image).float() / 255.0  # 0 to 1.0, HWC
+        # Downsample to latent resolution (stride=8). Use BOX (area average) to avoid Lanczos ringing.
+        mask_image = mask_image.resize((width // 8, height // 8), Image.BOX)
+        mask_image = np.array(mask_image, dtype=np.float32) / 255.0  # PIL -> numpy, [0,1]
+        mask_image = torch.from_numpy(mask_image).clamp_(0.0, 1.0)
         mask_image = mask_image.squeeze(-1)  # HWC -> HW
         mask_image = mask_image.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # HW -> 111HW (BCFHW)
         mask_image = mask_image.to(torch.float32)
