@@ -713,6 +713,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
     ignore_for_config = ["patch_size", "cross_attn_norm", "qk_norm", "text_dim", "window_size"]
     _no_split_modules = ["WanAttentionBlock"]
+    _FREQS_CACHE_MAX_SIZE = 512
 
     # @register_to_config
     def __init__(
@@ -995,6 +996,16 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
                 if f_indices is not None:
                     fhw = tuple(list(fhw) + f_indices[i])  # add f_indices to fhw for cache key
                 if fhw not in self.freqs_fhw:
+                    if len(self.freqs_fhw) >= self._FREQS_CACHE_MAX_SIZE:
+                        oldest_key = next(iter(self.freqs_fhw))
+                        del self.freqs_fhw[oldest_key]
+                        if not getattr(self, "_freqs_eviction_warned", False):
+                            logger.warning(
+                                f"RoPE frequency cache reached {self._FREQS_CACHE_MAX_SIZE} entries; "
+                                "evicting oldest. This may indicate unusually high bucket diversity "
+                                "(or f_indices variation expanding the keyspace)."
+                            )
+                            self._freqs_eviction_warned = True
                     c = self.dim // self.num_heads // 2
                     self.freqs_fhw[fhw] = calculate_freqs_i(fhw, c, self.freqs, None if f_indices is None else f_indices[i])
                 freqs_list.append(self.freqs_fhw[fhw])
@@ -1015,13 +1026,22 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten())).to(self.e_dtype)
             e0 = self.time_projection(e).unflatten(1, (6, self.dim)).to(self.e_dtype, copy=False)
         else:  # For Wan2.2
-            if t.dim() == 1:
-                # t = t.expand(t.size(0), seq_len) # this should be a bug in the original code
-                t = t.unsqueeze(1).expand(-1, seq_len)
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len))).to(self.e_dtype)
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim)).to(self.e_dtype)
+            compact = getattr(self, "compact_time_embedding", True)
+            if compact and t.dim() == 1:
+                # Compact path: compute embedding for [B] values, keep as [B, 1, dim].
+                # Broadcasting handles per-token operations in attention blocks and head.
+                # Saves multi-GiB of VRAM for 14B models vs full [B, seq_len, dim] expansion.
+                e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t)).to(self.e_dtype, copy=False)
+                e = e.unsqueeze(1)  # [B, dim] -> [B, 1, dim]
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim)).to(self.e_dtype, copy=False)
+            else:
+                # Full expansion path: per-token timesteps (I2V/TI2V with expand_timesteps) or compact disabled.
+                if t.dim() == 1:
+                    t = t.unsqueeze(1).expand(-1, seq_len)
+                bt = t.size(0)
+                t = t.flatten()
+                e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len))).to(self.e_dtype)
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim)).to(self.e_dtype)
         return e, e0
 
     def blissful_optimize(self):
