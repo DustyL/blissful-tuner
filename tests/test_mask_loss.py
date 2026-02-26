@@ -682,6 +682,25 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
         self.assertTrue(torch.allclose(out, torch.tensor(1.0), rtol=0, atol=1e-6))
 
+    def test_mask_area_scale_beta_uses_raw_mask_mean_not_processed(self) -> None:
+        # If mask_min_weight > 0, the processed mask mean is inflated even for tiny masks.
+        # --mask_area_scale_beta should measure geometric footprint (raw mask mean), not post-floor mean.
+        loss = torch.ones(1, 1, 1, 1, 4, dtype=torch.float32) * 2.0  # constant loss
+        mask_weights = torch.tensor([[[[1.0, 0.0, 0.0, 0.0]]]], dtype=torch.float32)  # raw mean = 0.25
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.2,  # would inflate processed mean to 0.4 if used incorrectly
+            mask_area_scale_beta=1.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
+        self.assertTrue(torch.allclose(out, torch.tensor(0.5), rtol=0, atol=1e-6))
+
 
 class TestValidateMaskLossArgs(unittest.TestCase):
     def test_raises_error_for_prior_without_mask_loss(self) -> None:

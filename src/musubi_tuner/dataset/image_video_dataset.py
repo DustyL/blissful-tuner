@@ -398,6 +398,13 @@ class ItemInfo:
         # np.ndarray for video/image masks
         self.mask_content: Optional[np.ndarray] = None
 
+        # Cache-time mask preprocessing parameters (optional).
+        #
+        # These are written into latent cache metadata for transparency and training-time safety checks.
+        # Caching scripts should set these on ItemInfo instances before calling save_latent_cache_*().
+        self.cache_mask_gamma: float | None = None
+        self.cache_mask_min_weight: float | None = None
+
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
@@ -760,16 +767,13 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
 
     # Record cache-time mask preprocessing parameters for transparency and training-time safety checks.
     #
-    # Note: these are globals set by cache scripts via `musubi_tuner.cache_latents.set_cache_mask_transform_args(args)`.
-    # Import is runtime-local to avoid circular imports (cache_latents imports this module).
-    try:
-        import musubi_tuner.cache_latents as cache_latents  # noqa: PLC0415
-
-        metadata["cache_mask_gamma"] = repr(float(getattr(cache_latents, "CACHE_MASK_GAMMA", 1.0)))
-        metadata["cache_mask_min_weight"] = repr(float(getattr(cache_latents, "CACHE_MASK_MIN_WEIGHT", 0.0)))
-    except Exception:  # noqa: BLE001
-        # Cache metadata is optional; older/foreign caches may omit it.
-        pass
+    # Store as compact, human-friendly floats (still parseable by float()).
+    gamma = getattr(item_info, "cache_mask_gamma", None)
+    min_weight = getattr(item_info, "cache_mask_min_weight", None)
+    gamma = 1.0 if gamma is None else float(gamma)
+    min_weight = 0.0 if min_weight is None else float(min_weight)
+    metadata["cache_mask_gamma"] = format(gamma, ".6g")
+    metadata["cache_mask_min_weight"] = format(min_weight, ".6g")
 
     for key, value in sd.items():
         # 1) Ensure contiguous FIRST to avoid overlapping memory issues on expanded views

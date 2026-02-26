@@ -485,13 +485,13 @@ class NetworkTrainer:
     @contextmanager
     def prior_model_context(self, network):
         """
-                Context manager to temporarily disable LoRA for computing prior predictions.
+        Context manager to temporarily disable LoRA for computing prior predictions.
 
-                Design decision: Keep model in train() mode during teacher forward.
-                - Matches OneTrainer behavior
-                - DiT models (WAN, FLUX, etc.) typically have no dropout, so train/eval makes no difference
-                - If a future model has dropout, train mode gives "realistic" teacher predictions
-                - If you want deterministic teacher targets, use --prior_teacher_eval (toggles transformer.eval() around the teacher pass)
+        Design decision: Keep model in train() mode during teacher forward.
+        - Matches OneTrainer behavior
+        - DiT models (WAN, FLUX, etc.) typically have no dropout, so train/eval makes no difference
+        - If a future model has dropout, train mode gives "realistic" teacher predictions
+        - If you want deterministic teacher targets, use --prior_teacher_eval (toggles transformer.eval() around the teacher pass)
 
         Usage:
             with self.prior_model_context(network):
@@ -2489,6 +2489,7 @@ class NetworkTrainer:
 
                     # Compute prior prediction if prior preservation is enabled
                     prior_pred = None
+                    prior_teacher_uses_ema = False
                     prior_preservation_weight = getattr(args, "prior_preservation_weight", 0.0)
                     mask_weights = batch.get("mask_weights")
 
@@ -2651,12 +2652,14 @@ class NetworkTrainer:
 
                     layout = "layered" if getattr(args, "is_layered", False) else "video"
                     drop_base_frame = bool(getattr(args, "remove_first_image_from_target", False)) if layout == "layered" else False
+                    mask_loss_stats = {} if len(accelerator.trackers) > 0 and bool(getattr(args, "use_mask_loss", False)) else None
                     loss = apply_masked_loss_with_prior(
                         loss,
                         mask_weights,
                         prior_loss_unreduced=prior_loss_unreduced,
                         prior_sample_mask=prior_sample_mask,
                         prior_weight_per_sample=prior_weight_per_sample,
+                        stats=mask_loss_stats,
                         args=args,
                         layout=layout,
                         drop_base_frame=drop_base_frame,
@@ -2742,6 +2745,51 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
+                    # Extra diagnostics for mask-weighted loss / prior preservation runs.
+                    #
+                    # These are intentionally lightweight scalars (no images/histograms) so they are safe to log
+                    # every step and make "physics validation" runs debuggable from TensorBoard/W&B.
+                    if bool(getattr(args, "use_mask_loss", False)):
+                        # Masked-loss internal terms and mask coverage summaries (filled by mask_loss.py).
+                        if mask_loss_stats:
+                            for k, v in mask_loss_stats.items():
+                                if isinstance(v, torch.Tensor):
+                                    logs[f"masked_loss/{k}"] = float(v.detach().float().item())
+                            # Quick sanity ratios: are we dominated by target or prior?
+                            if "target" in mask_loss_stats and "prior" in mask_loss_stats:
+                                t = float(mask_loss_stats["target"].detach().float().item())
+                                p = float(mask_loss_stats["prior"].detach().float().item())
+                                denom = t + p + 1e-8
+                                logs["masked_loss/target_fraction"] = t / denom
+                                logs["masked_loss/prior_fraction"] = p / denom
+
+                        # Timestep stats (helps reason about prior schedule / gating behavior).
+                        if isinstance(timesteps, torch.Tensor) and timesteps.numel() > 0:
+                            t = timesteps.detach().to(dtype=torch.float32)
+                            logs["timestep/mean"] = float(t.mean().item())
+                            logs["timestep/min"] = float(t.min().item())
+                            logs["timestep/max"] = float(t.max().item())
+
+                        # Prior preservation control-plane telemetry (teacher + scheduling).
+                        prior_weight = float(getattr(args, "prior_preservation_weight", 0.0))
+                        if prior_weight > 0:
+                            logs["prior/teacher_ran"] = float(prior_pred is not None)
+                            logs["prior/teacher_mode_ema_used"] = float(prior_teacher_uses_ema)
+
+                            if prior_sample_mask is not None and isinstance(prior_sample_mask, torch.Tensor):
+                                logs["prior/gate_frac"] = float(prior_sample_mask.detach().to(dtype=torch.float32).mean().item())
+                            else:
+                                # No per-sample gating → either prior is applied to all samples (teacher ran),
+                                # or prior was skipped entirely (e.g., no prior region).
+                                logs["prior/gate_frac"] = 1.0 if prior_pred is not None else 0.0
+
+                            if prior_weight_per_sample is not None and isinstance(prior_weight_per_sample, torch.Tensor):
+                                w = prior_weight_per_sample.detach().to(dtype=torch.float32)
+                                logs["prior/w_prior_mean"] = float(w.mean().item())
+                                logs["prior/w_prior_min"] = float(w.min().item())
+                                logs["prior/w_prior_max"] = float(w.max().item())
+                            else:
+                                logs["prior/w_prior_mean"] = float(prior_weight)
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:

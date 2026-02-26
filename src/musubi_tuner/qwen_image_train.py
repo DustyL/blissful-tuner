@@ -677,10 +677,12 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     # We use apply_masked_loss_with_prior for API consistency; it handles None prior_loss gracefully.
                     layout = "layered" if getattr(args, "is_layered", False) else "video"
                     drop_base_frame = bool(getattr(args, "remove_first_image_from_target", False)) if layout == "layered" else False
+                    mask_loss_stats = {} if len(accelerator.trackers) > 0 and bool(getattr(args, "use_mask_loss", False)) else None
                     loss = apply_masked_loss_with_prior(
                         loss,
                         batch.get("mask_weights", None),
                         prior_loss_unreduced=None,  # Full fine-tuning: no prior preservation
+                        stats=mask_loss_stats,
                         args=args,
                         layout=layout,
                         drop_base_frame=drop_base_frame,
@@ -755,6 +757,15 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, None, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
+                    if bool(getattr(args, "use_mask_loss", False)) and mask_loss_stats:
+                        for k, v in mask_loss_stats.items():
+                            if isinstance(v, torch.Tensor):
+                                logs[f"masked_loss/{k}"] = float(v.detach().float().item())
+                    if isinstance(timesteps, torch.Tensor) and timesteps.numel() > 0:
+                        t = timesteps.detach().to(dtype=torch.float32)
+                        logs["timestep/mean"] = float(t.mean().item())
+                        logs["timestep/min"] = float(t.min().item())
+                        logs["timestep/max"] = float(t.max().item())
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:

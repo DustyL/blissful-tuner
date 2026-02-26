@@ -1,5 +1,6 @@
 import argparse
 import os
+from dataclasses import dataclass
 from rich_argparse import RichHelpFormatter
 from typing import Optional, Union
 from rich.traceback import install as install_rich_tracebacks
@@ -20,19 +21,20 @@ from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = BlissfulLogger(__name__, "green")
 
-# Cache-time mask preprocessing parameters.
-#
-# Rationale: Non-linear transforms (gamma/min_weight) do NOT commute with area downsampling.
-# If we want "apply gamma/min_weight at pixel resolution, then downsample to latent space",
-# we need cache-time knobs so users can bake the exact math into the cache.
-CACHE_MASK_GAMMA: float = 1.0
-CACHE_MASK_MIN_WEIGHT: float = 0.0
+
+@dataclass(frozen=True)
+class CacheMaskTransform:
+    gamma: float = 1.0
+    min_weight: float = 0.0
 
 
-def set_cache_mask_transform_args(args: argparse.Namespace) -> None:
-    """Configure cache-time mask preprocessing (gamma/min_weight) from CLI args."""
-    global CACHE_MASK_GAMMA, CACHE_MASK_MIN_WEIGHT
+def get_cache_mask_transform(args: argparse.Namespace) -> CacheMaskTransform:
+    """Parse cache-time mask preprocessing (gamma/min_weight) from CLI args.
 
+    Rationale: Non-linear transforms (gamma/min_weight) do NOT commute with area downsampling.
+    If we want "apply gamma/min_weight at pixel resolution, then downsample to latent space",
+    we need cache-time knobs so users can bake the exact math into the cache.
+    """
     gamma = float(getattr(args, "cache_mask_gamma", 1.0))
     min_weight = float(getattr(args, "cache_mask_min_weight", 0.0))
 
@@ -41,11 +43,7 @@ def set_cache_mask_transform_args(args: argparse.Namespace) -> None:
     if min_weight < 0 or min_weight >= 1.0:
         raise ValueError("--cache_mask_min_weight must be in range [0, 1)")
 
-    prev = (CACHE_MASK_GAMMA, CACHE_MASK_MIN_WEIGHT)
-    CACHE_MASK_GAMMA = gamma
-    CACHE_MASK_MIN_WEIGHT = min_weight
-
-    if (gamma != 1.0 or min_weight != 0.0) and (gamma, min_weight) != prev:
+    if gamma != 1.0 or min_weight != 0.0:
         logger.info(
             "Baking cache-time mask transforms BEFORE latent downsample: "
             f"--cache_mask_gamma={gamma}, --cache_mask_min_weight={min_weight}. "
@@ -53,16 +51,18 @@ def set_cache_mask_transform_args(args: argparse.Namespace) -> None:
             "to avoid double application."
         )
 
+    return CacheMaskTransform(gamma=gamma, min_weight=min_weight)
+
 
 def apply_cache_mask_transforms(
     mask: torch.Tensor,
     *,
-    cache_mask_gamma: float | None = None,
-    cache_mask_min_weight: float | None = None,
+    cache_mask_gamma: float = 1.0,
+    cache_mask_min_weight: float = 0.0,
 ) -> torch.Tensor:
     """Apply cache-time mask gamma/min_weight in float32, returning a clamped [0,1] tensor."""
-    gamma = CACHE_MASK_GAMMA if cache_mask_gamma is None else float(cache_mask_gamma)
-    min_weight = CACHE_MASK_MIN_WEIGHT if cache_mask_min_weight is None else float(cache_mask_min_weight)
+    gamma = float(cache_mask_gamma)
+    min_weight = float(cache_mask_min_weight)
 
     if gamma <= 0:
         raise ValueError("--cache_mask_gamma must be > 0")
@@ -267,7 +267,12 @@ def show_datasets(
             batch_index += 1
 
 
-def preprocess_contents(batch: list[ItemInfo]) -> tuple[int, int, torch.Tensor]:
+def preprocess_contents(
+    batch: list[ItemInfo],
+    *,
+    cache_mask_gamma: float | None = None,
+    cache_mask_min_weight: float | None = None,
+) -> tuple[int, int, torch.Tensor, list[list[Optional[torch.Tensor]]]]:
     # item.content: target image (H, W, C)
     # item.control_content: list of images (H, W, C)
 
@@ -275,6 +280,18 @@ def preprocess_contents(batch: list[ItemInfo]) -> tuple[int, int, torch.Tensor]:
     contents = []
     content_masks: list[list[Optional[torch.Tensor]]] = []
     for item in batch:
+        # Cache-time transforms default to per-item values (set by encode_datasets) when available.
+        item_gamma = (
+            float(cache_mask_gamma)
+            if cache_mask_gamma is not None
+            else float(getattr(item, "cache_mask_gamma", 1.0) or 1.0)
+        )
+        item_min_weight = (
+            float(cache_mask_min_weight)
+            if cache_mask_min_weight is not None
+            else float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0)
+        )
+
         item_contents = item.control_content + [item.content]
 
         item_masks = []
@@ -283,14 +300,15 @@ def preprocess_contents(batch: list[ItemInfo]) -> tuple[int, int, torch.Tensor]:
                 item_contents[i] = c[..., :3]  # remove alpha channel from content
 
                 alpha = c[..., 3]  # extract alpha channel
-                mask_f = alpha.astype(np.float32) / 255.0  # [0,1] float32 at bucket resolution
-
-                # Apply cache-time preprocessing BEFORE downsampling (non-linear ops don't commute with averaging).
-                if CACHE_MASK_GAMMA != 1.0:
-                    mask_f = mask_f**CACHE_MASK_GAMMA
-                if CACHE_MASK_MIN_WEIGHT > 0.0:
-                    mask_f = mask_f * (1.0 - CACHE_MASK_MIN_WEIGHT) + CACHE_MASK_MIN_WEIGHT
-                mask_f = np.clip(mask_f, 0.0, 1.0)
+                # Normalize to [0,1] float32 at bucket resolution, then apply cache-time preprocessing
+                # BEFORE downsampling (non-linear ops don't commute with averaging).
+                mask_t = torch.from_numpy(alpha).to(dtype=torch.float32).div(255.0)
+                mask_t = apply_cache_mask_transforms(
+                    mask_t,
+                    cache_mask_gamma=item_gamma,
+                    cache_mask_min_weight=item_min_weight,
+                )
+                mask_f = mask_t.cpu().numpy().astype(np.float32)  # PIL expects float32 for mode="F"
 
                 mask_image = Image.fromarray(mask_f, mode="F")
                 width, height = mask_image.size
@@ -362,13 +380,16 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
 
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace, supports_alpha: bool = False):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
-    set_cache_mask_transform_args(args)
+    cache_mask_transform = get_cache_mask_transform(args)
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
+            for item in batch:
+                item.cache_mask_gamma = cache_mask_transform.gamma
+                item.cache_mask_min_weight = cache_mask_transform.min_weight
             if not supports_alpha:
                 # make sure content has 3 channels
                 for item in batch:

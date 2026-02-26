@@ -190,7 +190,11 @@ def encode_and_save_batch(
         if item.mask_content is not None:
             mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
             mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
-            mask = cache_latents.apply_cache_mask_transforms(mask)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
 
             lat_h, lat_w = latent.shape[-2:]
             mask = F.interpolate(mask, size=(lat_h, lat_w), mode="area")  # (1, 1, lat_h, lat_w)

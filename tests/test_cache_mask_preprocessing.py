@@ -1,4 +1,3 @@
-import argparse
 import unittest
 
 import numpy as np
@@ -28,30 +27,23 @@ class TestCacheMaskPreprocessing(unittest.TestCase):
 
         item = ItemInfo(item_key="example.png", caption="", original_size=(8, 8), content=rgba)
         item.control_content = []  # preprocess_contents expects a list for image controls
+        item.cache_mask_gamma = 0.7
+        item.cache_mask_min_weight = 0.0
 
-        prev_gamma = cache_latents.CACHE_MASK_GAMMA
-        prev_min_weight = cache_latents.CACHE_MASK_MIN_WEIGHT
-        try:
-            cache_latents.set_cache_mask_transform_args(argparse.Namespace(cache_mask_gamma=0.7, cache_mask_min_weight=0.0))
+        _, _, _, masks = cache_latents.preprocess_contents([item])
+        mask = masks[0][0]
+        self.assertIsNotNone(mask)
 
-            _, _, _, masks = cache_latents.preprocess_contents([item])
-            mask = masks[0][0]
-            self.assertIsNotNone(mask)
+        baked_value = float(mask.item())
 
-            baked_value = float(mask.item())
+        hair = 80.0 / 255.0
+        expected_gamma_before = (hair**0.7) * 0.5  # half hair pixels, half background pixels
+        expected_gamma_after = (hair * 0.5) ** 0.7
 
-            hair = 80.0 / 255.0
-            expected_gamma_before = (hair**0.7) * 0.5  # half hair pixels, half background pixels
-            expected_gamma_after = (hair * 0.5) ** 0.7
-
-            # Baking gamma before downsample should match the "gamma-before" math (and be strictly smaller).
-            self.assertAlmostEqual(baked_value, expected_gamma_before, delta=1e-5)
-            self.assertGreater(expected_gamma_after, expected_gamma_before)
-            self.assertLess(baked_value, expected_gamma_after)
-        finally:
-            cache_latents.set_cache_mask_transform_args(
-                argparse.Namespace(cache_mask_gamma=prev_gamma, cache_mask_min_weight=prev_min_weight)
-            )
+        # Baking gamma before downsample should match the "gamma-before" math (and be strictly smaller).
+        self.assertAlmostEqual(baked_value, expected_gamma_before, delta=1e-5)
+        self.assertGreater(expected_gamma_after, expected_gamma_before)
+        self.assertLess(baked_value, expected_gamma_after)
 
 
 if __name__ == "__main__":

@@ -92,7 +92,11 @@ def encode_and_save_batch(ae: flux2_models.AutoEncoder, batch: List[ItemInfo]):
 
             # Normalize mask from 0-255 to 0-1
             mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
-            mask = cache_latents.apply_cache_mask_transforms(mask)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
 
             # Downsample mask to latent space dimensions using area interpolation
             lat_h, lat_w = target_latent.shape[-2:]

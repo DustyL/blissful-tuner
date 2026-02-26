@@ -109,10 +109,10 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         "--mask_area_scale_beta",
         type=float,
         default=0.0,
-        help="Optional: Scale masked target loss by (mask_mean ** beta) to reduce gradient spikes on tiny masks. "
+        help="Optional: Scale masked target loss by (raw_mask_mean ** beta) to reduce gradient spikes on tiny masks. "
         "beta=0.0 keeps strict weighted-mean normalization (current behavior). "
-        "beta=1.0 approximates global mean behavior (safer but more diluted). "
-        "Try 0.5 as a middle-ground. Default: 0.0.",
+        "beta=1.0 approximates global-mean-like scaling when mask_gamma=1 and mask_min_weight=0. "
+        "Try 0.5 as a middle-ground. Note: raw_mask_mean is computed before gamma/min_weight. Default: 0.0.",
     )
 
     # Prior preservation arguments
@@ -595,6 +595,7 @@ def apply_masked_loss_with_prior(
     prior_loss_unreduced: torch.Tensor | None = None,
     prior_sample_mask: torch.Tensor | None = None,
     prior_weight_per_sample: torch.Tensor | None = None,
+    stats: dict[str, torch.Tensor] | None = None,
     args: argparse.Namespace,
     layout: MaskLossLayout = "video",
     drop_base_frame: bool = False,
@@ -725,8 +726,6 @@ def apply_masked_loss_with_prior(
     target_loss_weighted = loss * mask_processed
 
     mask_area_scale_beta = float(getattr(args, "mask_area_scale_beta", 0.0))
-    if mask_area_scale_beta < 0:
-        raise ValueError("--mask_area_scale_beta must be >= 0")
 
     if normalize_per_sample:
         # Per-sample weighted mean, then average over batch
@@ -738,7 +737,9 @@ def apply_masked_loss_with_prior(
         valid_target = target_weight > 1e-8
         per_sample_target = torch.where(valid_target, target_sum / target_weight.clamp_min(1e-8), torch.zeros_like(target_sum))
         if mask_area_scale_beta > 0.0:
-            area_ratio = mask_processed.mean(dim=reduce_dims, dtype=torch.float32).clamp(0.0, 1.0)
+            # Use RAW mask mean so this reflects geometric coverage, not post gamma/min_weight distortion.
+            # This keeps --mask_area_scale_beta effective even when --mask_min_weight > 0.
+            area_ratio = mask_raw_unblurred.mean(dim=reduce_dims, dtype=torch.float32).clamp(0.0, 1.0)
             per_sample_target = per_sample_target * (area_ratio**mask_area_scale_beta)
         L_target = per_sample_target.mean()
     else:
@@ -753,7 +754,7 @@ def apply_masked_loss_with_prior(
         else:
             L_target = target_loss_weighted.sum(dtype=torch.float32) / target_weight_sum
             if mask_area_scale_beta > 0.0:
-                area_ratio = mask_processed.mean(dtype=torch.float32).clamp(0.0, 1.0)
+                area_ratio = mask_raw_unblurred.mean(dtype=torch.float32).clamp(0.0, 1.0)
                 L_target = L_target * (area_ratio**mask_area_scale_beta)
 
     # === Prior Loss (outside mask) ===
@@ -796,4 +797,31 @@ def apply_masked_loss_with_prior(
         L_prior = loss.new_zeros((), dtype=torch.float32)
 
     # === Combine: region-normalized means + explicit weighting ===
+    if stats is not None:
+        # Loss terms (effective contributions to the combined loss).
+        stats["target"] = L_target.detach()
+        stats["prior"] = L_prior.detach()
+
+        # Mask summaries (compact tensors; use float32 reduction for stability).
+        # These are useful for diagnosing:
+        #   - target/prior area coverage
+        #   - threshold-mode overlap bugs (should be ~0 after overlap prevention)
+        raw_f32 = mask_raw_unblurred.detach().to(dtype=torch.float32)
+        processed_f32 = mask_processed.detach().to(dtype=torch.float32)
+        prior_f32 = prior_mask.detach().to(dtype=torch.float32)
+
+        stats["mask/raw_mean"] = raw_f32.mean()
+        stats["mask/raw_min"] = raw_f32.min()
+        stats["mask/raw_max"] = raw_f32.max()
+
+        stats["mask/processed_mean"] = processed_f32.mean()
+        stats["mask/processed_min"] = processed_f32.min()
+        stats["mask/processed_max"] = processed_f32.max()
+
+        stats["mask/prior_mean"] = prior_f32.mean()
+        stats["mask/prior_min"] = prior_f32.min()
+        stats["mask/prior_max"] = prior_f32.max()
+
+        stats["mask/overlap_mass"] = (processed_f32 * prior_f32).mean()
+
     return L_target + L_prior

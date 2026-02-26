@@ -171,7 +171,11 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
 
             mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
             mask = (mask.float() / 255.0).clamp_(0.0, 1.0)  # Normalize to [0, 1]
-            mask = cache_latents.apply_cache_mask_transforms(mask)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
 
             # Get latent dimensions from target_latent: (C, L, H, W)
             _, lat_l, lat_h, lat_w = target_latent.shape

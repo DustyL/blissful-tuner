@@ -435,13 +435,16 @@ def append_section_idx_to_latent_cache_path(latent_cache_path: str, section_idx:
 
 
 def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace):
-    cache_latents.set_cache_mask_transform_args(args)
+    cache_mask_transform = cache_latents.get_cache_mask_transform(args)
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch  # type: ignore
+            for item in batch:
+                item.cache_mask_gamma = cache_mask_transform.gamma
+                item.cache_mask_min_weight = cache_mask_transform.min_weight
 
             # make sure content has 3 channels
             for item in batch:
