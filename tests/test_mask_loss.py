@@ -701,6 +701,42 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         out = apply_masked_loss_with_prior(loss, mask_weights, prior_loss_unreduced=None, args=args, layout="video")
         self.assertTrue(torch.allclose(out, torch.tensor(0.5), rtol=0, atol=1e-6))
 
+    def test_huber_linear_frac_telemetry_is_region_weighted(self) -> None:
+        loss = torch.zeros(1, 2, 1, 1, 1, dtype=torch.float32)
+        prior_loss_unreduced = torch.zeros_like(loss)
+        mask_weights = torch.full((1, 1, 1, 1), 0.25, dtype=torch.float32)  # processed=0.25, prior=0.75
+
+        target_is_linear = torch.tensor([[[[[True]]], [[[False]]]]], dtype=torch.bool)  # channel-mean = 0.5
+        prior_is_linear = torch.tensor([[[[[True]]], [[[True]]]]], dtype=torch.bool)  # channel-mean = 1.0
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=0,
+            mask_area_scale_beta=0.0,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        stats: dict[str, torch.Tensor] = {}
+        _ = apply_masked_loss_with_prior(
+            loss,
+            mask_weights,
+            prior_loss_unreduced=prior_loss_unreduced,
+            target_huber_is_linear=target_is_linear,
+            prior_huber_is_linear=prior_is_linear,
+            stats=stats,
+            args=args,
+            layout="video",
+        )
+
+        self.assertIn("huber/target_linear_frac", stats)
+        self.assertIn("huber/prior_linear_frac", stats)
+        self.assertTrue(torch.allclose(stats["huber/target_linear_frac"], torch.tensor(0.5), rtol=0, atol=1e-6))
+        self.assertTrue(torch.allclose(stats["huber/prior_linear_frac"], torch.tensor(1.0), rtol=0, atol=1e-6))
+
 
 class TestValidateMaskLossArgs(unittest.TestCase):
     def test_raises_error_for_prior_without_mask_loss(self) -> None:

@@ -596,6 +596,8 @@ def apply_masked_loss_with_prior(
     prior_loss_unreduced: torch.Tensor | None = None,
     prior_sample_mask: torch.Tensor | None = None,
     prior_weight_per_sample: torch.Tensor | None = None,
+    target_huber_is_linear: torch.Tensor | None = None,
+    prior_huber_is_linear: torch.Tensor | None = None,
     stats: dict[str, torch.Tensor] | None = None,
     args: argparse.Namespace,
     layout: MaskLossLayout = "video",
@@ -620,6 +622,11 @@ def apply_masked_loss_with_prior(
         prior_weight_per_sample: Optional per-sample prior weight tensor (shape: (B,)). When provided,
             prior preservation uses per-sample weights (e.g., timestep-adaptive scheduling).
             Requires --normalize_per_sample.
+        target_huber_is_linear: Optional boolean tensor (same shape as `loss`) indicating which
+            elements are in the linear regime when `--loss_type huber` is used (|diff| > delta).
+            Used only for logging/telemetry; does not affect training.
+        prior_huber_is_linear: Optional boolean tensor (same shape as `prior_loss_unreduced`) indicating
+            which elements are in the linear regime for the prior teacher loss. Used only for telemetry.
         args: Namespace with mask_gamma, mask_min_weight, prior_preservation_weight,
               prior_mask_threshold, normalize_per_sample
         layout: "video" or "layered"
@@ -721,6 +728,38 @@ def apply_masked_loss_with_prior(
     if prior_mask_threshold is not None:
         # Prevent target/prior overlap: zero out target where prior applies
         mask_processed = mask_processed * (1 - prior_mask)
+
+    if stats is not None:
+        # Optional telemetry: how often Huber is operating in the linear regime (|diff| > delta).
+        # Call sites compute the boolean tensors cheaply from the UNWEIGHTED Huber loss (or diff),
+        # then we compute region-weighted fractions using the *actual* masks used for training.
+        def _weighted_linear_frac(is_linear: torch.Tensor, region_mask: torch.Tensor) -> torch.Tensor:
+            is_linear = is_linear.to(device=loss.device)
+            if is_linear.ndim == 4 and loss.ndim == 5 and layout == "video":
+                is_linear = is_linear.unsqueeze(2)  # (B,C,H,W) -> (B,C,1,H,W)
+            if is_linear.shape != loss.shape:
+                raise ValueError(
+                    "huber_is_linear tensor must match loss shape after normalization: "
+                    f"is_linear={tuple(is_linear.shape)} loss={tuple(loss.shape)} layout={layout}"
+                )
+
+            # Reduce across channel dimension without expanding the compact mask.
+            channel_dim = 1 if layout == "video" else 2
+            linear_count = is_linear.sum(dim=channel_dim, dtype=torch.float32)
+            linear_frac_per_voxel = linear_count / float(num_channels)
+
+            # Squeeze the singleton channel dim on the compact mask to align with linear_frac_per_voxel.
+            mask_singleton_dim = 1 if layout == "video" else 2
+            region_compact = region_mask.detach().to(dtype=torch.float32).squeeze(mask_singleton_dim)
+
+            denom = region_compact.sum(dtype=torch.float32).clamp_min(1e-8)
+            return (linear_frac_per_voxel * region_compact).sum(dtype=torch.float32) / denom
+
+        if target_huber_is_linear is not None:
+            stats["huber/target_linear_frac"] = _weighted_linear_frac(target_huber_is_linear, mask_processed).detach()
+
+        if prior_huber_is_linear is not None:
+            stats["huber/prior_linear_frac"] = _weighted_linear_frac(prior_huber_is_linear, prior_mask).detach()
 
     # === Target Loss (inside mask) ===
     # Broadcasting: loss (B,C,F,H,W) * compact mask (B,1,F,H,W) → (B,C,F,H,W)

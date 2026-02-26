@@ -2638,13 +2638,24 @@ class NetworkTrainer:
                     )
                     loss_type = getattr(args, "loss_type", "mse")
                     loss_delta = getattr(args, "loss_delta", 1.0)
-                    loss = compute_unreduced_target_loss(
-                        model_pred.to(network_dtype),
-                        target.to(network_dtype),
+                    model_pred_cast = model_pred.to(network_dtype)
+                    target_cast = target.to(network_dtype)
+                    loss_unreduced = compute_unreduced_target_loss(
+                        model_pred_cast,
+                        target_cast,
                         loss_type=loss_type,
                         loss_delta=loss_delta,
                     )
 
+                    log_huber_stats = (
+                        str(loss_type).lower() == "huber"
+                        and len(accelerator.trackers) > 0
+                        and bool(getattr(args, "use_mask_loss", False))
+                    )
+                    huber_threshold = 0.5 * float(loss_delta) * float(loss_delta)
+                    target_huber_is_linear = (loss_unreduced > huber_threshold) if log_huber_stats else None
+
+                    loss = loss_unreduced
                     if weighting is not None:
                         loss = loss * weighting
                     # loss = loss.mean([1, 2, 3])
@@ -2653,15 +2664,17 @@ class NetworkTrainer:
 
                     # Compute prior loss if we have a prior prediction
                     prior_loss_unreduced = None
+                    prior_huber_is_linear = None
                     if prior_pred is not None:
                         # Use the same loss type for both target and prior terms.
                         # This avoids a gradient discontinuity at mask boundaries when --loss_type huber is used.
                         prior_loss_unreduced = compute_unreduced_target_loss(
-                            model_pred.to(network_dtype),
+                            model_pred_cast,
                             prior_pred.to(network_dtype),
                             loss_type=loss_type,
                             loss_delta=loss_delta,
                         )
+                        prior_huber_is_linear = (prior_loss_unreduced > huber_threshold) if log_huber_stats else None
                         if weighting is not None:
                             prior_loss_unreduced = prior_loss_unreduced * weighting
 
@@ -2674,6 +2687,8 @@ class NetworkTrainer:
                         prior_loss_unreduced=prior_loss_unreduced,
                         prior_sample_mask=prior_sample_mask,
                         prior_weight_per_sample=prior_weight_per_sample,
+                        target_huber_is_linear=target_huber_is_linear,
+                        prior_huber_is_linear=prior_huber_is_linear,
                         stats=mask_loss_stats,
                         args=args,
                         layout=layout,

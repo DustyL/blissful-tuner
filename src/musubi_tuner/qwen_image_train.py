@@ -663,13 +663,22 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     )
                     loss_type = getattr(args, "loss_type", "mse")
                     loss_delta = getattr(args, "loss_delta", 1.0)
-                    loss = compute_unreduced_target_loss(
+                    loss_unreduced = compute_unreduced_target_loss(
                         model_pred.to(dit_dtype),
                         target.to(dit_dtype),
                         loss_type=loss_type,
                         loss_delta=loss_delta,
                     )
 
+                    log_huber_stats = (
+                        str(loss_type).lower() == "huber"
+                        and len(accelerator.trackers) > 0
+                        and bool(getattr(args, "use_mask_loss", False))
+                    )
+                    huber_threshold = 0.5 * float(loss_delta) * float(loss_delta)
+                    target_huber_is_linear = (loss_unreduced > huber_threshold) if log_huber_stats else None
+
+                    loss = loss_unreduced
                     if weighting is not None:
                         loss = loss * weighting
 
@@ -682,6 +691,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                         loss,
                         batch.get("mask_weights", None),
                         prior_loss_unreduced=None,  # Full fine-tuning: no prior preservation
+                        target_huber_is_linear=target_huber_is_linear,
                         stats=mask_loss_stats,
                         args=args,
                         layout=layout,
