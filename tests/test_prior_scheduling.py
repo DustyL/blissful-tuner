@@ -40,6 +40,19 @@ class TestPriorScheduling(unittest.TestCase):
         expected = torch.tensor([0.0, 2.0 * 0.1464466, 1.0, 2.0, 2.0], dtype=torch.float32)
         self.assertTrue(torch.allclose(w, expected, rtol=0, atol=1e-4))
 
+    def test_warmup_scales_output(self) -> None:
+        timesteps = torch.tensor([300.0], dtype=torch.float32)  # at pivot -> schedule factor is 1.0
+        w = compute_prior_weight_per_sample(
+            timesteps,
+            base_weight=2.0,
+            schedule="linear",
+            pivot_timestep=300.0,
+            global_step=50,
+            warmup_steps=100,
+        )
+        # warmup_factor = 50/100 = 0.5, so weight = 2.0 * 0.5 = 1.0
+        self.assertTrue(torch.allclose(w, torch.tensor([1.0], dtype=torch.float32), rtol=0, atol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()

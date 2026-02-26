@@ -58,6 +58,30 @@ class TestLoRAEmaTeacher(unittest.TestCase):
         with ema.apply_to(net):
             self.assertTrue(torch.allclose(net.w, torch.tensor([2.0, 3.9], dtype=torch.float16), rtol=0, atol=1e-3))
 
+    def test_apply_to_restores_on_exception(self) -> None:
+        net = _DummyNet()
+        ema = LoRAEmaTeacher(decay=0.5)
+        ema.init_from(net)
+
+        # Make live weights differ from EMA, then update EMA.
+        with torch.no_grad():
+            net.w.copy_(torch.tensor([5.0, 6.0], dtype=torch.float16))
+            net.b.copy_(torch.tensor([7.0], dtype=torch.float16))
+        ema.update(net)
+
+        live_w = net.w.detach().clone()
+        live_b = net.b.detach().clone()
+
+        with self.assertRaises(RuntimeError):
+            with ema.apply_to(net):
+                # Ensure we actually swapped to EMA before failing.
+                self.assertFalse(torch.allclose(net.w, live_w))
+                raise RuntimeError("simulated failure")
+
+        # Must restore to the pre-swap live weights.
+        self.assertTrue(torch.allclose(net.w, live_w))
+        self.assertTrue(torch.allclose(net.b, live_b))
+
 
 if __name__ == "__main__":
     unittest.main()

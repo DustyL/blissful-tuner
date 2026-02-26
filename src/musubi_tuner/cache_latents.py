@@ -282,9 +282,7 @@ def preprocess_contents(
     for item in batch:
         # Cache-time transforms default to per-item values (set by encode_datasets) when available.
         item_gamma = (
-            float(cache_mask_gamma)
-            if cache_mask_gamma is not None
-            else float(getattr(item, "cache_mask_gamma", 1.0) or 1.0)
+            float(cache_mask_gamma) if cache_mask_gamma is not None else float(getattr(item, "cache_mask_gamma", 1.0) or 1.0)
         )
         item_min_weight = (
             float(cache_mask_min_weight)

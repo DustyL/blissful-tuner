@@ -182,7 +182,8 @@ def add_mask_loss_args(parser: argparse.ArgumentParser) -> None:
         choices=["base", "ema"],
         help="Teacher mode for prior preservation (default: base). "
         "'base' disables adapters to use the pristine base model as teacher. "
-        "'ema' uses an EMA-smoothed copy of adapter weights as teacher (adapters remain enabled), which can reduce stylistic clash.",
+        "'ema' uses an EMA-smoothed copy of adapter weights as teacher (adapters remain enabled), which can reduce stylistic clash. "
+        "Note: EMA teacher is initialized after warmup and a small minimum number of steps to avoid step-0 adapter noise.",
     )
     parser.add_argument(
         "--prior_teacher_ema_decay",

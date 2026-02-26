@@ -447,6 +447,10 @@ This requires an additional forward pass (teacher) under `torch.no_grad()`, so i
 >
 > If you want a teacher that slowly follows your LoRA’s style while remaining stable, use the EMA teacher mode
 > (`--prior_teacher_mode ema`), which swaps adapter weights to an EMA-smoothed copy for the teacher forward pass.
+> The EMA teacher is initialized after warmup and at least ~100 optimizer steps to avoid using step-0 (random) adapter weights.
+>
+> **Checkpoint note:** EMA state is not currently saved in training checkpoints. If you resume from a checkpoint,
+> the EMA teacher will re-initialize from the current adapter weights (EMA history is lost).
 
 > **Note:** Masked Prior Preservation requires **LoRA training** (adapters must be temporarily disabled to compute the teacher prediction).  
 > It is not available for **full fine-tuning** runs without adapters (e.g. `qwen_image_train.py` full fine-tune mode).

@@ -2437,6 +2437,16 @@ class NetworkTrainer:
         prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base"))
         prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
         prior_lora_ema: LoRAEmaTeacher | None = None
+        # Guardrail: if EMA teacher is enabled with no warmup, step 0 LoRA weights are effectively random.
+        # Force at least N optimizer steps before initializing EMA so the teacher starts from a non-random adapter.
+        prior_teacher_ema_min_init_steps = 100
+        prior_teacher_ema_init_step = max(prior_teacher_ema_min_init_steps, prior_decay_warmup_steps)
+        if prior_teacher_mode == "ema" and prior_teacher_ema_init_step >= int(args.max_train_steps):
+            logger.warning(
+                "EMA teacher is enabled, but it will not initialize within this run: "
+                f"ema_init_step={prior_teacher_ema_init_step} >= max_train_steps={int(args.max_train_steps)}. "
+                "Teacher will remain in base mode for the entire run."
+            )
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -2517,7 +2527,7 @@ class NetworkTrainer:
                         need_prior_base
                         and prior_teacher_mode == "ema"
                         and prior_lora_ema is None
-                        and global_step >= prior_decay_warmup_steps
+                        and global_step >= prior_teacher_ema_init_step
                     ):
                         prior_lora_ema = LoRAEmaTeacher(decay=prior_teacher_ema_decay)
                         prior_lora_ema.init_from(accelerator.unwrap_model(network))
@@ -2644,8 +2654,13 @@ class NetworkTrainer:
                     # Compute prior loss if we have a prior prediction
                     prior_loss_unreduced = None
                     if prior_pred is not None:
-                        prior_loss_unreduced = torch.nn.functional.mse_loss(
-                            model_pred.to(network_dtype), prior_pred.to(network_dtype), reduction="none"
+                        # Use the same loss type for both target and prior terms.
+                        # This avoids a gradient discontinuity at mask boundaries when --loss_type huber is used.
+                        prior_loss_unreduced = compute_unreduced_target_loss(
+                            model_pred.to(network_dtype),
+                            prior_pred.to(network_dtype),
+                            loss_type=loss_type,
+                            loss_delta=loss_delta,
                         )
                         if weighting is not None:
                             prior_loss_unreduced = prior_loss_unreduced * weighting
