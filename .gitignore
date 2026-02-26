@@ -21,6 +21,12 @@ references/
 nvidia-python-packages.txt
 docs/fork_analysis.md
 docs/archive/
+docs/plans/
+
+# Local experiment configs (dataset-specific)
+configs/OLVA/
+configs/DLAY/
+configs/olva_*.toml
 
 # Local tool databases / caches
 .chunkhound.json
