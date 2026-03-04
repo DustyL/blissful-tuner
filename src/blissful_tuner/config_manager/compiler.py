@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
+import stat
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -325,3 +328,165 @@ def compile_config(
         "dataset_toml": dataset_toml,
         "provenance": provenance,
     }
+
+
+# ---------------------------------------------------------------------------
+# arch_display_dir: human-readable directory name from display_name
+# ---------------------------------------------------------------------------
+
+
+def _arch_display_dir(arch: dict[str, Any]) -> str:
+    """Convert an arch display_name to a directory-safe uppercase form.
+
+    Examples:
+        "WAN 2.2 T2V"           -> "WAN-2.2-T2V"
+        "Qwen-Image"            -> "QWEN-IMAGE"
+        "FLUX.2 Klein-base-9B"  -> "FLUX.2-KLEIN-BASE-9B"
+    """
+    name = arch["display_name"]
+    # Replace spaces with hyphens, then uppercase
+    return name.replace(" ", "-").upper()
+
+
+# ---------------------------------------------------------------------------
+# env.sh emitter
+# ---------------------------------------------------------------------------
+
+
+def _render_env_sh(
+    env_vars: dict[str, str],
+    persona_name: str,
+    machine_name: str,
+    blissful_dir: str,
+) -> str:
+    """Render the env.sh script content.
+
+    Produces a bash script that exports machine env vars and sources .env.local.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        "#!/usr/bin/env bash",
+        f"# Environment variables for {persona_name} on {machine_name}",
+        f"# Compiled by blissful-config at {timestamp}",
+        "",
+    ]
+
+    for key, value in sorted(env_vars.items()):
+        lines.append(f'export {key}="{value}"')
+
+    lines.append("")
+    lines.append("# Source local secrets if present (API keys, tokens, etc.)")
+    lines.append("# Create .env.local in the project root to set private variables.")
+    lines.append(f'if [ -f "{blissful_dir}/.env.local" ]; then')
+    lines.append(f'    source "{blissful_dir}/.env.local"')
+    lines.append("fi")
+    lines.append("")  # trailing newline
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Public API: compile_to_disk
+# ---------------------------------------------------------------------------
+
+
+def compile_to_disk(
+    machine_path: Path,
+    arch_key: str,
+    persona_path: Path,
+    preset_path: Path,
+    output_dir: Path,
+    override_path: Path | None = None,
+    override_sets: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compile config and write training TOML, dataset TOML, and env.sh to disk.
+
+    Args:
+        machine_path: Path to machine TOML.
+        arch_key: Architecture key or alias (resolved via registry).
+        persona_path: Path to persona TOML.
+        preset_path: Path to preset TOML.
+        output_dir: Root output directory for compiled configs.
+        override_path: Optional path to override TOML (applied last).
+        override_sets: Reserved for future use (named override sets).
+
+    Returns:
+        Dict with compile result (training_toml, dataset_toml, provenance)
+        plus file paths: training_toml_path, dataset_toml_path, env_sh_path.
+    """
+    from blissful_tuner.config_manager.writer import render_dataset_toml, render_training_toml
+
+    # 1. Compile config (in-memory)
+    result = compile_config(
+        machine_path=machine_path,
+        arch_key=arch_key,
+        persona_path=persona_path,
+        preset_path=preset_path,
+        override_path=override_path,
+    )
+
+    training_toml = result["training_toml"]
+    dataset_toml = result["dataset_toml"]
+    provenance = result["provenance"]
+
+    # 2. Load machine data for env vars and naming
+    machine_data = load_layer(machine_path)
+    machine = machine_data.get("machine", {})
+    machine_name = machine.get("name", "unknown")
+    machine_paths = machine.get("paths", {})
+    blissful_dir = machine_paths.get("blissful_dir", "/opt/blissful-tuner")
+    env_vars = machine.get("env", {})
+
+    # 3. Extract persona name from persona data
+    persona_data = load_layer(persona_path)
+    persona_name = persona_data.get("persona", {}).get("name", "unknown")
+
+    # 4. Extract preset slug
+    preset_data = load_layer(preset_path)
+    preset_slug = preset_data.get("preset", {}).get("slug", "default")
+
+    # 5. Resolve arch for display_name
+    arch = resolve_arch(arch_key)
+    canonical_key = provenance["arch"]
+    arch_dir = _arch_display_dir(arch)
+
+    # 6. Compute output paths
+    out_base = Path(output_dir) / machine_name / persona_name / arch_dir
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    persona_lower = persona_name.lower()
+    run_name = f"{persona_lower}_{canonical_key}_{preset_slug}"
+
+    training_filename = f"{run_name}.toml"
+    dataset_filename = f"{run_name}_dataset.toml"
+    env_filename = "env.sh"
+
+    training_path = out_base / training_filename
+    dataset_path = out_base / dataset_filename
+    env_path = out_base / env_filename
+
+    # 7. Set dataset_config pointer to the absolute path of the dataset TOML
+    training_toml["dataset"]["dataset_config"] = str(dataset_path.resolve())
+
+    # 8. Render TOML strings
+    training_str = render_training_toml(training_toml, provenance)
+    dataset_str = render_dataset_toml(dataset_toml, provenance)
+
+    # 9. Render env.sh
+    env_str = _render_env_sh(env_vars, persona_name, machine_name, blissful_dir)
+
+    # 10. Write files
+    training_path.write_text(training_str)
+    dataset_path.write_text(dataset_str)
+    env_path.write_text(env_str)
+
+    # Make env.sh executable (owner rwx, group rx, other rx)
+    current_mode = os.stat(env_path).st_mode
+    os.chmod(env_path, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # 11. Return result with file paths
+    result["training_toml_path"] = str(training_path)
+    result["dataset_toml_path"] = str(dataset_path)
+    result["env_sh_path"] = str(env_path)
+
+    return result
