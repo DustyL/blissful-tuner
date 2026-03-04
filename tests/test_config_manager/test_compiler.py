@@ -1,6 +1,8 @@
 """Tests for config compiler core utilities."""
 
-from blissful_tuner.config_manager.compiler import deep_merge
+import pytest
+
+from blissful_tuner.config_manager.compiler import deep_merge, interpolate
 
 
 class TestDeepMerge:
@@ -60,3 +62,79 @@ class TestDeepMerge:
         assert deep_merge({}, {"a": 1}) == {"a": 1}
         assert deep_merge({"a": 1}, {}) == {"a": 1}
         assert deep_merge({}, {}) == {}
+
+
+class TestInterpolate:
+    """Variable interpolation: ${scope.key} resolved from context dict."""
+
+    def test_simple_interpolation(self):
+        data = {"path": "${machine.models_dir}/model.safetensors"}
+        context = {"machine": {"models_dir": "/root/models"}}
+        result = interpolate(data, context)
+        assert result == {"path": "/root/models/model.safetensors"}
+
+    def test_nested_dict_interpolation(self):
+        data = {"model": {"dit": "${machine.models_dir}/dit.safetensors"}}
+        context = {"machine": {"models_dir": "/root/models"}}
+        result = interpolate(data, context)
+        assert result == {"model": {"dit": "/root/models/dit.safetensors"}}
+
+    def test_multiple_vars_in_one_string(self):
+        data = {"output": "${machine.output_dir}/${persona.name_lower}_run"}
+        context = {
+            "machine": {"output_dir": "/root/output"},
+            "persona": {"name_lower": "olva"},
+        }
+        result = interpolate(data, context)
+        assert result == {"output": "/root/output/olva_run"}
+
+    def test_no_interpolation_needed(self):
+        data = {"plain": "no variables here", "num": 42}
+        result = interpolate(data, {})
+        assert result == {"plain": "no variables here", "num": 42}
+
+    def test_array_values_interpolated(self):
+        data = {"paths": ["${machine.dir}/a", "${machine.dir}/b"]}
+        context = {"machine": {"dir": "/root"}}
+        result = interpolate(data, context)
+        assert result == {"paths": ["/root/a", "/root/b"]}
+
+    def test_missing_var_raises(self):
+        data = {"path": "${machine.missing_key}/foo"}
+        context = {"machine": {"models_dir": "/root"}}
+        with pytest.raises(KeyError, match="missing_key"):
+            interpolate(data, context)
+
+    def test_non_string_values_passthrough(self):
+        data = {"lr": 5e-5, "flag": True, "steps": 4000}
+        result = interpolate(data, {})
+        assert result == {"lr": 5e-5, "flag": True, "steps": 4000}
+
+    def test_data_not_mutated(self):
+        data = {"path": "${machine.dir}/foo"}
+        context = {"machine": {"dir": "/root"}}
+        interpolate(data, context)
+        assert data == {"path": "${machine.dir}/foo"}
+
+    def test_self_reference_cycle_raises(self):
+        """Direct self-reference must error, not infinite-loop."""
+        data = {"path": "${machine.path}/sub"}
+        context = {"machine": {"path": "${machine.path}/sub"}}
+        with pytest.raises(RecursionError, match="[Cc]ycle"):
+            interpolate(data, context)
+
+    def test_two_key_cycle_raises(self):
+        """Transitive cycle: a → b → a must error."""
+        data = {"result": "${machine.a}"}
+        context = {"machine": {"a": "${machine.b}/foo", "b": "${machine.a}/bar"}}
+        with pytest.raises(RecursionError, match="[Cc]ycle"):
+            interpolate(data, context)
+
+    def test_max_depth_exceeded_raises(self):
+        """Deeply nested (>10 levels) chain raises even without a true cycle."""
+        # Build a chain: v0 → v1 → v2 → ... → v11
+        context = {"machine": {f"v{i}": f"${{machine.v{i + 1}}}" for i in range(11)}}
+        context["machine"]["v11"] = "terminal"
+        data = {"out": "${machine.v0}"}
+        with pytest.raises(RecursionError, match="depth"):
+            interpolate(data, context)
