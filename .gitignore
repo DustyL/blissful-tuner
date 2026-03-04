@@ -34,3 +34,9 @@ configs/olva_*.toml
 .serena/
 
 .worktrees/
+
+# Blissful Config — compiled output and local-only state
+configs/compiled/
+configs/meta/machines/default.toml
+configs/meta/overrides/.draft_*
+.env.local
