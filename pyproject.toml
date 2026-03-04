@@ -102,6 +102,7 @@ postprocess = [
 
 [project.scripts]
 bt-compile = "blissful_tuner.config_manager.cli:main_compile"
+bt-diff = "blissful_tuner.config_manager.cli:main_diff"
 
 [build-system]
 requires = ["hatchling"]

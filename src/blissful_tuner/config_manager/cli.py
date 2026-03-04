@@ -307,3 +307,67 @@ def main_compile(args: list[str] | None = None) -> int:
             failed = True
 
     return 2 if failed else 0
+
+
+def main_diff(args: list[str] | None = None) -> int:
+    """Entry point for bt-diff CLI.
+
+    Compares two TOML config files semantically and reports differences.
+
+    Returns:
+        Exit code: 0 if no differences, 1 if differences found, 2 on error.
+    """
+    parser = argparse.ArgumentParser(
+        prog="bt-diff",
+        description="Compare two TOML config files semantically.",
+    )
+    parser.add_argument("file_a", type=Path, help="First TOML file")
+    parser.add_argument("file_b", type=Path, help="Second TOML file")
+    parser.add_argument(
+        "--flatten",
+        action="store_true",
+        help="Flatten all sections before comparing (simulates runtime loading)",
+    )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Only output exit code, no report",
+    )
+
+    parsed = parser.parse_args(args)
+
+    # Validate files exist
+    for path in (parsed.file_a, parsed.file_b):
+        if not path.exists():
+            print(f"error: file not found: {path}", file=sys.stderr)
+            return 2
+
+    # Load both files
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    with open(parsed.file_a, "rb") as f:
+        data_a = tomllib.load(f)
+    with open(parsed.file_b, "rb") as f:
+        data_b = tomllib.load(f)
+
+    # Optionally flatten
+    if parsed.flatten:
+        from blissful_tuner.config_manager.differ import flatten_toml
+
+        data_a = flatten_toml(data_a)
+        data_b = flatten_toml(data_b)
+
+    # Compute diff
+    from blissful_tuner.config_manager.differ import format_diff_report, semantic_diff
+
+    diffs = semantic_diff(data_a, data_b)
+
+    if not parsed.quiet:
+        report = format_diff_report(diffs)
+        print(report)
+
+    return 1 if diffs else 0

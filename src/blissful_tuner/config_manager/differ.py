@@ -5,6 +5,23 @@ from __future__ import annotations
 from typing import Any
 
 
+def flatten_toml(data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a multi-section TOML into a single dict (simulates read_config_from_file).
+
+    All section keys are merged into one namespace.  Last-write-wins for
+    collisions.  Only flattens one level of sections (not deeply nested).
+    """
+    result: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            # Section -- merge its contents
+            result.update(value)
+        else:
+            # Top-level scalar (unusual but possible)
+            result[key] = value
+    return result
+
+
 def normalize_toml(data: dict[str, Any]) -> dict[str, Any]:
     """Normalize a TOML dict for comparison: sort keys recursively."""
     result: dict[str, Any] = {}
