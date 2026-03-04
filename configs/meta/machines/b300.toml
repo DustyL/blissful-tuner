@@ -1,0 +1,26 @@
+# =============================================================================
+# Machine: B300 (Blackwell B300 — 275 GB VRAM, SM 10.3)
+# =============================================================================
+# Primary training instance. Used for WAN 2.2 (DLAY persona) and heavy runs
+# that benefit from the extra VRAM headroom.
+#
+# Paths follow the /root/ container layout on this instance.
+# =============================================================================
+
+[machine]
+name = "b300"
+display_name = "B300 Training Instance"
+
+[machine.paths]
+models_dir = "/root/models"
+datasets_dir = "/root/DATASETS"
+output_dir = "/root/output"
+blissful_dir = "/root/blissful-tuner"
+
+[machine.hardware]
+default_batch_size = 3
+gradient_checkpointing = false
+compile = true
+
+[machine.env]
+PYTHONUNBUFFERED = "1"

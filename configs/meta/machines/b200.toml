@@ -1,0 +1,26 @@
+# =============================================================================
+# Machine: B200 (Blackwell B200 — 183 GB VRAM, SM 10.0)
+# =============================================================================
+# Secondary training instance. Used for Qwen-Image (OLVA persona) and
+# medium-scale experiments.
+#
+# Paths follow the /home/ubuntu/ container layout on this instance.
+# =============================================================================
+
+[machine]
+name = "b200"
+display_name = "B200 Training Instance"
+
+[machine.paths]
+models_dir = "/home/ubuntu/Training_Models"
+datasets_dir = "/home/ubuntu/DATASETS-1328"
+output_dir = "/home/ubuntu/output"
+blissful_dir = "/home/ubuntu/blissful-tuner"
+
+[machine.hardware]
+default_batch_size = 2
+gradient_checkpointing = false
+compile = true
+
+[machine.env]
+PYTHONUNBUFFERED = "1"

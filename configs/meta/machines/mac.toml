@@ -1,0 +1,24 @@
+# =============================================================================
+# Machine: Mac (Development)
+# =============================================================================
+# Local development machine. Used for config authoring, testing, and
+# dry-run validation — not for actual GPU training.
+# =============================================================================
+
+[machine]
+name = "mac"
+display_name = "Mac (Development)"
+
+[machine.paths]
+models_dir = "/Users/dustin/models"
+datasets_dir = "/Users/dustin/DATASETS"
+output_dir = "/Users/dustin/output"
+blissful_dir = "/Users/dustin/blissful-tuner"
+
+[machine.hardware]
+default_batch_size = 1
+gradient_checkpointing = false
+compile = false
+
+[machine.env]
+PYTHONUNBUFFERED = "1"
