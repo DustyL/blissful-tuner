@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import logging
 import os
 import re
 import stat
+import tempfile
 import tomllib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import tomlkit
+
 from blissful_tuner.config_manager.registry import resolve_arch, resolve_arch_key
 
 logger = logging.getLogger(__name__)
+
+_COMPILER_VERSION = "0.1.0"
+_MANIFEST_SCHEMA_VERSION = 1
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -401,6 +410,153 @@ def _render_env_sh(
 
 
 # ---------------------------------------------------------------------------
+# Manifest management: tracking compiled artifacts
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_tmp_files(output_dir: Path) -> None:
+    """Remove leftover .tmp_* files from crashed compiles.
+
+    Scans the entire output directory tree for files matching .tmp_* and
+    removes them. These are artifacts from incomplete transactional writes.
+    """
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return
+    for tmp_file in output_dir.rglob(".tmp_*"):
+        try:
+            tmp_file.unlink()
+            logger.debug("Cleaned up leftover temp file: %s", tmp_file)
+        except OSError as e:
+            logger.warning("Failed to clean up temp file %s: %s", tmp_file, e)
+
+
+def _read_manifest(manifest_path: Path) -> dict[str, Any]:
+    """Read and return the manifest dict. Returns empty manifest if not found.
+
+    Returns:
+        Dict with schema_version, compiler_version, and entries list.
+    """
+    manifest_path = Path(manifest_path)
+    if manifest_path.exists():
+        with open(manifest_path, "rb") as f:
+            return tomllib.load(f)
+    return {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "compiler_version": _COMPILER_VERSION,
+        "entries": [],
+    }
+
+
+def _compute_override_hash(override_sets: list[str] | None) -> str:
+    """Compute SHA256[:8] hash of sorted override key=value pairs.
+
+    Returns empty string for base compiles (no overrides).
+    """
+    if not override_sets:
+        return ""
+    # Sort for deterministic hashing
+    sorted_overrides = sorted(override_sets)
+    serialized = "\n".join(sorted_overrides)
+    return hashlib.sha256(serialized.encode()).hexdigest()[:8]
+
+
+@contextlib.contextmanager
+def _manifest_lock(manifest_path: Path):
+    """Context manager for manifest file locking.
+
+    Uses fcntl.flock on Unix for concurrent access safety.
+    Falls back to no-lock on platforms without fcntl (Windows/Mac dev).
+    """
+    lock_path = manifest_path.parent / ".manifest.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import fcntl
+
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
+    except ImportError:
+        # fcntl not available (Windows) -- proceed without locking
+        logger.debug("fcntl not available, proceeding without manifest lock")
+        yield
+
+
+def _upsert_manifest(manifest_path: Path, entry: dict[str, Any]) -> None:
+    """Upsert a manifest entry using the 5-tuple key.
+
+    The 5-tuple key is (persona, arch, preset, machine, override_hash).
+    If an entry with the same key exists, it is replaced. Otherwise, a new
+    entry is appended.
+
+    The manifest is written atomically via temp file + os.replace.
+    """
+    manifest_path = Path(manifest_path)
+
+    with _manifest_lock(manifest_path):
+        manifest = _read_manifest(manifest_path)
+
+        # Update compiler_version to current
+        manifest["compiler_version"] = _COMPILER_VERSION
+        manifest["schema_version"] = _MANIFEST_SCHEMA_VERSION
+
+        # 5-tuple upsert key
+        key_fields = ("persona", "arch", "preset", "machine", "override_hash")
+        entry_key = tuple(entry[k] for k in key_fields)
+
+        # Find existing entry with same key
+        updated = False
+        for i, existing in enumerate(manifest["entries"]):
+            existing_key = tuple(existing.get(k, "") for k in key_fields)
+            if existing_key == entry_key:
+                manifest["entries"][i] = entry
+                updated = True
+                break
+
+        if not updated:
+            manifest["entries"].append(entry)
+
+        # Render manifest as TOML using tomlkit for clean output
+        doc = tomlkit.document()
+        doc.add("schema_version", manifest["schema_version"])
+        doc.add("compiler_version", manifest["compiler_version"])
+
+        # Build entries as array of tables
+        aot = tomlkit.aot()
+        for e in manifest["entries"]:
+            table = tomlkit.table()
+            for k, v in e.items():
+                table.add(k, v)
+            aot.append(table)
+        doc.add(tomlkit.nl())
+        doc.add("entries", aot)
+
+        manifest_str = tomlkit.dumps(doc)
+
+        # Atomic write: temp file + os.replace
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(manifest_path.parent),
+            prefix=".tmp_manifest_",
+            suffix=".toml",
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(manifest_str)
+            os.replace(tmp_path, str(manifest_path))
+        except BaseException:
+            # Clean up temp file on failure
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+
+# ---------------------------------------------------------------------------
 # Public API: compile_to_disk
 # ---------------------------------------------------------------------------
 
@@ -416,6 +572,16 @@ def compile_to_disk(
 ) -> dict[str, Any]:
     """Compile config and write training TOML, dataset TOML, and env.sh to disk.
 
+    Uses transactional write ordering for crash safety:
+    1. Clean up leftover .tmp_* files from crashed compiles
+    2. Write artifacts to .tmp_* temp files
+    3. Rename .tmp_* to final paths (atomic on same filesystem)
+    4. Upsert manifest entry
+
+    A crash between rename and manifest upsert leaves orphan files (harmless,
+    pruneable by bt-prune). The reverse ordering would leave dangling manifest
+    entries pointing to non-existent files (broken).
+
     Args:
         machine_path: Path to machine TOML.
         arch_key: Architecture key or alias (resolved via registry).
@@ -423,13 +589,18 @@ def compile_to_disk(
         preset_path: Path to preset TOML.
         output_dir: Root output directory for compiled configs.
         override_path: Optional path to override TOML (applied last).
-        override_sets: Reserved for future use (named override sets).
+        override_sets: Optional list of key=value override strings.
 
     Returns:
         Dict with compile result (training_toml, dataset_toml, provenance)
         plus file paths: training_toml_path, dataset_toml_path, env_sh_path.
     """
     from blissful_tuner.config_manager.writer import render_dataset_toml, render_training_toml
+
+    output_dir = Path(output_dir)
+
+    # 0. Clean up leftover .tmp_* files from crashed compiles
+    _cleanup_tmp_files(output_dir)
 
     # 1. Compile config (in-memory)
     result = compile_config(
@@ -448,8 +619,8 @@ def compile_to_disk(
     machine_data = load_layer(machine_path)
     machine = machine_data.get("machine", {})
     machine_name = machine.get("name", "unknown")
-    machine_paths = machine.get("paths", {})
-    blissful_dir = machine_paths.get("blissful_dir", "/opt/blissful-tuner")
+    machine_paths_cfg = machine.get("paths", {})
+    blissful_dir = machine_paths_cfg.get("blissful_dir", "/opt/blissful-tuner")
     env_vars = machine.get("env", {})
 
     # 3. Extract persona name from persona data
@@ -466,7 +637,7 @@ def compile_to_disk(
     arch_dir = _arch_display_dir(arch)
 
     # 6. Compute output paths
-    out_base = Path(output_dir) / machine_name / persona_name / arch_dir
+    out_base = output_dir / machine_name / persona_name / arch_dir
     out_base.mkdir(parents=True, exist_ok=True)
 
     persona_lower = persona_name.lower()
@@ -490,16 +661,50 @@ def compile_to_disk(
     # 9. Render env.sh
     env_str = _render_env_sh(env_vars, persona_name, machine_name, blissful_dir)
 
-    # 10. Write files
-    training_path.write_text(training_str)
-    dataset_path.write_text(dataset_str)
-    env_path.write_text(env_str)
+    # 10. Transactional write: temp files first, then rename
+    tmp_training = out_base / f".tmp_{training_filename}"
+    tmp_dataset = out_base / f".tmp_{dataset_filename}"
+    tmp_env = out_base / f".tmp_{env_filename}"
 
-    # Make env.sh executable (owner rwx, group rx, other rx)
-    current_mode = os.stat(env_path).st_mode
-    os.chmod(env_path, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # Write to temp files
+    tmp_training.write_text(training_str)
+    tmp_dataset.write_text(dataset_str)
+    tmp_env.write_text(env_str)
 
-    # 11. Return result with file paths
+    # Make temp env.sh executable before rename
+    current_mode = os.stat(tmp_env).st_mode
+    os.chmod(tmp_env, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Rename temps to final paths (atomic on same filesystem)
+    os.replace(str(tmp_training), str(training_path))
+    os.replace(str(tmp_dataset), str(dataset_path))
+    os.replace(str(tmp_env), str(env_path))
+
+    # 11. Compute override hash and upsert manifest entry
+    override_hash = _compute_override_hash(override_sets)
+    run_id = uuid.uuid4().hex[:12]
+
+    # Compute relative paths for manifest (relative to output_dir)
+    training_rel = str(training_path.relative_to(output_dir))
+    dataset_rel = str(dataset_path.relative_to(output_dir))
+
+    manifest_entry = {
+        "persona": persona_name,
+        "arch": canonical_key,
+        "preset": preset_slug,
+        "machine": machine_name,
+        "override_hash": override_hash,
+        "compiled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "run_id": run_id,
+        "status": "ok",
+        "training_config": training_rel,
+        "dataset_config": dataset_rel,
+    }
+
+    manifest_path = output_dir / "manifest.toml"
+    _upsert_manifest(manifest_path, manifest_entry)
+
+    # 12. Return result with file paths
     result["training_toml_path"] = str(training_path)
     result["dataset_toml_path"] = str(dataset_path)
     result["env_sh_path"] = str(env_path)
