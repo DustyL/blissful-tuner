@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Label, Select, Static
+from textual.widgets import Button, Footer, Header, Label, Select, Static, TabbedContent, TabPane
 
 
 def _find_meta_dir() -> Path:
@@ -62,6 +63,51 @@ def _list_archs() -> list[tuple[str, str]]:
     return sorted((f"{arch['display_name']} ({key})", key) for key, arch in ARCH_REGISTRY.items())
 
 
+# Tab IDs and their corresponding sections in compile_config() training_toml
+_PREVIEW_TABS: list[tuple[str, str]] = [
+    ("Model", "model"),
+    ("Network", "network"),
+    ("Optimizer", "optimizer"),
+    ("Training", "training"),
+    ("Output", "output"),
+    ("Advanced", "advanced"),
+]
+
+_PLACEHOLDER_MSG = "Select all fields to preview"
+
+
+def _format_section(section_name: str, data: dict[str, Any], provenance: dict[str, Any]) -> str:
+    """Format a config section as readable key = value lines with provenance header.
+
+    Args:
+        section_name: The section name (e.g. "model", "training").
+        data: The section dict from compile_config().
+        provenance: Provenance metadata from compile_config().
+
+    Returns:
+        Formatted string with provenance header and key-value pairs.
+    """
+    prov_parts = [f"{k}={v}" for k, v in provenance.items()]
+    lines = [f"[bold green]\\[{section_name}][/bold green]  [dim]({', '.join(prov_parts)})[/dim]", ""]
+
+    if not data:
+        lines.append("[dim]  (empty)[/dim]")
+        return "\n".join(lines)
+
+    for key, value in sorted(data.items()):
+        if isinstance(value, dict):
+            # Nested dict -- show each sub-key indented
+            lines.append(f"  [bold]{key}[/bold]:")
+            for sub_key, sub_value in sorted(value.items()):
+                lines.append(f"    {sub_key} = {sub_value}")
+        elif isinstance(value, list):
+            lines.append(f"  [bold]{key}[/bold] = {value}")
+        else:
+            lines.append(f"  [bold]{key}[/bold] = {value}")
+
+    return "\n".join(lines)
+
+
 class BlissfulConfigApp(App):
     """Blissful Config TUI -- compile layered TOML configs interactively."""
 
@@ -98,6 +144,17 @@ class BlissfulConfigApp(App):
 
     #compile-btn {
         margin-right: 2;
+    }
+
+    #preview-panel {
+        height: 1fr;
+        border-top: solid green;
+        padding: 1 2;
+    }
+
+    .preview-tab-content {
+        height: 1fr;
+        overflow-y: auto;
     }
 
     #status-area {
@@ -150,10 +207,84 @@ class BlissfulConfigApp(App):
             yield Button("Compile", id="compile-btn", variant="primary")
             yield Button("Quit", id="quit-btn", variant="error")
 
+        # Preview panel with tabbed sections
+        with TabbedContent(id="preview-panel"):
+            for tab_label, section_key in _PREVIEW_TABS:
+                with TabPane(tab_label, id=f"tab-{section_key}"):
+                    yield Static(_PLACEHOLDER_MSG, id=f"preview-{section_key}", classes="preview-tab-content")
+
         with Vertical(id="status-area"):
-            yield Static("Ready. Select machine, architecture, persona, and preset to compile.", id="status-text")
+            yield Static(
+                "Ready. Select machine, architecture, persona, and preset to compile.",
+                id="status-text",
+            )
 
         yield Footer()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Update preview panel whenever any selector changes."""
+        self._update_preview()
+
+    def _get_selections(self) -> tuple[Any, Any, Any, Any]:
+        """Read current dropdown values. Returns (machine, arch, persona, preset)."""
+        machine = self.query_one("#machine-select", Select).value
+        arch = self.query_one("#arch-select", Select).value
+        persona = self.query_one("#persona-select", Select).value
+        preset = self.query_one("#preset-select", Select).value
+        return machine, arch, persona, preset
+
+    def _update_preview(self) -> None:
+        """Recompute the merged config preview from current selections."""
+        machine, arch, persona, preset = self._get_selections()
+
+        # If any selection is blank, show placeholder in all tabs
+        if machine is Select.BLANK or arch is Select.BLANK or persona is Select.BLANK or preset is Select.BLANK:
+            for _tab_label, section_key in _PREVIEW_TABS:
+                widget = self.query_one(f"#preview-{section_key}", Static)
+                widget.update(_PLACEHOLDER_MSG)
+            return
+
+        if not self._meta_dir:
+            for _tab_label, section_key in _PREVIEW_TABS:
+                widget = self.query_one(f"#preview-{section_key}", Static)
+                widget.update("[bold red]Error:[/] Could not find configs/meta/ directory.")
+            return
+
+        # Resolve paths
+        machine_path = self._meta_dir / "machines" / f"{machine}.toml"
+        persona_path = self._meta_dir / "personas" / f"{persona}.toml"
+        preset_path = self._meta_dir / "presets" / f"{preset}.toml"
+
+        try:
+            from blissful_tuner.config_manager.compiler import compile_config
+
+            result = compile_config(
+                machine_path=machine_path,
+                arch_key=str(arch),
+                persona_path=persona_path,
+                preset_path=preset_path,
+            )
+
+            training_toml = result["training_toml"]
+            provenance = result["provenance"]
+
+            # Update each tab with its section data
+            for _tab_label, section_key in _PREVIEW_TABS:
+                widget = self.query_one(f"#preview-{section_key}", Static)
+                section_data = training_toml.get(section_key, {})
+                formatted = _format_section(section_key, section_data, provenance)
+                widget.update(formatted)
+
+        except Exception as e:
+            # Show error in all tabs
+            error_msg = f"[bold red]Preview error:[/] {e}"
+            for _tab_label, section_key in _PREVIEW_TABS:
+                widget = self.query_one(f"#preview-{section_key}", Static)
+                widget.update(error_msg)
+
+            # Also update status bar
+            status = self.query_one("#status-text", Static)
+            status.update(f"[bold red]Preview error:[/] {e}")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "quit-btn":
@@ -166,10 +297,7 @@ class BlissfulConfigApp(App):
         status = self.query_one("#status-text", Static)
 
         # Get current selections
-        machine = self.query_one("#machine-select", Select).value
-        arch = self.query_one("#arch-select", Select).value
-        persona = self.query_one("#persona-select", Select).value
-        preset = self.query_one("#preset-select", Select).value
+        machine, arch, persona, preset = self._get_selections()
 
         # Validate all selections made
         if machine is Select.BLANK or arch is Select.BLANK or persona is Select.BLANK or preset is Select.BLANK:
