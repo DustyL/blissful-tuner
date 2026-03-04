@@ -240,6 +240,65 @@ class TestCompileConfig:
         assert training["training"]["seed"] == 42
         assert training["training"]["mixed_precision"] == "bf16"
 
+    def test_no_nested_dicts_in_training_toml(self):
+        """Hard invariant: no section value in emitted training TOML is a dict."""
+        result = compile_config(
+            machine_path=FIXTURES / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=FIXTURES / "personas" / "TESTPERSONA.toml",
+            preset_path=FIXTURES / "presets" / "test_adamw.toml",
+        )
+        for section_name, section in result["training_toml"].items():
+            if isinstance(section, dict):
+                for key, value in section.items():
+                    assert not isinstance(value, dict), (
+                        f"Nested dict in [{section_name}].{key} — read_config_from_file() would not flatten this correctly"
+                    )
+
+    def test_training_extra_flattened(self):
+        """[training.extra] keys are promoted into [training], not nested."""
+        result = compile_config(
+            machine_path=FIXTURES / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=FIXTURES / "personas" / "TESTPERSONA.toml",
+            preset_path=FIXTURES / "presets" / "test_adamw_with_extra.toml",
+        )
+        training = result["training_toml"]
+        assert training["training"]["some_new_flag"] is True
+        assert training["training"]["experimental_option"] == "fast"
+        assert "extra" not in training["training"]
+
+    def test_emitted_toml_has_no_nested_dicts(self):
+        """Hard invariant: no section value in emitted training TOML is a dict (with extra)."""
+        result = compile_config(
+            machine_path=FIXTURES / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=FIXTURES / "personas" / "TESTPERSONA.toml",
+            preset_path=FIXTURES / "presets" / "test_adamw_with_extra.toml",
+        )
+        for section_name, section in result["training_toml"].items():
+            if isinstance(section, dict):
+                for key, value in section.items():
+                    assert not isinstance(value, dict), (
+                        f"Nested dict in [{section_name}].{key} — read_config_from_file() would not flatten this correctly"
+                    )
+
+    def test_training_extra_collision_warns(self, caplog):
+        """[training.extra] key colliding with [training] key logs warning."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            result = compile_config(
+                machine_path=FIXTURES / "machines" / "test_machine.toml",
+                arch_key="qwen_image",
+                persona_path=FIXTURES / "personas" / "TESTPERSONA.toml",
+                preset_path=FIXTURES / "presets" / "test_adamw_with_extra_collision.toml",
+            )
+        assert "collision" in caplog.text.lower() or "override" in caplog.text.lower() or "extra" in caplog.text.lower()
+        # The extra value should win (last write wins)
+        training = result["training_toml"]
+        assert training["training"]["seed"] == 99
+
     def test_model_paths_interpolated_for_wan(self):
         """WAN model paths should use machine.models_dir."""
         result = compile_config(

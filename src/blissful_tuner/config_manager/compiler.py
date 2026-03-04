@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import re
 import stat
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from blissful_tuner.config_manager.registry import resolve_arch, resolve_arch_key
+
+logger = logging.getLogger(__name__)
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -164,6 +167,18 @@ def _build_training_toml(
     required_args = copy.deepcopy(arch.get("required_variant_args", {}))
     preset_training = copy.deepcopy(preset_data.get("training", {}))
     training_section = deep_merge(deep_merge(arch_defaults, required_args), preset_training)
+
+    # Flatten [training.extra] passthrough: promote nested keys into [training]
+    extra = training_section.get("extra")
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if key in training_section:
+                logger.warning(
+                    "[training.extra] key '%s' collides with existing [training] key — extra value wins",
+                    key,
+                )
+            training_section[key] = value
+        del training_section["extra"]
 
     # [output] — computed paths
     output_dir = f"{machine_output_dir}/{run_name}"

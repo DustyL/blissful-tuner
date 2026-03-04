@@ -1,0 +1,19 @@
+[preset]
+name = "Test AdamW with Extra Collision"
+slug = "test_adamw_extra_collision"
+
+[optimizer]
+optimizer_type = "adamw"
+learning_rate = 5e-5
+
+[network]
+network_dim = 64
+network_alpha = 32
+
+[training]
+max_train_steps = 2000
+seed = 42
+mixed_precision = "bf16"
+
+[training.extra]
+seed = 99
