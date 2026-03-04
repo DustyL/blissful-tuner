@@ -1,0 +1,50 @@
+# =============================================================================
+# Sample prompts for OLVA persona training on Qwen-Image-2512 (v2)
+# =============================================================================
+# Lines starting with # are ignored
+# Qwen-Image-2512 optimal resolutions:
+#   1:1  -> 1328x1328 (portraits)
+#   16:9 -> 1664x928  (landscape)
+#   9:16 -> 928x1664  (vertical)
+#
+# Parameters:
+#   --w/--h: width/height
+#   --s: inference steps (default 50 for Qwen)
+#   --g: guidance scale (CFG, typically 4.0 for Qwen)
+#   --fs: discrete flow shift (typically 2.2 for Qwen)
+#
+# v2 additions: minimal prompts to test trigger word learning vs scenario memorization
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MINIMAL PROMPTS - Test trigger word learning (no scenario details)
+# -----------------------------------------------------------------------------
+# These detect whether the LoRA learned "OLVA" as an identity vs. memorizing scenes
+
+# Minimal 1: Just trigger + basic descriptor
+OLVA, a woman, portrait image. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10000
+
+# Minimal 2: Trigger + slightly more context
+OLVA, looking directly at the camera with a natural expression. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10001
+
+# Minimal 3: Explicit "no doubling" guard (helps diagnose phantom limbs / duplicate faces)
+OLVA, single woman, solo portrait, no other people, no duplicate faces. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10007
+
+# -----------------------------------------------------------------------------
+# DETAILED PROMPTS - Standard evaluation scenarios
+# -----------------------------------------------------------------------------
+
+# Portrait 1:1 - Formal Event
+OLVA woman sits at a formal event, dressed elegantly. The professional indoor lighting casts soft shadows as they look directly at the camera with a warm, genuine smile. Behind them, the elegant venue decor dissolves into a beautiful bokeh. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10002
+
+# Portrait 1:1 - Casual Outdoor
+Standing in a sun-dappled park during golden hour, OLVA wears casual clothes that catch the warm afternoon light. Sunbeams filter through the canopy of green leaves, casting a natural golden glow. The shallow depth of field renders the foliage into soft circles of green and gold. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10003
+
+# Portrait 1:1 - Urban Night
+In a dimly lit city alley at night, OLVA, a woman, leans against an old brick wall. Neon signs from nearby shops cast shifting pools of pink, blue, and amber light across their face. The atmosphere is cinematic and moody, with rain-slicked pavement reflecting the colorful glow. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10004
+
+# Landscape 16:9 - Beach Scene
+OLVA woman walks along a tropical beach as the sun sinks toward the horizon, painting the sky in shades of coral and lavender. The warm golden light illuminates their profile while a gentle breeze moves their hair. Behind them, turquoise waves lap softly at the white sand shore. --w 1664 --h 928 --s 50 --g 4.0 --fs 2.2 --d 10005
+
+# Portrait 9:16 - Studio Shot
+In a professional photography studio with a clean white backdrop, OLVA stands tall in well-tailored attire. The studio lighting is perfectly arranged, creating crisp highlights along the contours of their face. They stand in a confident three-quarter pose, their expression composed and self-assured. --w 928 --h 1664 --s 50 --g 4.0 --fs 2.2 --d 10006

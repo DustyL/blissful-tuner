@@ -1,0 +1,45 @@
+# =============================================================================
+# Persona: DLAY
+# =============================================================================
+# Male subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 279 images (B200 count) with SAM3 segmentation masks
+#   - 4-tier weighted masks: Face=255, Body=128, Hair=80, Background=0
+#   - Captions co-located as .txt files
+#   - Multiple resolution variants available (1328x1328, 1024x1024, 512x512)
+#
+# Supported architectures:
+#   - Qwen-Image-2512 (1328x1328)
+#   - WAN 2.2 T2V/I2V (1024x1024, 512x512, 256x256)
+#   - FLUX.2 DEV/Klein-9B (1024x1024)
+#   - Z-Image Base/Turbo (1024x1024)
+# =============================================================================
+
+[persona]
+name = "DLAY"
+trigger_word = "DLAY"
+
+[dataset]
+# Qwen-Image paths (1328x1328)
+# On B200: /home/ubuntu/DATASETS-1328/DLAY-1328/subject
+# On B300: /root/DATASETS-1328/DLAY-1328/subject
+image_directory = "${machine.datasets_dir}/DLAY-1328/subject"
+mask_directory = "${machine.datasets_dir}/DLAY-1328/weighted_masks"
+use_masks = true
+resolutions = [[1328, 1328]]
+
+# WAN 2.2 uses a different dataset layout with multi-resolution
+# image_directory_wan = "${machine.datasets_dir}/DLAY/wan"
+# mask_directory_wan = "${machine.datasets_dir}/DLAY/mask_weighted"
+# resolutions_wan = [[1024, 1024], [512, 512], [256, 256]]
+
+[prompts]
+# Architecture-specific sample prompt files
+sample_prompts_qwen = "prompts/sample_prompts_dlay_qwen2512.txt"
+sample_prompts_wan_t2v = "prompts/sample_prompts_dlay_wan_t2v.txt"
+sample_prompts_wan_i2v = "prompts/sample_prompts_dlay_wan_i2v.txt"
+sample_prompts_flux2_dev = "prompts/sample_prompts_dlay_flux2dev.txt"
+sample_prompts_flux2_klein9b = "prompts/sample_prompts_dlay_flux2klein9b.txt"
+sample_prompts_zimage_base = "prompts/sample_prompts_dlay_zimage_base.txt"
+sample_prompts_zimage_turbo = "prompts/sample_prompts_dlay_zimage_turbo.txt"

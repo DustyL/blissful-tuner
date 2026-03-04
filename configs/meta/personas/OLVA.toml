@@ -1,0 +1,32 @@
+# =============================================================================
+# Persona: OLVA
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 207 curated solo/subject-focal images at 1328x1328 (from 296 total)
+#   - Group photos and multi-person images excluded to prevent identity bleed
+#   - 4-tier weighted SAM3 masks: Face=255, Body=128, Hair=80, Background=0
+#   - Captions co-located as .txt files
+#   - require_mask = true (fail fast if any image lacks a matching mask)
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "OLVA"
+trigger_word = "OLVA"
+
+[dataset]
+# Qwen-Image paths (1328x1328)
+# On B200: /home/ubuntu/DATASETS-1328/OLVA-1328/subject/Include
+image_directory = "${machine.datasets_dir}/OLVA-1328/subject/Include"
+mask_directory = "${machine.datasets_dir}/OLVA-1328/subject/weighted_masks-curated"
+use_masks = true
+require_mask = true
+resolutions = [[1328, 1328]]
+
+[prompts]
+sample_prompts_qwen = "prompts/sample_prompts_olva_qwen2512.txt"
+sample_prompts_qwen_v2 = "prompts/sample_prompts_olva_qwen2512_v2.txt"

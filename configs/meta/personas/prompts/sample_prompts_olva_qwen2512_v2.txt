@@ -1,0 +1,85 @@
+# =============================================================================
+# Sample prompts for OLVA persona training on Qwen-Image-2512 (v3 - Validation)
+# =============================================================================
+# Lines starting with # are ignored
+# Qwen-Image-2512 optimal resolutions:
+#   1:1  -> 1328x1328 (portraits)
+#   16:9 -> 1664x928  (landscape)
+#   9:16 -> 928x1664  (vertical)
+#
+# Parameters:
+#   --w/--h: width/height
+#   --s: inference steps (default 50 for Qwen)
+#   --g: guidance scale (CFG, typically 4.0 for Qwen)
+#   --fs: discrete flow shift (typically 2.2 for Qwen)
+#   --d: seed (for reproducibility)
+#   --n: negative prompt
+#   --l: LoRA multiplier (if supported during training sampling)
+#
+# Negative prompt for all validation (detects common artifacts):
+NEGATIVE_PROMPT="deformed, distorted, disfigured, poor details, bad anatomy, wrong anatomy, extra limbs, missing limbs, floating limbs, disconnected limbs, mutation, mutated, ugly, disgusting, blurry, amputation, 3d, cgi, render, sketch, cartoon, drawing, anime, text, watermark, signature, duplicate, clone"
+#
+# =============================================================================
+# MINIMAL PROMPTS - Test trigger word learning (steps 0-2000)
+# =============================================================================
+# These detect whether the LoRA learned "OLVA" as an identity vs. memorizing scenes
+# Minimal 1: Just trigger + basic descriptor
+OLVA, portrait image. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10000 --n "${NEGATIVE_PROMPT}"
+# Minimal 2: Trigger + slightly more context
+OLVA looking directly at the camera with a natural expression. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10001 --n "${NEGATIVE_PROMPT}"
+# Minimal 3: Explicit "no doubling" guard (helps diagnose phantom limbs / duplicate faces)
+OLVA,  solo portrait, no other people, no duplicate faces. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10007 --n "${NEGATIVE_PROMPT}"
+#
+# =============================================================================
+# IDENTITY CONSISTENCY TESTS - Same prompt, different seeds (steps 2000-5000)
+# =============================================================================
+# Should produce consistent OLVA identity across all seeds
+OLVA, portrait photo, looking at camera, neutral expression, studio lighting, plain background. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 20001 --n "${NEGATIVE_PROMPT}"
+OLVA, portrait photo, looking at camera, neutral expression, studio lighting, plain background. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 20002 --n "${NEGATIVE_PROMPT}"
+OLVA, portrait photo, looking at camera, neutral expression, studio lighting, plain background. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 20003 --n "${NEGATIVE_PROMPT}"
+#
+# =============================================================================
+# DETAILED PROMPTS - Standard evaluation scenarios (steps 2000-5000)
+# =============================================================================
+# Portrait 1:1 - Formal Event (with canonical features)
+OLVA sits at a formal event, dressed elegantly. The professional indoor lighting casts soft shadows as she looks directly at the camera with a warm, genuine smile. Behind her, the elegant venue decor dissolves into a beautiful bokeh. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10002 --n "${NEGATIVE_PROMPT}"
+# Portrait 1:1 - Casual Outdoor
+OLVA stands in a sun-dappled park during golden hour, wearing casual clothes that catch the warm afternoon light. Sunbeams filter through the canopy of green leaves, casting a natural golden glow. The shallow depth of field renders the foliage into soft circles of green and gold. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10003 --n "${NEGATIVE_PROMPT}"
+# Portrait 1:1 - Urban Night
+OLVA leans against an old brick wall in a dimly lit city alley at night. Neon signs from nearby shops cast shifting pools of pink, blue, and amber light across her face. The atmosphere is cinematic and moody, with rain-slicked pavement reflecting the colorful glow. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 10004 --n "${NEGATIVE_PROMPT}"
+# Landscape 16:9 - Beach Scene
+OLVA walks along a tropical beach as the sun sinks toward the horizon, painting the sky in shades of coral and lavender. The warm golden light illuminates her profile while a gentle breeze moves her hair. Behind her, turquoise waves lap softly at the white sand shore. --w 1664 --h 928 --s 50 --g 4.0 --fs 2.2 --d 10005 --n "${NEGATIVE_PROMPT}"
+# Portrait 9:16 - Studio Shot
+OLVA, stands tall in a professional photography studio with a clean white backdrop, wearing a skimpy swimsuit. The studio lighting is perfectly arranged, creating crisp highlights along the contours of her face. She stands in a confident three-quarter pose, her expression composed and self-assured. --w 928 --h 1664 --s 50 --g 4.0 --fs 2.2 --d 10006 --n "${NEGATIVE_PROMPT}"
+#
+# =============================================================================
+# EDGE CASE STRESS TESTS - Detect LoRA weaknesses (steps 5000+)
+# =============================================================================
+# Extreme close-up - tests facial feature learning
+OLVA, extreme close-up portrait, face fills frame, detailed eyes and skin texture visible. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 30001 --n "${NEGATIVE_PROMPT}"
+# Side profile - tests 3D face understanding
+OLVA, a side profile portrait, facing left, full face profile visible. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 30002 --n "${NEGATIVE_PROMPT}"
+# Different ethnicity context - tests if OLVA identity overrides prompt
+OLVA, portrait photo. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 30003 --n "${NEGATIVE_PROMPT}"
+# Age variation - tests if OLVA age is bound to trigger
+OLVA, topless, portrait photo. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 30004 --n "${NEGATIVE_PROMPT}"
+# Hand visibility - common failure point for LoRAs
+OLVA, portrait with hands visible near face, fingers clearly defined. --w 1328 --h 1328 --s 50 --g 4.0 --fs 2.2 --d 30005 --n "${NEGATIVE_PROMPT}"
+#
+# =============================================================================
+# VALIDATION CHECKLIST - What to look for at each stage
+# =============================================================================
+# Steps 0-2000:
+#   [ ] Does "OLVA" produce a consistent person vs. random women?
+#   [ ] Are minimal prompts generating recognizable character?
+#
+# Steps 2000-5000:
+#   [ ] Do consistency test seeds produce same OLVA identity?
+#   [ ] Are canonical features (hair color, eye color, age) stable?
+#   [ ] Do detailed prompts show feature improvement?
+#
+# Steps 5000+:
+#   [ ] Do edge cases still maintain OLVA identity?
+#   [ ] Is there any overfitting (same pose/expression in all outputs)?
+#   [ ] Are hands/fingers artifact-free?
+#   [ ] Does ethnicity override work (OLVA stays OLVA regardless of prompt ethnicity)?

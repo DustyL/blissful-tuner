@@ -1,0 +1,83 @@
+# =============================================================================
+# Preset: AdamW + LoRA+ with EMA Teacher + Huber Loss
+# =============================================================================
+# Extended preset that adds the full masked-loss arsenal on top of the base
+# AdamW LoRA+ optimizer settings. Designed for weighted-mask persona training
+# with prior preservation.
+#
+# Additions over adamw_loraplus:
+#   - Huber loss (loss_type="huber", delta=1.0): reduces boundary spikes/halos
+#   - Weighted mask loss with prior preservation
+#   - EMA teacher mode: EMA-smoothed LoRA copy provides the prior signal
+#   - Cosine prior decay schedule: flat at high noise, decays at low noise
+#   - Timestep gating: skip teacher forward below timestep 50 (saves compute)
+#   - mask_area_scale_beta=0.5: stabilizes gradient on tiny-mask images
+#   - mask_blur_kernel_size=3: conservative feathering of mask boundaries
+#
+# Prerequisites:
+#   - Weighted masks in dataset (4-tier: Face=255, Body=128, Hair=80, BG=0)
+#   - require_mask=true recommended in dataset config
+#   - Fresh cache_directory when changing mask sources
+#
+# Suitable for:
+#   - Qwen-Image-2512 persona training (primary validation target)
+#   - Any architecture with mask loss support (WAN, FLUX.2, Z-Image, K5)
+# =============================================================================
+
+[preset]
+name = "AdamW LoRA+ EMA Huber"
+slug = "adamw_loraplus_ema_huber"
+
+# --- Optimizer ---
+[optimizer]
+optimizer_type = "adamw"
+learning_rate = 5e-5
+optimizer_args = [
+    "betas=(0.9, 0.99)",
+    "weight_decay=0.01",
+    "eps=1e-8",
+]
+lr_scheduler = "cosine_with_min_lr"
+lr_warmup_steps = 100
+lr_scheduler_min_lr_ratio = 0.1
+
+# --- Network ---
+[network]
+network_dim = 64
+network_alpha = 32
+network_args = [
+    "loraplus_lr_ratio=8",
+    "exclude_mod=False",
+]
+
+# --- Training ---
+[training]
+max_train_steps = 4000
+save_every_n_steps = 250
+seed = 42
+mixed_precision = "bf16"
+scale_weight_norms = 2.0
+
+# Target loss robustness
+loss_type = "huber"
+loss_delta = 1.0
+
+# Weighted mask loss (subject)
+use_mask_loss = true
+mask_gamma = 1.0
+mask_min_weight = 0.0
+mask_blur_kernel_size = 3
+mask_area_scale_beta = 0.5
+
+# Prior preservation (background)
+prior_preservation_weight = 1.0
+prior_mask_threshold = 0.1
+normalize_per_sample = true
+prior_preservation_timestep_threshold = 50
+
+# Prior scheduling + EMA teacher
+prior_decay_schedule = "cosine"
+prior_decay_timestep_start = 300
+prior_decay_warmup_ratio = 0.05
+prior_teacher_mode = "ema"
+prior_teacher_ema_decay = 0.9995

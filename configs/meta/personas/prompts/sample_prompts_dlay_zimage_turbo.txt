@@ -1,0 +1,53 @@
+# =============================================================================
+# Sample prompts for DLAY persona training on Z-Image Turbo (De-Turbo)
+# =============================================================================
+# Lines starting with # are ignored
+# Z-Image optimal resolutions:
+#   1:1  -> 1024x1024 (portraits)
+#   16:9 -> 1360x768  (landscape)  [must be div-16]
+#   9:16 -> 768x1360  (vertical)   [must be div-16]
+#
+# Parameters:
+#   --w/--h: width/height (must be divisible by 16)
+#   --d: seed
+#   --s: inference steps (20 recommended for De-Turbo training samples)
+#   --l: CFG scale (4.0 for De-Turbo training samples)
+#   --fs: flow_shift (default 3.0)
+#   --n: negative prompt (required for CFG-based sampling)
+#
+# IMPORTANT: De-Turbo training requires CFG for quality sample generation.
+# Always include --l and --n in training sample prompts.
+#
+# NOTE: At final inference on the ACTUAL Turbo model, use:
+#   --infer_steps 8 --guidance_scale 0.0 (no CFG, no negative prompt)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MINIMAL PROMPTS - Test trigger word learning (no scenario details)
+# -----------------------------------------------------------------------------
+# These detect whether the LoRA learned "DLAY" as an identity vs. memorizing scenes
+
+# Minimal 1: Just trigger + basic descriptor
+DLAY, a man, portrait photo. --w 1024 --h 1024 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry --d 10000
+
+# Minimal 2: Trigger + slightly more context
+DLAY, a young man with short dark hair, looking directly at the camera with a natural expression. A high quality photograph. --w 1024 --h 1024 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry, distorted --d 10001
+
+# -----------------------------------------------------------------------------
+# DETAILED PROMPTS - Standard evaluation scenarios
+# -----------------------------------------------------------------------------
+
+# Portrait 1:1 - Formal Event
+DLAY, a man with short dark brown hair and a slim build, wearing a navy blue blazer over a light gray checkered button-down shirt, seated at a formal event. He looks directly at the camera with a warm smile. Professional indoor lighting creates soft shadows, with elegant venue decor visible in the blurred background. High quality, photorealistic, detailed facial features. --w 1024 --h 1024 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry --d 10002
+
+# Portrait 1:1 - Casual Outdoor
+DLAY, a man in a fitted black t-shirt, standing in a sun-dappled park during golden hour. His short dark hair catches the warm light as he gazes thoughtfully off-camera. Shallow depth of field blurs the green foliage behind him. Natural lighting, photorealistic skin texture, individual hair strands visible. --w 1024 --h 1024 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry --d 10003
+
+# Portrait 1:1 - Urban Night
+DLAY, a man wearing an open leather jacket over a white henley, leaning against a brick wall in a city alley at night. Neon signs cast colorful reflections on his face. Cinematic lighting, moody atmosphere, detailed fabric textures, sharp focus on facial features. --w 1024 --h 1024 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry, overexposed --d 10004
+
+# Landscape 16:9 - Beach Scene
+DLAY, a man in a light linen shirt with rolled sleeves, walking along a tropical beach at sunset. Ocean waves gently lap at the shore behind him. Warm golden light illuminates his profile, wind gently moving his hair. Wide shot showing expansive sky with pastel clouds. --w 1360 --h 768 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry --d 10005
+
+# Portrait 9:16 - Studio Shot
+DLAY, a man in a tailored charcoal suit and burgundy tie, standing in a professional photography studio. Clean white backdrop with subtle gradient. Studio lighting creates perfect highlights on his face. Three-quarter view, confident posture, detailed suit fabric texture. --w 768 --h 1360 --s 20 --l 4.0 --fs 3.0 --n bad quality, blurry --d 10006

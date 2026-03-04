@@ -1,0 +1,54 @@
+# =============================================================================
+# Sample prompts for DLAY persona training on FLUX.2 Klein-9B
+# =============================================================================
+# Lines starting with # are ignored
+# FLUX.2 Klein-9B optimal resolutions:
+#   1:1  -> 1024x1024 (portraits)
+#   16:9 -> 1360x768  (landscape)
+#   9:16 -> 768x1360  (vertical)
+#
+# Parameters:
+#   --w/--h: width/height
+#   --d: seed
+#
+# NOTE: --s (steps) and --g (guidance) are omitted because Klein-9B is
+# step-distilled with FIXED values (4 steps, guidance 1.0). The trainer's
+# _apply_flux2_sample_defaults() auto-fills and enforces these from
+# FLUX2_MODEL_INFO["klein-9b"].fixed_params.
+#
+# Klein-9B prompting tips (Qwen3 text encoder):
+#   - Narrative, prose-style prompts work best
+#   - Emphasis on emotional context and atmosphere
+#   - Lighting descriptions are particularly impactful
+#   - Avoid structured/JSON formats (no field labels)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MINIMAL PROMPTS - Test trigger word learning (no scenario details)
+# -----------------------------------------------------------------------------
+# These detect whether the LoRA learned "DLAY" as an identity vs. memorizing scenes
+
+# Minimal 1: Just trigger + basic descriptor
+DLAY, a man, portrait photo. --w 1024 --h 1024 --d 10000
+
+# Minimal 2: Trigger + slightly more context
+DLAY, a young man with short dark hair, looking directly at the camera with a natural expression. A high quality photograph. --w 1024 --h 1024 --d 10001
+
+# -----------------------------------------------------------------------------
+# DETAILED PROMPTS - Narrative prose style for Klein/Qwen3
+# -----------------------------------------------------------------------------
+
+# Portrait 1:1 - Formal Event
+DLAY sits at a formal event, his short dark brown hair neatly styled. He wears a navy blue blazer over a light gray checkered button-down shirt. The professional indoor lighting casts soft shadows across his face as he looks directly at the camera with a warm, genuine smile. Behind him, the elegant venue decor dissolves into a beautiful bokeh. --w 1024 --h 1024 --d 10002
+
+# Portrait 1:1 - Casual Outdoor
+Standing in a sun-dappled park during golden hour, DLAY wears a fitted black t-shirt that catches the warm afternoon light. His short dark hair glows at the edges as sunbeams filter through the canopy of green leaves behind him. He gazes thoughtfully off to one side, his expression calm and contemplative. The shallow depth of field renders the foliage into soft circles of green and gold. --w 1024 --h 1024 --d 10003
+
+# Portrait 1:1 - Urban Night
+In a dimly lit city alley at night, DLAY leans against an old brick wall. He wears an open leather jacket over a white henley shirt. Neon signs from nearby shops cast shifting pools of pink, blue, and amber light across his face and shoulders. The atmosphere is cinematic and moody, with rain-slicked pavement reflecting the colorful glow. --w 1024 --h 1024 --d 10004
+
+# Landscape 16:9 - Beach Scene
+DLAY walks along a tropical beach as the sun sinks toward the horizon, painting the sky in shades of coral and lavender. He wears a light linen shirt with the sleeves casually rolled to his elbows. The warm golden light illuminates his profile while a gentle breeze moves his hair. Behind him, turquoise waves lap softly at the white sand shore. --w 1360 --h 768 --d 10005
+
+# Portrait 9:16 - Studio Shot
+In a professional photography studio with a clean white backdrop, DLAY stands tall in a tailored charcoal suit with a rich burgundy tie. The studio lighting is perfectly arranged, creating crisp highlights along the contours of his face and the sharp lines of his suit. He stands in a confident three-quarter pose, his expression composed and self-assured. --w 768 --h 1360 --d 10006

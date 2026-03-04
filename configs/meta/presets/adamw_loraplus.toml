@@ -1,0 +1,48 @@
+# =============================================================================
+# Preset: AdamW + LoRA+
+# =============================================================================
+# Proven-stable baseline for persona LoRA training across all architectures.
+#
+# Design choices:
+#   - LR 5e-5 with cosine decay: conservative but reliable for identity lock-in
+#   - LoRA+ ratio=8: with fixed LR, effective B-matrix LR = 5e-5 * 8 = 4e-4
+#   - No RS-LoRA: standard LoRA scaling (alpha/r = 32/64 = 0.5)
+#   - scale_weight_norms=2.0: prevents LoRA weight drift during long training
+#   - Warmup=100: gentle ramp avoids early-step gradient spikes
+#   - Cosine with min_lr_ratio=0.1: floor at 5e-6 keeps identity features alive
+#
+# Suitable for:
+#   - Qwen-Image-2512, FLUX.2 DEV/Klein, Z-Image Base/Turbo
+#   - WAN 2.2 may prefer slightly different LR (see wan-specific overrides)
+# =============================================================================
+
+[preset]
+name = "AdamW LoRA+"
+slug = "adamw_loraplus"
+
+[optimizer]
+optimizer_type = "adamw"
+learning_rate = 5e-5
+optimizer_args = [
+    "betas=(0.9, 0.99)",
+    "weight_decay=0.01",
+    "eps=1e-8",
+]
+lr_scheduler = "cosine_with_min_lr"
+lr_warmup_steps = 100
+lr_scheduler_min_lr_ratio = 0.1
+
+[network]
+network_dim = 64
+network_alpha = 32
+network_args = [
+    "loraplus_lr_ratio=8",
+    "exclude_mod=False",
+]
+
+[training]
+max_train_steps = 4000
+save_every_n_steps = 250
+seed = 42
+mixed_precision = "bf16"
+scale_weight_norms = 2.0

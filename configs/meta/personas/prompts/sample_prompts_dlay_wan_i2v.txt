@@ -1,0 +1,10 @@
+# Sample prompts for DLAY persona — WAN 2.2 I2V-A14B
+# Lines starting with # are ignored
+# I2V requires --i <path> for the conditioning input image
+# Use --w/--h for resolution, --l for video length, --s for steps, --g for guidance, --fs for flow shift
+#
+# NOTE: Update the --i paths to point to actual reference images on your system.
+# The input image provides the first frame; the model generates the continuation.
+
+dlay, a man with short dark hair, turns his head slowly toward the camera with a confident smirk, warm golden hour light on his face. --i /root/DATASETS/DLAY/wan/dlay_portrait_01.png --w 1024 --h 1024 --l 33 --s 30 --g 6.5 --fs 5.0
+dlay, a man in a navy sweater, lifts a book from the shelf and flips through the pages, soft reading light highlighting his features. --i /root/DATASETS/DLAY/wan/dlay_bookstore_01.png --w 1024 --h 1024 --l 33 --s 30 --g 6.5 --fs 5.0
