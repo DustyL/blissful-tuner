@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _find_meta_dir() -> Path:
@@ -371,3 +376,376 @@ def main_diff(args: list[str] | None = None) -> int:
         print(report)
 
     return 1 if diffs else 0
+
+
+# ---------------------------------------------------------------------------
+# bt-prune: stale compiled artifact pruning
+# ---------------------------------------------------------------------------
+
+# File extensions that bt-prune is allowed to delete
+_PRUNABLE_EXTENSIONS = {".toml", ".sh", ".txt"}
+
+# Files that should never be treated as orphans
+_INTERNAL_FILES = {"manifest.toml", ".manifest.lock"}
+
+
+def find_stale_entries(compiled_dir: Path, meta_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Phase 1: check each manifest entry against source files.
+
+    For each manifest entry, verify:
+    - Persona TOML still exists in meta_dir/personas/
+    - Arch key still exists in ARCH_REGISTRY
+    - Preset TOML still exists in meta_dir/presets/
+
+    Args:
+        compiled_dir: Path to configs/compiled/ containing manifest.toml.
+        meta_dir: Path to configs/meta/ containing personas/ and presets/.
+
+    Returns:
+        List of dicts with keys: entry (the manifest entry), reason (why it's stale).
+    """
+    from blissful_tuner.config_manager.registry import ARCH_REGISTRY
+
+    manifest_path = compiled_dir / "manifest.toml"
+    if not manifest_path.exists():
+        return []
+
+    with open(manifest_path, "rb") as f:
+        manifest = tomllib.load(f)
+
+    stale: list[dict[str, Any]] = []
+    for entry in manifest.get("entries", []):
+        persona = entry.get("persona", "")
+        arch = entry.get("arch", "")
+        preset = entry.get("preset", "")
+
+        # Check persona TOML exists
+        if meta_dir is not None:
+            persona_path = meta_dir / "personas" / f"{persona}.toml"
+            if not persona_path.exists():
+                stale.append(
+                    {
+                        "entry": entry,
+                        "reason": f"Persona TOML not found: {persona_path}",
+                    }
+                )
+                continue
+
+        # Check arch key exists in registry
+        if arch not in ARCH_REGISTRY:
+            stale.append(
+                {
+                    "entry": entry,
+                    "reason": f"Arch key '{arch}' not found in ARCH_REGISTRY",
+                }
+            )
+            continue
+
+        # Check preset TOML exists
+        if meta_dir is not None:
+            preset_path = meta_dir / "presets" / f"{preset}.toml"
+            if not preset_path.exists():
+                stale.append(
+                    {
+                        "entry": entry,
+                        "reason": f"Preset TOML not found: {preset_path}",
+                    }
+                )
+                continue
+
+    return stale
+
+
+def find_orphaned_files(compiled_dir: Path) -> list[Path]:
+    """Phase 2: find files on disk not referenced by any manifest entry.
+
+    Scans compiled_dir recursively for .toml, .sh, .txt files.
+    Files referenced by manifest entries (training_config, dataset_config)
+    are not orphaned. Internal files (manifest.toml, .manifest.lock) and
+    hidden files (starting with '.') are excluded.
+
+    Safety: symlinks whose realpath resolves outside compiled_dir are skipped.
+
+    Args:
+        compiled_dir: Path to configs/compiled/.
+
+    Returns:
+        List of Paths to orphaned files (absolute).
+    """
+    compiled_dir = Path(compiled_dir).resolve()
+
+    # Read manifest to get referenced files
+    manifest_path = compiled_dir / "manifest.toml"
+    referenced: set[Path] = set()
+    if manifest_path.exists():
+        with open(manifest_path, "rb") as f:
+            manifest = tomllib.load(f)
+        for entry in manifest.get("entries", []):
+            for key in ("training_config", "dataset_config"):
+                rel = entry.get(key, "")
+                if rel:
+                    referenced.add((compiled_dir / rel).resolve())
+
+    # Scan disk for prunable files
+    orphans: list[Path] = []
+    for path in compiled_dir.rglob("*"):
+        if not path.is_file():
+            continue
+
+        # Skip internal files
+        if path.name in _INTERNAL_FILES:
+            continue
+
+        # Skip hidden files (dotfiles like .manifest.lock, .tmp_*)
+        if path.name.startswith("."):
+            continue
+
+        # Only consider prunable extensions
+        if path.suffix not in _PRUNABLE_EXTENSIONS:
+            continue
+
+        # Safety: verify realpath is inside compiled tree
+        real = Path(os.path.realpath(path))
+        try:
+            real.relative_to(compiled_dir)
+        except ValueError:
+            # Symlink points outside compiled dir -- skip
+            logger.warning("Skipping symlink that resolves outside compiled tree: %s -> %s", path, real)
+            continue
+
+        # Check if referenced by manifest
+        if real not in referenced:
+            orphans.append(path)
+
+    return orphans
+
+
+def prune_stale_artifacts(
+    compiled_dir: Path,
+    meta_dir: Path | None = None,
+    dry_run: bool = True,
+    machine: str | None = None,
+    persona: str | None = None,
+) -> dict[str, Any]:
+    """Two-phase source-aware reconciliation for compiled artifacts.
+
+    Phase 1: Find stale manifest entries (missing persona/arch/preset sources).
+    Phase 2: Find orphaned files on disk not referenced by surviving entries.
+
+    Args:
+        compiled_dir: Path to configs/compiled/.
+        meta_dir: Path to configs/meta/ (for persona/preset existence checks).
+        dry_run: If True, report only (no deletions). Default True.
+        machine: If set, only prune entries for this machine name.
+        persona: If set, only prune entries for this persona name.
+
+    Returns:
+        Dict with stale_count, orphan_count, stale_entries, orphaned_files.
+    """
+    import tomlkit
+
+    from blissful_tuner.config_manager.compiler import _read_manifest
+
+    compiled_dir = Path(compiled_dir).resolve()
+    manifest_path = compiled_dir / "manifest.toml"
+
+    # Phase 1: find stale entries
+    all_stale = find_stale_entries(compiled_dir, meta_dir=meta_dir)
+
+    # Apply scoping filters
+    scoped_stale = []
+    for item in all_stale:
+        entry = item["entry"]
+        if machine is not None and entry.get("machine") != machine:
+            continue
+        if persona is not None and entry.get("persona") != persona:
+            continue
+        scoped_stale.append(item)
+
+    # Report stale entries
+    for item in scoped_stale:
+        entry = item["entry"]
+        logger.info(
+            "Stale entry: %s/%s/%s (machine=%s) -- %s",
+            entry.get("persona"),
+            entry.get("arch"),
+            entry.get("preset"),
+            entry.get("machine"),
+            item["reason"],
+        )
+        print(
+            f"  STALE: {entry.get('persona')}/{entry.get('arch')}/{entry.get('preset')}"
+            f" (machine={entry.get('machine')}) -- {item['reason']}"
+        )
+
+    # Remove stale entries from manifest (if executing)
+    if not dry_run and scoped_stale and manifest_path.exists():
+        manifest = _read_manifest(manifest_path)
+
+        # Build set of stale 5-tuple keys
+        key_fields = ("persona", "arch", "preset", "machine", "override_hash")
+        stale_keys = {tuple(item["entry"].get(k, "") for k in key_fields) for item in scoped_stale}
+
+        # Filter entries
+        surviving_entries = [e for e in manifest.get("entries", []) if tuple(e.get(k, "") for k in key_fields) not in stale_keys]
+        manifest["entries"] = surviving_entries
+
+        # Rewrite manifest
+        doc = tomlkit.document()
+        doc.add("schema_version", manifest.get("schema_version", 1))
+        doc.add("compiler_version", manifest.get("compiler_version", "0.1.0"))
+        doc.add(tomlkit.nl())
+        if surviving_entries:
+            aot = tomlkit.aot()
+            for e in surviving_entries:
+                table = tomlkit.table()
+                for k, v in e.items():
+                    table.add(k, v)
+                aot.append(table)
+            doc.add("entries", aot)
+        else:
+            # Empty entries: use inline array to produce `entries = []`
+            doc.add("entries", tomlkit.array())
+        manifest_path.write_text(tomlkit.dumps(doc))
+
+    # Phase 2: find orphaned files (after manifest cleanup)
+    orphans = find_orphaned_files(compiled_dir)
+
+    # Apply machine scoping to orphans: only delete files under machine/ subdirectory
+    if machine is not None:
+        machine_prefix = compiled_dir / machine
+        orphans = [p for p in orphans if p.resolve().is_relative_to(machine_prefix.resolve())]
+
+    # Apply persona scoping: only delete files under */persona/ subdirectory
+    if persona is not None:
+        orphans = [p for p in orphans if _file_under_persona(p, compiled_dir, persona)]
+
+    # Collect _stripped.txt sidecars for orphaned .toml files
+    sidecars: list[Path] = []
+    for orphan in orphans:
+        if orphan.suffix == ".toml":
+            stripped = orphan.with_name(orphan.stem + "_stripped.txt")
+            if stripped.exists() and stripped not in orphans:
+                sidecars.append(stripped)
+    orphans.extend(sidecars)
+
+    # Report orphans
+    for orphan in orphans:
+        print(f"  ORPHAN: {orphan}")
+
+    # Delete orphaned files (if executing)
+    deleted_count = 0
+    if not dry_run:
+        for orphan in orphans:
+            # Final safety check: realpath inside compiled tree
+            real = Path(os.path.realpath(orphan))
+            try:
+                real.relative_to(compiled_dir)
+            except ValueError:
+                logger.warning("Refusing to delete file outside compiled tree: %s -> %s", orphan, real)
+                continue
+
+            # Only delete prunable extensions
+            if orphan.suffix not in _PRUNABLE_EXTENSIONS:
+                logger.warning("Refusing to delete non-prunable extension: %s", orphan)
+                continue
+
+            try:
+                orphan.unlink()
+                logger.info("Deleted orphaned file: %s", orphan)
+                deleted_count += 1
+            except OSError as e:
+                logger.warning("Failed to delete orphaned file %s: %s", orphan, e)
+
+    result = {
+        "stale_count": len(scoped_stale),
+        "orphan_count": deleted_count if not dry_run else len(orphans),
+        "stale_entries": scoped_stale,
+        "orphaned_files": orphans,
+    }
+
+    if dry_run:
+        print(f"\n  Dry run: {result['stale_count']} stale entries, {result['orphan_count']} orphaned files")
+        print("  Use --execute to apply changes.")
+    else:
+        print(f"\n  Pruned: {result['stale_count']} stale entries removed, {deleted_count} orphaned files deleted")
+
+    return result
+
+
+def _file_under_persona(file_path: Path, compiled_dir: Path, persona: str) -> bool:
+    """Check if a file is under a persona subdirectory.
+
+    Expected structure: compiled_dir / machine / persona / arch / ...
+    """
+    try:
+        rel = file_path.resolve().relative_to(compiled_dir.resolve())
+        parts = rel.parts
+        # machine / persona / arch / file
+        return len(parts) >= 2 and parts[1] == persona
+    except ValueError:
+        return False
+
+
+def main_prune(args: list[str] | None = None) -> int:
+    """Entry point for bt-prune CLI.
+
+    Cleans up stale compiled artifacts using two-phase source-aware reconciliation.
+
+    Returns:
+        Exit code: 0 for success, 1 for error.
+    """
+    parser = argparse.ArgumentParser(
+        prog="bt-prune",
+        description="Clean up stale compiled training config artifacts.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually delete orphaned files and remove stale manifest entries (default: dry-run)",
+    )
+    parser.add_argument("--machine", help="Only prune artifacts for this machine name")
+    parser.add_argument("--persona", help="Only prune artifacts for this persona name")
+    parser.add_argument("--compiled-dir", type=Path, help="Path to configs/compiled/ (default: auto-detect)")
+    parser.add_argument("--meta-dir", type=Path, help="Path to configs/meta/ (default: auto-detect)")
+
+    parsed = parser.parse_args(args)
+
+    # Resolve compiled dir
+    if parsed.compiled_dir:
+        compiled_dir = parsed.compiled_dir
+    else:
+        try:
+            compiled_dir = _find_compiled_dir()
+        except FileNotFoundError:
+            print("error: could not find configs/compiled/ directory; use --compiled-dir", file=sys.stderr)
+            return 1
+
+    if not compiled_dir.is_dir():
+        print(f"error: compiled directory does not exist: {compiled_dir}", file=sys.stderr)
+        return 1
+
+    # Resolve meta dir
+    if parsed.meta_dir:
+        meta_dir = parsed.meta_dir
+    else:
+        try:
+            meta_dir = _find_meta_dir()
+        except FileNotFoundError:
+            meta_dir = None
+
+    dry_run = not parsed.execute
+
+    try:
+        prune_stale_artifacts(
+            compiled_dir=compiled_dir,
+            meta_dir=meta_dir,
+            dry_run=dry_run,
+            machine=parsed.machine,
+            persona=parsed.persona,
+        )
+    except Exception as e:
+        print(f"error: prune failed: {e}", file=sys.stderr)
+        return 1
+
+    return 0
