@@ -1,0 +1,18 @@
+[machine]
+name = "test"
+display_name = "Test Machine"
+
+[machine.paths]
+models_dir = "/test/models"
+datasets_dir = "/test/DATASETS"
+output_dir = "/test/output"
+blissful_dir = "/test/blissful-tuner"
+
+[machine.hardware]
+default_batch_size = 2
+gradient_checkpointing = false
+compile = false
+
+[machine.env]
+PYTHONUNBUFFERED = "1"
+OMP_NUM_THREADS = "4"
