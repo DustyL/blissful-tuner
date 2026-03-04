@@ -72,6 +72,9 @@ optimizers = [
     "lion-pytorch>=0.2.3",
     "schedulefree>=1.4.0",
 ]
+tui = [
+    "textual>=0.70.0",
+]
 
 [tool.uv]
 conflicts = [
@@ -104,6 +107,7 @@ postprocess = [
 bt-compile = "blissful_tuner.config_manager.cli:main_compile"
 bt-diff = "blissful_tuner.config_manager.cli:main_diff"
 bt-prune = "blissful_tuner.config_manager.cli:main_prune"
+bt-tui = "blissful_tuner.config_manager.tui.app:main"
 
 [build-system]
 requires = ["hatchling"]
