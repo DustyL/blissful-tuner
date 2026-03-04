@@ -1,0 +1,22 @@
+# =============================================================================
+# Persona: EMBLA
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 250 images with segmentation masks (not weighted)
+#   - Weighted masks not yet generated
+#   - Captions co-located as .txt files
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "EMBLA"
+trigger_word = "EMBLA"
+
+[dataset]
+image_directory = "${machine.datasets_dir}/EMBLA-1328/subject"
+use_masks = false
+resolutions = [[1328, 1328]]

@@ -1,0 +1,24 @@
+# =============================================================================
+# Persona: ALXXA
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 914 images with weighted masks (912 masks)
+#   - 4-tier weighted masks: Face=255, Body=128, Hair=80, Background=0
+#   - Captions co-located as .txt files
+#   - Nested directory layout: ALXXA-1328/ALXXA-1328/
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "ALXXA"
+trigger_word = "ALXXA"
+
+[dataset]
+image_directory = "${machine.datasets_dir}/ALXXA-1328/ALXXA-1328/subject"
+mask_directory = "${machine.datasets_dir}/ALXXA-1328/ALXXA-1328/weighted_masks"
+use_masks = true
+resolutions = [[1328, 1328]]

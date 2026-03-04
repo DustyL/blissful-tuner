@@ -1,0 +1,23 @@
+# =============================================================================
+# Persona: PAISLEE
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 60 images with segmentation masks (not weighted)
+#   - Weighted masks not yet generated
+#   - Small dataset — may benefit from augmentation
+#   - Captions co-located as .txt files
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "PAISLEE"
+trigger_word = "PAISLEE"
+
+[dataset]
+image_directory = "${machine.datasets_dir}/PAISLEE-1328/subject"
+use_masks = false
+resolutions = [[1328, 1328]]

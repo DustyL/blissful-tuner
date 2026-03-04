@@ -1,0 +1,21 @@
+# =============================================================================
+# Persona: COCOQ
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 165 images without weighted masks
+#   - Captions co-located as .txt files
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "COCOQ"
+trigger_word = "COCOQ"
+
+[dataset]
+image_directory = "${machine.datasets_dir}/COCOQ-1328/subject"
+use_masks = false
+resolutions = [[1328, 1328]]

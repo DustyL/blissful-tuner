@@ -1,0 +1,21 @@
+# =============================================================================
+# Persona: ADDY
+# =============================================================================
+# Female subject persona for LoRA identity training.
+#
+# Dataset details:
+#   - 1055 images without weighted masks
+#   - Captions co-located as .txt files
+#
+# Primary architecture:
+#   - Qwen-Image-2512 (1328x1328)
+# =============================================================================
+
+[persona]
+name = "ADDY"
+trigger_word = "ADDY"
+
+[dataset]
+image_directory = "${machine.datasets_dir}/ADDY-1328/subject"
+use_masks = false
+resolutions = [[1328, 1328]]
