@@ -456,6 +456,35 @@ def _read_manifest(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _parse_override_sets(override_sets: list[str]) -> dict[str, Any]:
+    """Parse --set KEY=VALUE pairs into a section-keyed override dict.
+
+    Keys use dot notation: "section.key=value" → {"section": {"key": parsed_value}}.
+    Keys without a dot are placed in the "training" section by default.
+
+    Uses the shared value parser for TOML-semantic type-safe parsing.
+    """
+    from blissful_tuner.config_manager.value_parser import parse_value
+
+    result: dict[str, Any] = {}
+    for item in override_sets:
+        if "=" not in item:
+            raise ValueError(f"Invalid --set format: '{item}' (expected KEY=VALUE)")
+        key, raw_value = item.split("=", 1)
+        parsed_value = parse_value(raw_value)
+
+        if "." in key:
+            section, field = key.split(".", 1)
+        else:
+            section, field = "training", key
+
+        if section not in result:
+            result[section] = {}
+        result[section][field] = parsed_value
+
+    return result
+
+
 def _compute_override_hash(override_sets: list[str] | None) -> str:
     """Compute SHA256[:8] hash of sorted override key=value pairs.
 
@@ -610,13 +639,17 @@ def compile_to_disk(
     # 0. Clean up leftover .tmp_* files from crashed compiles
     _cleanup_tmp_files(output_dir)
 
-    # 1. Compile config (in-memory)
+    # 1. Parse --set overrides into section-keyed dict
+    set_override_data = _parse_override_sets(override_sets) if override_sets else None
+
+    # 2. Compile config (in-memory)
     result = compile_config(
         machine_path=machine_path,
         arch_key=arch_key,
         persona_path=persona_path,
         preset_path=preset_path,
         override_path=override_path,
+        override_data=set_override_data,
     )
 
     training_toml = result["training_toml"]

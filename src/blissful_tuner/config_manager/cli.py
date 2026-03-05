@@ -223,9 +223,9 @@ def main_compile(args: list[str] | None = None) -> int:
         print("error: either PERSONA or --all is required", file=sys.stderr)
         return 1
 
-    # --- Parse --set overrides ---
+    # --- Validate --set overrides (format check: KEY=VALUE) ---
     try:
-        set_overrides_dict = _parse_set_overrides(parsed.set_overrides)
+        _parse_set_overrides(parsed.set_overrides)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

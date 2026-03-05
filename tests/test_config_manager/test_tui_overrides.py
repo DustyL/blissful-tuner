@@ -319,3 +319,59 @@ class TestCompileConfigOverrideData:
 
         prov = result["provenance"]
         assert "ephemeral_overrides" not in prov
+
+
+class TestParseOverrideSets:
+    """Test _parse_override_sets() in compiler.py for --set KEY=VALUE wiring."""
+
+    def test_dot_notation_parses_to_section(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(["training.learning_rate=1e-4"])
+        assert result == {"training": {"learning_rate": 1e-4}}
+
+    def test_no_dot_defaults_to_training(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(["seed=99"])
+        assert result == {"training": {"seed": 99}}
+
+    def test_multiple_overrides_across_sections(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(
+            [
+                "training.max_train_steps=2000",
+                "optimizer.learning_rate=1e-4",
+                "network.network_dim=32",
+            ]
+        )
+        assert result == {
+            "training": {"max_train_steps": 2000},
+            "optimizer": {"learning_rate": 1e-4},
+            "network": {"network_dim": 32},
+        }
+
+    def test_value_with_equals_sign(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(["training.some_arg='key=value'"])
+        assert result == {"training": {"some_arg": "key=value"}}
+
+    def test_invalid_format_raises(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        with pytest.raises(ValueError, match="Invalid --set format"):
+            _parse_override_sets(["no_equals_here"])
+
+    def test_boolean_value(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(["training.use_mask_loss=true"])
+        assert result == {"training": {"use_mask_loss": True}}
+
+    def test_array_value(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(['network.network_args=["loraplus_lr_ratio=8"]'])
+        assert result == {"network": {"network_args": ["loraplus_lr_ratio=8"]}}
