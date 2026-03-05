@@ -288,6 +288,7 @@ def compile_config(
     persona_path: Path,
     preset_path: Path,
     override_path: Path | None = None,
+    override_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compile a full training config from TOML layer files.
 
@@ -297,6 +298,8 @@ def compile_config(
         persona_path: Path to persona TOML.
         preset_path: Path to preset TOML.
         override_path: Optional path to override TOML (applied last).
+        override_data: Optional override dict (applied after override_path).
+            Used by the TUI for ephemeral overrides without writing a file.
 
     Returns:
         Dict with keys: training_toml, dataset_toml, provenance.
@@ -305,7 +308,7 @@ def compile_config(
     machine_data = load_layer(machine_path)
     persona_data = load_layer(persona_path)
     preset_data = load_layer(preset_path)
-    override_data = load_layer(override_path) if override_path else {}
+    file_override_data = load_layer(override_path) if override_path else {}
 
     # 2. Resolve arch
     canonical_key = resolve_arch_key(arch_key)
@@ -314,7 +317,9 @@ def compile_config(
     # 3. Build interpolation context
     context = _build_context(machine_data, persona_data)
 
-    # 4. Apply overrides (if any) to preset
+    # 4. Apply overrides (if any) to preset — file overrides first, then dict overrides
+    if file_override_data:
+        preset_data = deep_merge(preset_data, file_override_data)
     if override_data:
         preset_data = deep_merge(preset_data, override_data)
 
@@ -346,6 +351,9 @@ def compile_config(
     }
     if override_path:
         provenance["override"] = Path(override_path).name
+    if override_data:
+        n_overrides = sum(len(v) if isinstance(v, dict) else 1 for v in override_data.values())
+        provenance["ephemeral_overrides"] = n_overrides
 
     return {
         "training_toml": training_toml,
