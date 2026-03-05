@@ -86,18 +86,40 @@ class TestManifest:
             manifest = tomllib.load(f)
         assert manifest["entries"][0]["override_hash"] == ""
 
-    def test_tmp_cleanup_on_startup(self, tmp_path):
-        """Leftover .tmp_ files from crashed compiles are cleaned up."""
-        # Create fake .tmp_ files
+    def test_tmp_cleanup_removes_old_files(self, tmp_path):
+        """Leftover .tmp_ files older than age threshold are cleaned up."""
+        import os
+        import time
+
+        from blissful_tuner.config_manager.compiler import _cleanup_tmp_files
+
+        # Create fake .tmp_ files with old mtime (> 1 hour)
         output_dir = tmp_path / "test" / "TESTPERSONA" / "QWEN-IMAGE"
         output_dir.mkdir(parents=True)
-        (output_dir / ".tmp_training.toml").write_text("leftover")
-        (output_dir / ".tmp_dataset.toml").write_text("leftover")
+        for name in (".tmp_old_training.toml", ".tmp_old_dataset.toml"):
+            p = output_dir / name
+            p.write_text("leftover")
+            old_time = time.time() - 7200  # 2 hours ago
+            os.utime(p, (old_time, old_time))
 
-        self._compile_once(tmp_path)
+        _cleanup_tmp_files(tmp_path)
 
-        # .tmp_ files should be cleaned up
+        # Old .tmp_ files should be cleaned up
         assert not list(tmp_path.rglob(".tmp_*"))
+
+    def test_tmp_cleanup_preserves_recent_files(self, tmp_path):
+        """Recent .tmp_ files (< age threshold) are NOT cleaned up."""
+        from blissful_tuner.config_manager.compiler import _cleanup_tmp_files
+
+        # Create fake .tmp_ files with current mtime
+        output_dir = tmp_path / "test"
+        output_dir.mkdir(parents=True)
+        (output_dir / ".tmp_recent.toml").write_text("in-flight")
+
+        _cleanup_tmp_files(tmp_path)
+
+        # Recent .tmp_ files should NOT be cleaned up
+        assert list(tmp_path.rglob(".tmp_*"))
 
     def test_upsert_updates_compiled_at(self, tmp_path):
         """Second compile of same 5-tuple updates compiled_at timestamp."""

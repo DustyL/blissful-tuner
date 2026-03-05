@@ -6,7 +6,11 @@ import argparse
 import logging
 import os
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +95,9 @@ def run_compile(
 ) -> dict[str, Any]:
     """Run the compile pipeline. Returns result dict with file paths.
 
+    Validation is fail-closed by default: unsupported features raise
+    ConfigValidationError. Pass coerce=True to strip them instead.
+
     Args:
         persona: Persona name (informational, used for messaging).
         arch: Architecture key (resolved via registry).
@@ -108,24 +115,16 @@ def run_compile(
     """
     from blissful_tuner.config_manager.compiler import compile_to_disk
 
-    result = compile_to_disk(
+    return compile_to_disk(
         machine_path=machine_path,
         arch_key=arch,
         persona_path=persona_path,
         preset_path=preset_path,
         output_dir=output_dir,
         override_sets=override_sets,
+        coerce=coerce,
+        allow_unknown=allow_unknown,
     )
-
-    # Optionally validate with coerce mode
-    if coerce:
-        from blissful_tuner.config_manager.registry import resolve_arch
-        from blissful_tuner.config_manager.validator import validate_config
-
-        arch_entry = resolve_arch(arch)
-        validate_config(result["training_toml"], arch_entry, strict=False)
-
-    return result
 
 
 def main_compile(args: list[str] | None = None) -> int:
@@ -349,11 +348,6 @@ def main_diff(args: list[str] | None = None) -> int:
             return 2
 
     # Load both files
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # type: ignore[no-redef]
-
     with open(parsed.file_a, "rb") as f:
         data_a = tomllib.load(f)
     with open(parsed.file_b, "rb") as f:
@@ -415,13 +409,14 @@ def find_stale_entries(compiled_dir: Path, meta_dir: Path | None = None) -> list
 
     stale: list[dict[str, Any]] = []
     for entry in manifest.get("entries", []):
-        persona = entry.get("persona", "")
+        # Use source file stems if available (fix #6: persona name != filename)
+        persona_stem = entry.get("persona_source", entry.get("persona", ""))
         arch = entry.get("arch", "")
-        preset = entry.get("preset", "")
+        preset_stem = entry.get("preset_source", entry.get("preset", ""))
 
         # Check persona TOML exists
         if meta_dir is not None:
-            persona_path = meta_dir / "personas" / f"{persona}.toml"
+            persona_path = meta_dir / "personas" / f"{persona_stem}.toml"
             if not persona_path.exists():
                 stale.append(
                     {
@@ -443,7 +438,7 @@ def find_stale_entries(compiled_dir: Path, meta_dir: Path | None = None) -> list
 
         # Check preset TOML exists
         if meta_dir is not None:
-            preset_path = meta_dir / "presets" / f"{preset}.toml"
+            preset_path = meta_dir / "presets" / f"{preset_stem}.toml"
             if not preset_path.exists():
                 stale.append(
                     {
@@ -578,35 +573,56 @@ def prune_stale_artifacts(
             f" (machine={entry.get('machine')}) -- {item['reason']}"
         )
 
-    # Remove stale entries from manifest (if executing)
+    # Remove stale entries from manifest (if executing) — lock+atomic like compiler
     if not dry_run and scoped_stale and manifest_path.exists():
-        manifest = _read_manifest(manifest_path)
+        from blissful_tuner.config_manager.compiler import _manifest_lock, _read_manifest
 
-        # Build set of stale 5-tuple keys
-        key_fields = ("persona", "arch", "preset", "machine", "override_hash")
-        stale_keys = {tuple(item["entry"].get(k, "") for k in key_fields) for item in scoped_stale}
+        with _manifest_lock(manifest_path):
+            manifest = _read_manifest(manifest_path)
 
-        # Filter entries
-        surviving_entries = [e for e in manifest.get("entries", []) if tuple(e.get(k, "") for k in key_fields) not in stale_keys]
-        manifest["entries"] = surviving_entries
+            # Build set of stale 5-tuple keys
+            key_fields = ("persona", "arch", "preset", "machine", "override_hash")
+            stale_keys = {tuple(item["entry"].get(k, "") for k in key_fields) for item in scoped_stale}
 
-        # Rewrite manifest
-        doc = tomlkit.document()
-        doc.add("schema_version", manifest.get("schema_version", 1))
-        doc.add("compiler_version", manifest.get("compiler_version", "0.1.0"))
-        doc.add(tomlkit.nl())
-        if surviving_entries:
-            aot = tomlkit.aot()
-            for e in surviving_entries:
-                table = tomlkit.table()
-                for k, v in e.items():
-                    table.add(k, v)
-                aot.append(table)
-            doc.add("entries", aot)
-        else:
-            # Empty entries: use inline array to produce `entries = []`
-            doc.add("entries", tomlkit.array())
-        manifest_path.write_text(tomlkit.dumps(doc))
+            # Filter entries
+            surviving_entries = [
+                e for e in manifest.get("entries", []) if tuple(e.get(k, "") for k in key_fields) not in stale_keys
+            ]
+            manifest["entries"] = surviving_entries
+
+            # Atomic rewrite via temp file + os.replace
+            doc = tomlkit.document()
+            doc.add("schema_version", manifest.get("schema_version", 1))
+            doc.add("compiler_version", manifest.get("compiler_version", "0.1.0"))
+            doc.add(tomlkit.nl())
+            if surviving_entries:
+                aot = tomlkit.aot()
+                for e in surviving_entries:
+                    table = tomlkit.table()
+                    for k, v in e.items():
+                        table.add(k, v)
+                    aot.append(table)
+                doc.add("entries", aot)
+            else:
+                doc.add("entries", tomlkit.array())
+
+            import tempfile
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(manifest_path.parent),
+                prefix=".tmp_manifest_prune_",
+                suffix=".toml",
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(tomlkit.dumps(doc))
+                os.replace(tmp_path, str(manifest_path))
+            except BaseException:
+                import contextlib
+
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
 
     # Phase 2: find orphaned files (after manifest cleanup)
     orphans = find_orphaned_files(compiled_dir)

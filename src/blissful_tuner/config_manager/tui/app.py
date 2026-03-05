@@ -174,7 +174,14 @@ def _write_override_toml(path: Path, overrides: dict[str, dict[str, Any]]) -> No
 def _list_draft_files(meta_dir: Path) -> list[Path]:
     """List draft override files in the overrides directory."""
     d = _overrides_dir(meta_dir)
-    return sorted(d.glob(".draft_*.toml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    drafts = []
+    for p in d.glob(".draft_*.toml"):
+        try:
+            drafts.append((p, p.stat().st_mtime))
+        except OSError:
+            continue  # File deleted between glob and stat (TOCTOU)
+    drafts.sort(key=lambda x: x[1], reverse=True)
+    return [p for p, _ in drafts]
 
 
 def _cleanup_old_drafts(meta_dir: Path) -> int:
@@ -182,18 +189,21 @@ def _cleanup_old_drafts(meta_dir: Path) -> int:
     cutoff = time.time() - (_DRAFT_MAX_AGE_DAYS * 86400)
     removed = 0
     for draft in _list_draft_files(meta_dir):
-        if draft.stat().st_mtime < cutoff:
-            try:
+        try:
+            if draft.stat().st_mtime < cutoff:
                 draft.unlink()
                 removed += 1
-            except OSError:
-                pass
+        except OSError:
+            pass  # File deleted between stat and unlink (TOCTOU)
     return removed
 
 
 def _load_draft(path: Path) -> dict[str, dict[str, Any]]:
     """Load a draft TOML file and return it as a section->keys dict."""
-    import tomllib
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -946,28 +956,9 @@ class BlissfulConfigApp(App):
 
         status.update(f"Compiling {persona}/{arch}/{preset} for {machine}...")
 
-        # Build override_sets from ephemeral overrides for run_compile
-        override_sets: list[str] | None = None
-        if self._ephemeral_overrides:
-            override_sets = []
-            for section, keys in self._ephemeral_overrides.items():
-                for key, value in keys.items():
-                    override_sets.append(f"{section}.{key}={value!r}")
-
-        # If we have ephemeral overrides, write a temp override file for the compiler
-        temp_override_path: Path | None = None
-        if self._ephemeral_overrides and any(self._ephemeral_overrides.values()):
-            import tempfile
-
-            fd, tmp_path = tempfile.mkstemp(suffix=".toml", prefix=".tui_override_")
-            temp_override_path = Path(tmp_path)
-            try:
-                import os
-
-                os.close(fd)
-                _write_override_toml(temp_override_path, self._ephemeral_overrides)
-            except Exception:
-                temp_override_path = None
+        # Build override_data dict directly from ephemeral overrides
+        # (no repr+parse round-trip — preserves types exactly)
+        override_data = _build_override_data(self._ephemeral_overrides) or None
 
         try:
             from blissful_tuner.config_manager.compiler import compile_to_disk
@@ -978,8 +969,7 @@ class BlissfulConfigApp(App):
                 persona_path=persona_path,
                 preset_path=preset_path,
                 output_dir=output_dir,
-                override_path=temp_override_path,
-                override_sets=override_sets,
+                override_data=override_data,
             )
 
             training_path = result.get("training_toml_path", "?")
@@ -994,10 +984,6 @@ class BlissfulConfigApp(App):
             )
         except Exception as e:
             status.update(f"[bold red]Compile failed:[/] {e}")
-        finally:
-            # Clean up temp file
-            if temp_override_path and temp_override_path.exists():
-                temp_override_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Save override action

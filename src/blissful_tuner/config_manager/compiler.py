@@ -10,7 +10,11 @@ import os
 import re
 import stat
 import tempfile
-import tomllib
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -422,19 +426,26 @@ def _render_env_sh(
 # ---------------------------------------------------------------------------
 
 
-def _cleanup_tmp_files(output_dir: Path) -> None:
-    """Remove leftover .tmp_* files from crashed compiles.
+_TMP_MAX_AGE_SECONDS = 3600  # 1 hour
 
-    Scans the entire output directory tree for files matching .tmp_* and
-    removes them. These are artifacts from incomplete transactional writes.
+
+def _cleanup_tmp_files(output_dir: Path) -> None:
+    """Remove leftover .tmp_* files from crashed compiles (older than 1 hour).
+
+    Only deletes temp files older than _TMP_MAX_AGE_SECONDS to avoid
+    removing in-flight temp files from concurrent compiles.
     """
+    import time
+
     output_dir = Path(output_dir)
     if not output_dir.exists():
         return
+    cutoff = time.time() - _TMP_MAX_AGE_SECONDS
     for tmp_file in output_dir.rglob(".tmp_*"):
         try:
-            tmp_file.unlink()
-            logger.debug("Cleaned up leftover temp file: %s", tmp_file)
+            if tmp_file.stat().st_mtime < cutoff:
+                tmp_file.unlink()
+                logger.debug("Cleaned up leftover temp file: %s", tmp_file)
         except OSError as e:
             logger.warning("Failed to clean up temp file %s: %s", tmp_file, e)
 
@@ -456,11 +467,19 @@ def _read_manifest(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+# Sections that can be overridden via --set (preset-layer sections)
+_OVERRIDABLE_SECTIONS = {"network", "optimizer", "training", "sampling"}
+
+
 def _parse_override_sets(override_sets: list[str]) -> dict[str, Any]:
     """Parse --set KEY=VALUE pairs into a section-keyed override dict.
 
     Keys use dot notation: "section.key=value" → {"section": {"key": parsed_value}}.
     Keys without a dot are placed in the "training" section by default.
+
+    Only preset-layer sections (network, optimizer, training, sampling) can be
+    overridden. Sections like model, output, advanced, and dataset are computed
+    from machine/persona/arch and would be silently ignored — these are rejected.
 
     Uses the shared value parser for TOML-semantic type-safe parsing.
     """
@@ -477,6 +496,13 @@ def _parse_override_sets(override_sets: list[str]) -> dict[str, Any]:
             section, field = key.split(".", 1)
         else:
             section, field = "training", key
+
+        if section not in _OVERRIDABLE_SECTIONS:
+            raise ValueError(
+                f"Cannot override section '{section}' (key: {key}). "
+                f"Only {sorted(_OVERRIDABLE_SECTIONS)} sections are overridable. "
+                f"Sections like model, output, advanced are computed from machine/persona/arch."
+            )
 
         if section not in result:
             result[section] = {}
@@ -606,18 +632,24 @@ def compile_to_disk(
     output_dir: Path,
     override_path: Path | None = None,
     override_sets: list[str] | None = None,
+    override_data: dict[str, Any] | None = None,
+    coerce: bool = False,
+    allow_unknown: bool = False,
 ) -> dict[str, Any]:
-    """Compile config and write training TOML, dataset TOML, and env.sh to disk.
+    """Compile config, validate, and write training TOML, dataset TOML, and env.sh to disk.
+
+    Pipeline order: compile → validate/coerce → render → write.
+
+    Validation is fail-closed by default (strict=True). Pass coerce=True to
+    strip unsupported features instead of erroring. A _stripped.txt sidecar
+    report is written alongside the training TOML when keys are stripped.
 
     Uses transactional write ordering for crash safety:
-    1. Clean up leftover .tmp_* files from crashed compiles
-    2. Write artifacts to .tmp_* temp files
-    3. Rename .tmp_* to final paths (atomic on same filesystem)
-    4. Upsert manifest entry
-
-    A crash between rename and manifest upsert leaves orphan files (harmless,
-    pruneable by bt-prune). The reverse ordering would leave dangling manifest
-    entries pointing to non-existent files (broken).
+    1. Compile in-memory
+    2. Validate (strict or coerce) — BEFORE any disk write
+    3. Write artifacts to unique .tmp_<uuid>_* temp files
+    4. Rename to final paths (atomic on same filesystem)
+    5. Upsert manifest entry
 
     Args:
         machine_path: Path to machine TOML.
@@ -627,20 +659,28 @@ def compile_to_disk(
         output_dir: Root output directory for compiled configs.
         override_path: Optional path to override TOML (applied last).
         override_sets: Optional list of key=value override strings.
+        override_data: Optional override dict (applied after override_sets).
+            Used by TUI for type-safe ephemeral overrides without repr round-trip.
+        coerce: If True, strip unsupported features instead of erroring.
+        allow_unknown: If True, allow unknown --set keys.
 
     Returns:
         Dict with compile result (training_toml, dataset_toml, provenance)
         plus file paths: training_toml_path, dataset_toml_path, env_sh_path.
     """
+    from blissful_tuner.config_manager.validator import validate_config
     from blissful_tuner.config_manager.writer import render_dataset_toml, render_training_toml
 
     output_dir = Path(output_dir)
 
-    # 0. Clean up leftover .tmp_* files from crashed compiles
-    _cleanup_tmp_files(output_dir)
-
-    # 1. Parse --set overrides into section-keyed dict
+    # 1. Build combined override dict from --set strings and/or direct override_data
     set_override_data = _parse_override_sets(override_sets) if override_sets else None
+    combined_override_data = set_override_data
+    if override_data:
+        if combined_override_data:
+            combined_override_data = deep_merge(combined_override_data, override_data)
+        else:
+            combined_override_data = override_data
 
     # 2. Compile config (in-memory)
     result = compile_config(
@@ -649,14 +689,40 @@ def compile_to_disk(
         persona_path=persona_path,
         preset_path=preset_path,
         override_path=override_path,
-        override_data=set_override_data,
+        override_data=combined_override_data,
     )
 
     training_toml = result["training_toml"]
     dataset_toml = result["dataset_toml"]
     provenance = result["provenance"]
 
-    # 2. Load machine data for env vars and naming
+    # 3. Validate BEFORE writing — fail-closed by default
+    arch = resolve_arch(arch_key)
+    canonical_key = provenance["arch"]
+    stripped_report = validate_config(training_toml, arch, strict=not coerce)
+
+    # 3b. Validate --set override keys are known (unless --allow-unknown)
+    if override_sets and not allow_unknown:
+        from blissful_tuner.config_manager.validator import ConfigValidationError
+
+        # Flatten compiled config to get all known keys
+        known_keys: set[str] = set()
+        for section in training_toml.values():
+            if isinstance(section, dict):
+                known_keys.update(section.keys())
+        # Check each override key exists in the compiled output
+        for item in override_sets:
+            key, _ = item.split("=", 1)
+            if "." in key:
+                _, field = key.split(".", 1)
+            else:
+                field = key
+            if field not in known_keys:
+                raise ConfigValidationError(
+                    f"Unknown override key '{key}' (resolved field: '{field}'). Use --allow-unknown to force."
+                )
+
+    # 4. Load machine data for env vars and naming
     machine_data = load_layer(machine_path)
     machine = machine_data.get("machine", {})
     machine_name = machine.get("name", "unknown")
@@ -664,25 +730,21 @@ def compile_to_disk(
     blissful_dir = machine_paths_cfg.get("blissful_dir", "/opt/blissful-tuner")
     env_vars = machine.get("env", {})
 
-    # 3. Extract persona name from persona data
+    # 5. Extract persona name and preset slug from source data
     persona_data = load_layer(persona_path)
     persona_name = persona_data.get("persona", {}).get("name", "unknown")
-
-    # 4. Extract preset slug
     preset_data = load_layer(preset_path)
     preset_slug = preset_data.get("preset", {}).get("slug", "default")
 
-    # 5. Resolve arch for display_name
-    arch = resolve_arch(arch_key)
-    canonical_key = provenance["arch"]
+    # 6. Compute output paths — include _ov_{hash8} suffix when overrides exist
     arch_dir = _arch_display_dir(arch)
-
-    # 6. Compute output paths
     out_base = output_dir / machine_name / persona_name / arch_dir
     out_base.mkdir(parents=True, exist_ok=True)
 
     persona_lower = persona_name.lower()
-    run_name = f"{persona_lower}_{canonical_key}_{preset_slug}"
+    override_hash = _compute_override_hash(override_sets)
+    override_suffix = f"_ov_{override_hash}" if override_hash else ""
+    run_name = f"{persona_lower}_{canonical_key}_{preset_slug}{override_suffix}"
 
     training_filename = f"{run_name}.toml"
     dataset_filename = f"{run_name}_dataset.toml"
@@ -695,17 +757,18 @@ def compile_to_disk(
     # 7. Set dataset_config pointer to the absolute path of the dataset TOML
     training_toml["dataset"]["dataset_config"] = str(dataset_path.resolve())
 
-    # 8. Render TOML strings
+    # 8. Render TOML strings (after validation/coerce, so stripped keys are gone)
     training_str = render_training_toml(training_toml, provenance)
     dataset_str = render_dataset_toml(dataset_toml, provenance)
 
     # 9. Render env.sh
     env_str = _render_env_sh(env_vars, persona_name, machine_name, blissful_dir)
 
-    # 10. Transactional write: temp files first, then rename
-    tmp_training = out_base / f".tmp_{training_filename}"
-    tmp_dataset = out_base / f".tmp_{dataset_filename}"
-    tmp_env = out_base / f".tmp_{env_filename}"
+    # 10. Transactional write: unique temp files first, then rename
+    tmp_id = uuid.uuid4().hex[:8]
+    tmp_training = out_base / f".tmp_{tmp_id}_{training_filename}"
+    tmp_dataset = out_base / f".tmp_{tmp_id}_{dataset_filename}"
+    tmp_env = out_base / f".tmp_{tmp_id}_{env_filename}"
 
     # Write to temp files
     tmp_training.write_text(training_str)
@@ -721,8 +784,13 @@ def compile_to_disk(
     os.replace(str(tmp_dataset), str(dataset_path))
     os.replace(str(tmp_env), str(env_path))
 
-    # 11. Compute override hash and upsert manifest entry
-    override_hash = _compute_override_hash(override_sets)
+    # 10b. Write _stripped.txt sidecar if coerce mode stripped keys
+    if not stripped_report.is_empty():
+        stripped_path = training_path.with_name(training_path.stem + "_stripped.txt")
+        stripped_path.write_text(stripped_report.format())
+        result["stripped_report_path"] = str(stripped_path)
+
+    # 11. Upsert manifest entry with source file stems for prune reconciliation
     run_id = uuid.uuid4().hex[:12]
 
     # Compute relative paths for manifest (relative to output_dir)
@@ -735,6 +803,8 @@ def compile_to_disk(
         "preset": preset_slug,
         "machine": machine_name,
         "override_hash": override_hash,
+        "persona_source": Path(persona_path).stem,
+        "preset_source": Path(preset_path).stem,
         "compiled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run_id": run_id,
         "status": "ok",

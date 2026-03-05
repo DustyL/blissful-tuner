@@ -375,3 +375,21 @@ class TestParseOverrideSets:
 
         result = _parse_override_sets(['network.network_args=["loraplus_lr_ratio=8"]'])
         assert result == {"network": {"network_args": ["loraplus_lr_ratio=8"]}}
+
+    def test_non_overridable_section_rejected(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        with pytest.raises(ValueError, match="Cannot override section 'output'"):
+            _parse_override_sets(['output.output_dir="/tmp/custom"'])
+
+    def test_model_section_rejected(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        with pytest.raises(ValueError, match="Cannot override section 'model'"):
+            _parse_override_sets(['model.dit="/some/path"'])
+
+    def test_sampling_section_allowed(self):
+        from blissful_tuner.config_manager.compiler import _parse_override_sets
+
+        result = _parse_override_sets(["sampling.cfg_scale=7.0"])
+        assert result == {"sampling": {"cfg_scale": 7.0}}
