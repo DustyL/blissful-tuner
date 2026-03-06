@@ -1,9 +1,6 @@
 """Tests for TOML writer with provenance headers."""
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
+import tomllib
 
 from blissful_tuner.config_manager.writer import render_training_toml, render_dataset_toml
 

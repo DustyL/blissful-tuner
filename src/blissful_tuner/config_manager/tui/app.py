@@ -102,6 +102,7 @@ _PREVIEW_TABS: list[tuple[str, str]] = [
     ("Network", "network"),
     ("Optimizer", "optimizer"),
     ("Training", "training"),
+    ("Sampling", "sampling"),
     ("Output", "output"),
     ("Advanced", "advanced"),
 ]
@@ -128,22 +129,6 @@ def _build_override_data(ephemeral: dict[str, dict[str, Any]]) -> dict[str, dict
         if section in _PRESET_OVERRIDE_SECTIONS and keys:
             result[section] = dict(keys)
     return result
-
-
-def _apply_post_compile_overrides(
-    training_toml: dict[str, Any],
-    ephemeral: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """Apply ephemeral overrides for non-preset sections directly to the training TOML.
-
-    Modifies training_toml in-place and returns it.
-    """
-    for section, keys in ephemeral.items():
-        if section not in _PRESET_OVERRIDE_SECTIONS and keys:
-            if section not in training_toml:
-                training_toml[section] = {}
-            training_toml[section].update(keys)
-    return training_toml
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +185,7 @@ def _cleanup_old_drafts(meta_dir: Path) -> int:
 
 def _load_draft(path: Path) -> dict[str, dict[str, Any]]:
     """Load a draft TOML file and return it as a section->keys dict."""
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # type: ignore[no-redef]
+    import tomllib
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -501,8 +483,12 @@ class BlissfulConfigApp(App):
         self._edit_key: str | None = None
         # Track validation errors
         self._has_validation_error: bool = False
+        # Track unknown override keys (blocks compile)
+        self._has_unknown_keys: bool = False
         # Last compiled training_toml for type checking against existing values
         self._last_training_toml: dict[str, Any] | None = None
+        # Baseline training_toml (no overrides) for unknown-key detection
+        self._baseline_training_toml: dict[str, Any] | None = None
         # atexit handler registered flag
         self._atexit_registered: bool = False
         # Draft path for the current session (set on atexit write)
@@ -608,11 +594,14 @@ class BlissfulConfigApp(App):
             if result == "restore":
                 try:
                     restored = _load_draft(draft_path)
-                    self._ephemeral_overrides = restored
+                    # Filter to preset-layer sections only — non-overridable
+                    # sections (model, output, etc.) are stale from old drafts.
+                    filtered = {k: v for k, v in restored.items() if k in _PRESET_OVERRIDE_SECTIONS}
+                    self._ephemeral_overrides = filtered
                     self._update_modified_badge()
                     self._update_preview()
                     status = self.query_one("#status-text", Static)
-                    total = sum(len(v) for v in restored.values())
+                    total = sum(len(v) for v in filtered.values())
                     status.update(f"[bold green]Restored {total} override(s) from draft.[/]")
                     # Delete the draft after successful restore
                     draft_path.unlink(missing_ok=True)
@@ -632,9 +621,11 @@ class BlissfulConfigApp(App):
         """Update preview panel whenever any selector changes.
 
         Clears ephemeral overrides when the selection changes to avoid
-        stale overrides from a different config combination.
+        stale overrides from a different config combination. Defers
+        clearing until after the first successful preview so that
+        draft-restored overrides survive initial selector setup.
         """
-        if self._ephemeral_overrides:
+        if self._ephemeral_overrides and self._last_training_toml is not None:
             total = sum(len(v) for v in self._ephemeral_overrides.values())
             if total > 0:
                 # Clear ephemeral overrides on navigation
@@ -716,6 +707,13 @@ class BlissfulConfigApp(App):
         if self._edit_section is None or self._edit_key is None:
             return True
 
+        # Reject non-preset section edits during live validation
+        if self._edit_section not in _PRESET_OVERRIDE_SECTIONS:
+            error_label.update(f"[bold red]Cannot override [{self._edit_section}] — computed from machine/persona/arch.[/]")
+            self._has_validation_error = True
+            self._update_compile_button_state()
+            return False
+
         # Look up existing value for type checking
         existing_value = self._get_existing_value(self._edit_section, self._edit_key)
 
@@ -740,6 +738,18 @@ class BlissfulConfigApp(App):
 
         error_label = self.query_one("#edit-error", Label)
         status = self.query_one("#status-text", Static)
+
+        # Reject non-preset section overrides — model, output, advanced, dataset
+        # are computed from machine/persona/arch and cannot be overridden.
+        if self._edit_section not in _PRESET_OVERRIDE_SECTIONS:
+            error_label.update(
+                f"[bold red]Cannot override [{self._edit_section}] — "
+                f"computed from machine/persona/arch. "
+                f"Only {sorted(_PRESET_OVERRIDE_SECTIONS)} can be overridden.[/]"
+            )
+            self._has_validation_error = True
+            self._update_compile_button_state()
+            return
 
         raw_value = raw_value.strip()
         if not raw_value:
@@ -796,7 +806,7 @@ class BlissfulConfigApp(App):
     def _update_compile_button_state(self) -> None:
         """Enable/disable compile button based on validation state."""
         btn = self.query_one("#compile-btn", Button)
-        btn.disabled = self._has_validation_error
+        btn.disabled = self._has_validation_error or self._has_unknown_keys
 
     def _update_modified_badge(self) -> None:
         """Update the sub-title to show [MODIFIED] when overrides exist."""
@@ -862,23 +872,48 @@ class BlissfulConfigApp(App):
         try:
             from blissful_tuner.config_manager.compiler import compile_config
 
-            # Build override data from ephemeral overrides (preset-layer sections)
-            override_data = _build_override_data(self._ephemeral_overrides) or None
-
-            result = compile_config(
+            # Always compile a baseline (no overrides) for unknown-key detection
+            baseline_result = compile_config(
                 machine_path=machine_path,
                 arch_key=str(arch),
                 persona_path=persona_path,
                 preset_path=preset_path,
-                override_data=override_data,
             )
+            self._baseline_training_toml = baseline_result["training_toml"]
 
-            training_toml = result["training_toml"]
+            # Build override data from ephemeral overrides (preset-layer sections)
+            override_data = _build_override_data(self._ephemeral_overrides) or None
 
-            # Apply non-preset section overrides directly
-            _apply_post_compile_overrides(training_toml, self._ephemeral_overrides)
+            # Compile with overrides for display (or reuse baseline if none)
+            if override_data:
+                result = compile_config(
+                    machine_path=machine_path,
+                    arch_key=str(arch),
+                    persona_path=persona_path,
+                    preset_path=preset_path,
+                    override_data=override_data,
+                )
+                training_toml = result["training_toml"]
+            else:
+                training_toml = self._baseline_training_toml
 
             self._last_training_toml = training_toml
+
+            # Check override keys against baseline sections (same check compile_to_disk uses)
+            unknown_keys: list[str] = []
+            if override_data and self._baseline_training_toml:
+                for section, keys in override_data.items():
+                    if not isinstance(keys, dict):
+                        continue
+                    baseline_section = self._baseline_training_toml.get(section, {})
+                    if not isinstance(baseline_section, dict):
+                        baseline_section = {}
+                    for key in keys:
+                        if key not in baseline_section:
+                            unknown_keys.append(f"{section}.{key}")
+
+            self._has_unknown_keys = bool(unknown_keys)
+            self._update_compile_button_state()
 
             # Update each tab's DataTable
             for _tab_label, section_key in _PREVIEW_TABS:
@@ -896,8 +931,18 @@ class BlissfulConfigApp(App):
                             status = "[MODIFIED]" if flat_key in overrides_for_section else ""
                             table.add_row(flat_key, str(sub_value), status)
                     else:
-                        status = "[MODIFIED]" if key in overrides_for_section else ""
+                        if key in overrides_for_section:
+                            full_key = f"{section_key}.{key}"
+                            status = "[UNKNOWN]" if full_key in unknown_keys else "[MODIFIED]"
+                        else:
+                            status = ""
                         table.add_row(key, str(value), status)
+
+            if unknown_keys:
+                status_widget = self.query_one("#status-text", Static)
+                status_widget.update(
+                    f"[bold yellow]Warning:[/] Unknown key(s) will be rejected on compile: {', '.join(unknown_keys)}"
+                )
 
         except Exception as e:
             # Show error in status

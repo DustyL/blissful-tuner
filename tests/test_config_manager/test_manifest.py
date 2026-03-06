@@ -1,9 +1,6 @@
 """Tests for compiled manifest with upsert and concurrency safety."""
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
+import tomllib
 from pathlib import Path
 
 from blissful_tuner.config_manager.compiler import compile_to_disk

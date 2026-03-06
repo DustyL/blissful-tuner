@@ -11,10 +11,7 @@ import re
 import stat
 import tempfile
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore[no-redef]
+import tomllib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,9 +152,15 @@ def _build_training_toml(
 
     Sections: model, dataset, network, optimizer, training, sampling, output, advanced.
     """
+    from blissful_tuner.config_manager.validator import ConfigValidationError
+
     persona_name = persona_data.get("persona", {}).get("name", "unknown")
+    if not isinstance(persona_name, str):
+        raise ConfigValidationError(f"Persona name must be a string, got {type(persona_name).__name__}: {persona_name!r}")
     persona_lower = persona_name.lower()
     preset_slug = preset_data.get("preset", {}).get("slug", "default")
+    if not isinstance(preset_slug, str):
+        raise ConfigValidationError(f"Preset slug must be a string, got {type(preset_slug).__name__}: {preset_slug!r}")
     machine_hw = machine_data.get("machine", {}).get("hardware", {})
 
     run_name = f"{persona_lower}_{arch_key}_{preset_slug}"
@@ -293,6 +296,7 @@ def compile_config(
     preset_path: Path,
     override_path: Path | None = None,
     override_data: dict[str, Any] | None = None,
+    file_override_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compile a full training config from TOML layer files.
 
@@ -302,8 +306,11 @@ def compile_config(
         persona_path: Path to persona TOML.
         preset_path: Path to preset TOML.
         override_path: Optional path to override TOML (applied last).
+            Ignored if file_override_data is provided.
         override_data: Optional override dict (applied after override_path).
             Used by the TUI for ephemeral overrides without writing a file.
+        file_override_data: Pre-loaded override file data. When provided,
+            override_path is not read (avoids TOCTOU re-read).
 
     Returns:
         Dict with keys: training_toml, dataset_toml, provenance.
@@ -312,7 +319,8 @@ def compile_config(
     machine_data = load_layer(machine_path)
     persona_data = load_layer(persona_path)
     preset_data = load_layer(preset_path)
-    file_override_data = load_layer(override_path) if override_path else {}
+    if file_override_data is None:
+        file_override_data = load_layer(override_path) if override_path else {}
 
     # 2. Resolve arch
     canonical_key = resolve_arch_key(arch_key)
@@ -322,10 +330,17 @@ def compile_config(
     context = _build_context(machine_data, persona_data)
 
     # 4. Apply overrides (if any) to preset — file overrides first, then dict overrides
+    #    Only preset-layer sections (network, optimizer, training, sampling) are
+    #    meaningful here. Non-preset sections (model, output, advanced, dataset) are
+    #    computed from machine/persona/arch and would be silently ignored.
     if file_override_data:
-        preset_data = deep_merge(preset_data, file_override_data)
+        filtered_file = {k: v for k, v in file_override_data.items() if k in _OVERRIDABLE_SECTIONS or k == "preset"}
+        if filtered_file:
+            preset_data = deep_merge(preset_data, filtered_file)
     if override_data:
-        preset_data = deep_merge(preset_data, override_data)
+        filtered_data = {k: v for k, v in override_data.items() if k in _OVERRIDABLE_SECTIONS}
+        if filtered_data:
+            preset_data = deep_merge(preset_data, filtered_data)
 
     # 5. Build training TOML
     training_toml = _build_training_toml(
@@ -346,12 +361,16 @@ def compile_config(
         context=context,
     )
 
-    # 7. Provenance metadata
+    # 7. Provenance metadata (type validation already done in _build_training_toml)
+    persona_name = persona_data.get("persona", {}).get("name", "unknown")
+    preset_slug = preset_data.get("preset", {}).get("slug", "default")
     provenance = {
         "machine": Path(machine_path).name,
         "arch": canonical_key,
         "persona": Path(persona_path).name,
         "preset": Path(preset_path).name,
+        "persona_name": persona_name,
+        "preset_slug": preset_slug,
     }
     if override_path:
         provenance["override"] = Path(override_path).name
@@ -511,17 +530,43 @@ def _parse_override_sets(override_sets: list[str]) -> dict[str, Any]:
     return result
 
 
-def _compute_override_hash(override_sets: list[str] | None) -> str:
-    """Compute SHA256[:8] hash of sorted override key=value pairs.
+def _compute_override_hash(
+    override_sets: list[str] | None = None,
+    override_data: dict[str, Any] | None = None,
+    file_override_data: dict[str, Any] | None = None,
+) -> str:
+    """Compute SHA256[:16] hash of effective overrides from all three sources.
 
-    Returns empty string for base compiles (no overrides).
+    Hashes the canonical JSON representation of the combined override dict.
+    Returns empty string for base compiles (no overrides from any source).
+    All three override sources contribute to artifact identity.
+
+    Args:
+        override_sets: --set KEY=VALUE pairs.
+        override_data: Override dict from TUI/API.
+        file_override_data: Pre-loaded override file data (already filtered
+            to overridable sections + preset).
     """
-    if not override_sets:
+    import json
+
+    # Build combined override dict from all sources
+    combined: dict[str, Any] = {}
+    if file_override_data:
+        filtered = {k: v for k, v in file_override_data.items() if k in _OVERRIDABLE_SECTIONS or k == "preset"}
+        if filtered:
+            combined = filtered
+    if override_sets:
+        parsed = _parse_override_sets(override_sets)
+        combined = deep_merge(combined, parsed) if combined else parsed
+    if override_data:
+        combined = deep_merge(combined, override_data) if combined else override_data
+
+    if not combined:
         return ""
-    # Sort for deterministic hashing
-    sorted_overrides = sorted(override_sets)
-    serialized = "\n".join(sorted_overrides)
-    return hashlib.sha256(serialized.encode()).hexdigest()[:8]
+
+    # Canonical JSON for deterministic hashing (sorted keys)
+    serialized = json.dumps(combined, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode()).hexdigest()[:16]
 
 
 @contextlib.contextmanager
@@ -550,7 +595,7 @@ def _manifest_lock(manifest_path: Path):
         yield
 
 
-def _upsert_manifest(manifest_path: Path, entry: dict[str, Any]) -> None:
+def _upsert_manifest(manifest_path: Path, entry: dict[str, Any], *, _locked: bool = False) -> None:
     """Upsert a manifest entry using the 5-tuple key.
 
     The 5-tuple key is (persona, arch, preset, machine, override_hash).
@@ -558,10 +603,15 @@ def _upsert_manifest(manifest_path: Path, entry: dict[str, Any]) -> None:
     entry is appended.
 
     The manifest is written atomically via temp file + os.replace.
+
+    Args:
+        _locked: If True, caller already holds the manifest lock. Skips
+            re-acquisition to avoid deadlock.
     """
     manifest_path = Path(manifest_path)
 
-    with _manifest_lock(manifest_path):
+    lock_cm = contextlib.nullcontext() if _locked else _manifest_lock(manifest_path)
+    with lock_cm:
         manifest = _read_manifest(manifest_path)
 
         # Update compiler_version to current
@@ -673,8 +723,44 @@ def compile_to_disk(
 
     output_dir = Path(output_dir)
 
+    # 0. Best-effort cleanup of stale temp files from previous crashed compiles
+    _cleanup_tmp_files(output_dir)
+
+    from blissful_tuner.config_manager.validator import ConfigValidationError
+
+    # 0b. Load and validate override_path sections (fail-closed)
+    #     Load ONCE here and pass to compile_config + _compute_override_hash
+    #     to avoid TOCTOU re-reads where the file could change between loads.
+    file_override_data: dict[str, Any] = {}
+    if override_path:
+        file_override_data = load_layer(override_path)
+        bad_file_sections = sorted(set(file_override_data.keys()) - _OVERRIDABLE_SECTIONS - {"preset"})
+        if bad_file_sections:
+            raise ConfigValidationError(
+                f"Override file contains non-overridable section(s) {bad_file_sections}. "
+                f"Only {sorted(_OVERRIDABLE_SECTIONS)} (and [preset] metadata) are allowed."
+            )
+        # Validate that every section value (including [preset]) is a dict
+        for section, value in file_override_data.items():
+            if not isinstance(value, dict):
+                raise ConfigValidationError(f"Override file section '{section}' must be a table/dict, got {type(value).__name__}.")
+
     # 1. Build combined override dict from --set strings and/or direct override_data
+    #    _parse_override_sets already rejects non-overridable sections for --set.
+    #    Validate override_data sections here (TUI/API path).
     set_override_data = _parse_override_sets(override_sets) if override_sets else None
+    if override_data:
+        bad_sections = sorted(set(override_data.keys()) - _OVERRIDABLE_SECTIONS)
+        if bad_sections:
+            raise ConfigValidationError(
+                f"Cannot override section(s) {bad_sections}. "
+                f"Only {sorted(_OVERRIDABLE_SECTIONS)} are overridable. "
+                f"Sections like model, output, advanced are computed from machine/persona/arch."
+            )
+        for section, value in override_data.items():
+            if not isinstance(value, dict):
+                raise ConfigValidationError(f"Override section '{section}' must be a dict, got {type(value).__name__}.")
+
     combined_override_data = set_override_data
     if override_data:
         if combined_override_data:
@@ -682,13 +768,15 @@ def compile_to_disk(
         else:
             combined_override_data = override_data
 
-    # 2. Compile config (in-memory)
+    # 2. Compile config (in-memory) — pass pre-loaded file data to avoid re-read.
+    #    override_path is still passed for provenance (filename only, not re-read).
     result = compile_config(
         machine_path=machine_path,
         arch_key=arch_key,
         persona_path=persona_path,
         preset_path=preset_path,
         override_path=override_path,
+        file_override_data=file_override_data or None,
         override_data=combined_override_data,
     )
 
@@ -701,26 +789,38 @@ def compile_to_disk(
     canonical_key = provenance["arch"]
     stripped_report = validate_config(training_toml, arch, strict=not coerce)
 
-    # 3b. Validate --set override keys are known (unless --allow-unknown)
-    if override_sets and not allow_unknown:
-        from blissful_tuner.config_manager.validator import ConfigValidationError
+    # 3b. Validate override keys from ALL sources against a baseline compile
+    # (without any overrides). Section-aware: each key must exist in the
+    # same section of the baseline, preventing cross-section injection
+    # (e.g. 'training.dit' passing because 'dit' exists in [model]).
+    all_override_keys: dict[str, set[str]] = {}
+    if file_override_data:
+        for section, fields in file_override_data.items():
+            if section in _OVERRIDABLE_SECTIONS and isinstance(fields, dict):
+                all_override_keys.setdefault(section, set()).update(fields.keys())
+    if combined_override_data:
+        for section, fields in combined_override_data.items():
+            if isinstance(fields, dict):
+                all_override_keys.setdefault(section, set()).update(fields.keys())
 
-        # Flatten compiled config to get all known keys
-        known_keys: set[str] = set()
-        for section in training_toml.values():
-            if isinstance(section, dict):
-                known_keys.update(section.keys())
-        # Check each override key exists in the compiled output
-        for item in override_sets:
-            key, _ = item.split("=", 1)
-            if "." in key:
-                _, field = key.split(".", 1)
-            else:
-                field = key
-            if field not in known_keys:
-                raise ConfigValidationError(
-                    f"Unknown override key '{key}' (resolved field: '{field}'). Use --allow-unknown to force."
-                )
+    if not allow_unknown and all_override_keys:
+        # Compile a baseline without any overrides to get the true known key set
+        baseline = compile_config(
+            machine_path=machine_path,
+            arch_key=arch_key,
+            persona_path=persona_path,
+            preset_path=preset_path,
+        )
+        baseline_training = baseline["training_toml"]
+
+        # Check each override field against the SAME section in the baseline
+        for section_name, fields in all_override_keys.items():
+            baseline_section = baseline_training.get(section_name, {})
+            if not isinstance(baseline_section, dict):
+                baseline_section = {}
+            for field in fields:
+                if field not in baseline_section:
+                    raise ConfigValidationError(f"Unknown override key '{section_name}.{field}'. Use --allow-unknown to force.")
 
     # 4. Load machine data for env vars and naming
     machine_data = load_layer(machine_path)
@@ -730,11 +830,21 @@ def compile_to_disk(
     blissful_dir = machine_paths_cfg.get("blissful_dir", "/opt/blissful-tuner")
     env_vars = machine.get("env", {})
 
-    # 5. Extract persona name and preset slug from source data
-    persona_data = load_layer(persona_path)
-    persona_name = persona_data.get("persona", {}).get("name", "unknown")
-    preset_data = load_layer(preset_path)
-    preset_slug = preset_data.get("preset", {}).get("slug", "default")
+    # 5. Extract effective persona name and preset slug from provenance
+    #    These come from the compiled result (post-merge), not raw source files,
+    #    so that override_path [preset] changes are reflected in naming.
+    persona_name = provenance["persona_name"]
+    preset_slug = provenance["preset_slug"]
+
+    # 5b. Validate persona_name and preset_slug are filesystem-safe.
+    #     Type validation (must be string) already done in _build_training_toml.
+    _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+    for label, value in [("persona name", persona_name), ("preset slug", preset_slug)]:
+        if not _SAFE_NAME_RE.match(value):
+            raise ConfigValidationError(
+                f"{label.capitalize()} '{value}' contains filesystem-unsafe characters. "
+                f"Only alphanumeric, hyphens, underscores, and dots are allowed."
+            )
 
     # 6. Compute output paths — include _ov_{hash8} suffix when overrides exist
     arch_dir = _arch_display_dir(arch)
@@ -742,7 +852,9 @@ def compile_to_disk(
     out_base.mkdir(parents=True, exist_ok=True)
 
     persona_lower = persona_name.lower()
-    override_hash = _compute_override_hash(override_sets)
+    override_hash = _compute_override_hash(
+        override_sets=override_sets, override_data=override_data, file_override_data=file_override_data or None
+    )
     override_suffix = f"_ov_{override_hash}" if override_hash else ""
     run_name = f"{persona_lower}_{canonical_key}_{preset_slug}{override_suffix}"
 
@@ -753,6 +865,14 @@ def compile_to_disk(
     training_path = out_base / training_filename
     dataset_path = out_base / dataset_filename
     env_path = out_base / env_filename
+
+    # 6b. Output path collision guard — detect provenance mismatch before writing.
+    #     Uses the same provenance dict that render_training_toml writes to the header,
+    #     so field values match exactly during comparison.
+    from blissful_tuner.config_manager.validator import check_output_path_collision
+
+    for guarded_path in (training_path, dataset_path):
+        check_output_path_collision(guarded_path, provenance)
 
     # 7. Set dataset_config pointer to the absolute path of the dataset TOML
     training_toml["dataset"]["dataset_config"] = str(dataset_path.resolve())
@@ -779,23 +899,12 @@ def compile_to_disk(
     current_mode = os.stat(tmp_env).st_mode
     os.chmod(tmp_env, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    # Rename temps to final paths (atomic on same filesystem)
-    os.replace(str(tmp_training), str(training_path))
-    os.replace(str(tmp_dataset), str(dataset_path))
-    os.replace(str(tmp_env), str(env_path))
-
-    # 10b. Write _stripped.txt sidecar if coerce mode stripped keys
-    if not stripped_report.is_empty():
-        stripped_path = training_path.with_name(training_path.stem + "_stripped.txt")
-        stripped_path.write_text(stripped_report.format())
-        result["stripped_report_path"] = str(stripped_path)
-
-    # 11. Upsert manifest entry with source file stems for prune reconciliation
+    # 10b. Prepare manifest entry BEFORE publishing (for atomic publish+upsert)
     run_id = uuid.uuid4().hex[:12]
-
-    # Compute relative paths for manifest (relative to output_dir)
     training_rel = str(training_path.relative_to(output_dir))
     dataset_rel = str(dataset_path.relative_to(output_dir))
+
+    env_rel = str(env_path.relative_to(output_dir))
 
     manifest_entry = {
         "persona": persona_name,
@@ -810,10 +919,70 @@ def compile_to_disk(
         "status": "ok",
         "training_config": training_rel,
         "dataset_config": dataset_rel,
+        "env_config": env_rel,
     }
 
     manifest_path = output_dir / "manifest.toml"
-    _upsert_manifest(manifest_path, manifest_entry)
+
+    # Rename + manifest upsert under a single lock so prune cannot
+    # observe files without a corresponding manifest entry.
+    # On failure, restore previous artifacts from backups so recompile
+    # failures never destroy last-known-good outputs.
+    with _manifest_lock(manifest_path):
+        backup_id = uuid.uuid4().hex[:8]
+        finals = [str(training_path), str(dataset_path), str(env_path)]
+        backups: dict[str, str] = {}  # final_path -> backup_path
+        published: set[str] = set()  # files successfully renamed from tmp
+
+        try:
+            # Phase 1: Back up existing artifacts (inside try so partial
+            # backups are restored on failure at any point)
+            for final in finals:
+                if os.path.exists(final):
+                    backup = f"{final}.bak_{backup_id}"
+                    os.replace(final, backup)
+                    backups[final] = backup
+
+            # Phase 2: Publish new artifacts (track each successful rename)
+            os.replace(str(tmp_training), str(training_path))
+            published.add(str(training_path))
+            os.replace(str(tmp_dataset), str(dataset_path))
+            published.add(str(dataset_path))
+            os.replace(str(tmp_env), str(env_path))
+            published.add(str(env_path))
+
+            # Phase 3: Upsert manifest
+            _upsert_manifest(manifest_path, manifest_entry, _locked=True)
+        except BaseException:
+            # Restore previous good artifacts from backups
+            for final, backup in backups.items():
+                with contextlib.suppress(OSError):
+                    os.replace(backup, final)
+            # Remove only files that were published (renamed from tmp) during
+            # this compile and have no backup to restore from. This avoids
+            # accidentally deleting pre-existing files that weren't backed up
+            # because the backup phase failed before reaching them.
+            for final in published:
+                if final not in backups:
+                    with contextlib.suppress(OSError):
+                        os.unlink(final)
+            raise
+        else:
+            # Success — remove backups
+            for backup in backups.values():
+                with contextlib.suppress(OSError):
+                    os.unlink(backup)
+
+            # Sidecar management (best-effort after successful publish+manifest)
+            stripped_path = training_path.with_name(training_path.stem + "_stripped.txt")
+            try:
+                if not stripped_report.is_empty():
+                    stripped_path.write_text(stripped_report.format())
+                    result["stripped_report_path"] = str(stripped_path)
+                elif stripped_path.exists():
+                    stripped_path.unlink()
+            except OSError as e:
+                logger.warning("Failed to manage _stripped.txt sidecar: %s", e)
 
     # 12. Return result with file paths
     result["training_toml_path"] = str(training_path)

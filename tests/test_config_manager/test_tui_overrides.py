@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 
 from blissful_tuner.config_manager.tui.app import (
-    _apply_post_compile_overrides,
     _build_override_data,
     _cleanup_old_drafts,
     _list_draft_files,
@@ -77,40 +76,76 @@ class TestBuildOverrideData:
         assert "sampling" in result
 
 
-class TestApplyPostCompileOverrides:
-    """Test _apply_post_compile_overrides for non-preset sections."""
+class TestNonPresetSectionRejection:
+    """Non-preset sections (model, output, advanced) cannot be overridden."""
 
-    def test_model_override_applied(self):
-        training_toml: dict[str, Any] = {"model": {"dit": "/old/path"}}
-        ephemeral = {"model": {"dit": "/new/path"}}
-        result = _apply_post_compile_overrides(training_toml, ephemeral)
-        assert result["model"]["dit"] == "/new/path"
+    def test_override_data_model_section_filtered_in_compile(self):
+        """Model section in override_data is filtered out during compile_config merge."""
+        from blissful_tuner.config_manager.compiler import compile_config
 
-    def test_output_override_applied(self):
-        training_toml: dict[str, Any] = {"output": {"output_dir": "/old"}}
-        ephemeral = {"output": {"output_dir": "/new"}}
-        result = _apply_post_compile_overrides(training_toml, ephemeral)
-        assert result["output"]["output_dir"] == "/new"
+        fixtures = Path(__file__).parent / "fixtures"
+        # Compile with a model override — it should be filtered out
+        base = compile_config(
+            machine_path=fixtures / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=fixtures / "personas" / "TESTPERSONA.toml",
+            preset_path=fixtures / "presets" / "test_adamw.toml",
+        )
+        with_override = compile_config(
+            machine_path=fixtures / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=fixtures / "personas" / "TESTPERSONA.toml",
+            preset_path=fixtures / "presets" / "test_adamw.toml",
+            override_data={"model": {"dit": "/overridden/path"}},
+        )
+        # Model section should be identical — override_data model keys are filtered
+        assert base["training_toml"]["model"] == with_override["training_toml"]["model"]
 
-    def test_preset_sections_not_applied(self):
-        """Preset sections should NOT be applied by post-compile (they go via override_data)."""
-        training_toml: dict[str, Any] = {"training": {"seed": 42}}
-        ephemeral = {"training": {"seed": 99}}
-        result = _apply_post_compile_overrides(training_toml, ephemeral)
-        # training is a preset section, so it should not be touched by post-compile
-        assert result["training"]["seed"] == 42
+    def test_override_data_output_section_filtered(self):
+        """Output section in override_data is filtered out during compile_config merge."""
+        from blissful_tuner.config_manager.compiler import compile_config
 
-    def test_new_section_created(self):
-        training_toml: dict[str, Any] = {}
-        ephemeral = {"advanced": {"compile": True}}
-        result = _apply_post_compile_overrides(training_toml, ephemeral)
-        assert result["advanced"]["compile"] is True
+        fixtures = Path(__file__).parent / "fixtures"
+        base = compile_config(
+            machine_path=fixtures / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=fixtures / "personas" / "TESTPERSONA.toml",
+            preset_path=fixtures / "presets" / "test_adamw.toml",
+        )
+        with_override = compile_config(
+            machine_path=fixtures / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=fixtures / "personas" / "TESTPERSONA.toml",
+            preset_path=fixtures / "presets" / "test_adamw.toml",
+            override_data={"output": {"output_dir": "/overridden"}},
+        )
+        assert base["training_toml"]["output"] == with_override["training_toml"]["output"]
 
-    def test_modifies_in_place(self):
-        training_toml: dict[str, Any] = {"model": {"dit": "/old"}}
-        ephemeral = {"model": {"dit": "/new"}}
-        _apply_post_compile_overrides(training_toml, ephemeral)
-        assert training_toml["model"]["dit"] == "/new"
+    def test_preset_section_override_still_works(self):
+        """Preset sections (training, network, etc.) still apply correctly."""
+        from blissful_tuner.config_manager.compiler import compile_config
+
+        fixtures = Path(__file__).parent / "fixtures"
+        result = compile_config(
+            machine_path=fixtures / "machines" / "test_machine.toml",
+            arch_key="qwen_image",
+            persona_path=fixtures / "personas" / "TESTPERSONA.toml",
+            preset_path=fixtures / "presets" / "test_adamw.toml",
+            override_data={"training": {"seed": 12345}},
+        )
+        assert result["training_toml"]["training"]["seed"] == 12345
+
+    def test_build_override_data_filters_non_preset(self):
+        """_build_override_data only includes preset-layer sections."""
+        ephemeral: dict[str, dict[str, Any]] = {
+            "training": {"seed": 99},
+            "model": {"dit": "/bad"},
+            "output": {"output_dir": "/bad"},
+        }
+        result = _build_override_data(ephemeral)
+        assert "training" in result
+        assert "model" not in result
+        assert "output" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +354,43 @@ class TestCompileConfigOverrideData:
 
         prov = result["provenance"]
         assert "ephemeral_overrides" not in prov
+
+
+class TestComputeOverrideHash:
+    """Test _compute_override_hash() covers both override_sets and override_data."""
+
+    def test_empty_returns_empty(self):
+        from blissful_tuner.config_manager.compiler import _compute_override_hash
+
+        assert _compute_override_hash() == ""
+
+    def test_override_sets_only(self):
+        from blissful_tuner.config_manager.compiler import _compute_override_hash
+
+        h = _compute_override_hash(override_sets=["training.seed=42"])
+        assert len(h) == 16
+        assert h != ""
+
+    def test_override_data_only(self):
+        from blissful_tuner.config_manager.compiler import _compute_override_hash
+
+        h = _compute_override_hash(override_data={"training": {"seed": 42}})
+        assert len(h) == 16
+        assert h != ""
+
+    def test_same_content_same_hash(self):
+        from blissful_tuner.config_manager.compiler import _compute_override_hash
+
+        h1 = _compute_override_hash(override_sets=["training.seed=42"])
+        h2 = _compute_override_hash(override_data={"training": {"seed": 42}})
+        assert h1 == h2
+
+    def test_different_content_different_hash(self):
+        from blissful_tuner.config_manager.compiler import _compute_override_hash
+
+        h1 = _compute_override_hash(override_data={"training": {"seed": 42}})
+        h2 = _compute_override_hash(override_data={"training": {"seed": 99}})
+        assert h1 != h2
 
 
 class TestParseOverrideSets:

@@ -7,10 +7,7 @@ import logging
 import os
 import sys
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore[no-redef]
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -476,10 +473,16 @@ def find_orphaned_files(compiled_dir: Path) -> list[Path]:
         with open(manifest_path, "rb") as f:
             manifest = tomllib.load(f)
         for entry in manifest.get("entries", []):
-            for key in ("training_config", "dataset_config"):
+            for key in ("training_config", "dataset_config", "env_config"):
                 rel = entry.get(key, "")
                 if rel:
                     referenced.add((compiled_dir / rel).resolve())
+            # Infer env.sh for legacy entries that lack env_config
+            training_rel = entry.get("training_config", "")
+            if training_rel and not entry.get("env_config"):
+                inferred_env = (compiled_dir / training_rel).parent / "env.sh"
+                if inferred_env.exists():
+                    referenced.add(inferred_env.resolve())
 
     # Scan disk for prunable files
     orphans: list[Path] = []
@@ -537,47 +540,51 @@ def prune_stale_artifacts(
     Returns:
         Dict with stale_count, orphan_count, stale_entries, orphaned_files.
     """
+    import contextlib
+    import tempfile
+
     import tomlkit
 
-    from blissful_tuner.config_manager.compiler import _read_manifest
+    from blissful_tuner.config_manager.compiler import _manifest_lock, _read_manifest
 
     compiled_dir = Path(compiled_dir).resolve()
     manifest_path = compiled_dir / "manifest.toml"
 
-    # Phase 1: find stale entries
-    all_stale = find_stale_entries(compiled_dir, meta_dir=meta_dir)
+    # Hold the manifest lock for the entire prune operation so that
+    # a concurrent compile cannot publish files between our manifest
+    # read (Phase 1) and orphan deletion (Phase 2).
+    with _manifest_lock(manifest_path):
+        # Phase 1: find stale entries
+        all_stale = find_stale_entries(compiled_dir, meta_dir=meta_dir)
 
-    # Apply scoping filters
-    scoped_stale = []
-    for item in all_stale:
-        entry = item["entry"]
-        if machine is not None and entry.get("machine") != machine:
-            continue
-        if persona is not None and entry.get("persona") != persona:
-            continue
-        scoped_stale.append(item)
+        # Apply scoping filters
+        scoped_stale = []
+        for item in all_stale:
+            entry = item["entry"]
+            if machine is not None and entry.get("machine") != machine:
+                continue
+            if persona is not None and entry.get("persona") != persona:
+                continue
+            scoped_stale.append(item)
 
-    # Report stale entries
-    for item in scoped_stale:
-        entry = item["entry"]
-        logger.info(
-            "Stale entry: %s/%s/%s (machine=%s) -- %s",
-            entry.get("persona"),
-            entry.get("arch"),
-            entry.get("preset"),
-            entry.get("machine"),
-            item["reason"],
-        )
-        print(
-            f"  STALE: {entry.get('persona')}/{entry.get('arch')}/{entry.get('preset')}"
-            f" (machine={entry.get('machine')}) -- {item['reason']}"
-        )
+        # Report stale entries
+        for item in scoped_stale:
+            entry = item["entry"]
+            logger.info(
+                "Stale entry: %s/%s/%s (machine=%s) -- %s",
+                entry.get("persona"),
+                entry.get("arch"),
+                entry.get("preset"),
+                entry.get("machine"),
+                item["reason"],
+            )
+            print(
+                f"  STALE: {entry.get('persona')}/{entry.get('arch')}/{entry.get('preset')}"
+                f" (machine={entry.get('machine')}) -- {item['reason']}"
+            )
 
-    # Remove stale entries from manifest (if executing) — lock+atomic like compiler
-    if not dry_run and scoped_stale and manifest_path.exists():
-        from blissful_tuner.config_manager.compiler import _manifest_lock, _read_manifest
-
-        with _manifest_lock(manifest_path):
+        # Remove stale entries from manifest (if executing)
+        if not dry_run and scoped_stale and manifest_path.exists():
             manifest = _read_manifest(manifest_path)
 
             # Build set of stale 5-tuple keys
@@ -606,8 +613,6 @@ def prune_stale_artifacts(
             else:
                 doc.add("entries", tomlkit.array())
 
-            import tempfile
-
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(manifest_path.parent),
                 prefix=".tmp_manifest_prune_",
@@ -618,60 +623,58 @@ def prune_stale_artifacts(
                     f.write(tomlkit.dumps(doc))
                 os.replace(tmp_path, str(manifest_path))
             except BaseException:
-                import contextlib
-
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
                 raise
 
-    # Phase 2: find orphaned files (after manifest cleanup)
-    orphans = find_orphaned_files(compiled_dir)
+        # Phase 2: find orphaned files (after manifest cleanup, still under lock)
+        orphans = find_orphaned_files(compiled_dir)
 
-    # Apply machine scoping to orphans: only delete files under machine/ subdirectory
-    if machine is not None:
-        machine_prefix = compiled_dir / machine
-        orphans = [p for p in orphans if p.resolve().is_relative_to(machine_prefix.resolve())]
+        # Apply machine scoping to orphans: only delete files under machine/ subdirectory
+        if machine is not None:
+            machine_prefix = compiled_dir / machine
+            orphans = [p for p in orphans if p.resolve().is_relative_to(machine_prefix.resolve())]
 
-    # Apply persona scoping: only delete files under */persona/ subdirectory
-    if persona is not None:
-        orphans = [p for p in orphans if _file_under_persona(p, compiled_dir, persona)]
+        # Apply persona scoping: only delete files under */persona/ subdirectory
+        if persona is not None:
+            orphans = [p for p in orphans if _file_under_persona(p, compiled_dir, persona)]
 
-    # Collect _stripped.txt sidecars for orphaned .toml files
-    sidecars: list[Path] = []
-    for orphan in orphans:
-        if orphan.suffix == ".toml":
-            stripped = orphan.with_name(orphan.stem + "_stripped.txt")
-            if stripped.exists() and stripped not in orphans:
-                sidecars.append(stripped)
-    orphans.extend(sidecars)
-
-    # Report orphans
-    for orphan in orphans:
-        print(f"  ORPHAN: {orphan}")
-
-    # Delete orphaned files (if executing)
-    deleted_count = 0
-    if not dry_run:
+        # Collect _stripped.txt sidecars for orphaned .toml files
+        sidecars: list[Path] = []
         for orphan in orphans:
-            # Final safety check: realpath inside compiled tree
-            real = Path(os.path.realpath(orphan))
-            try:
-                real.relative_to(compiled_dir)
-            except ValueError:
-                logger.warning("Refusing to delete file outside compiled tree: %s -> %s", orphan, real)
-                continue
+            if orphan.suffix == ".toml":
+                stripped = orphan.with_name(orphan.stem + "_stripped.txt")
+                if stripped.exists() and stripped not in orphans:
+                    sidecars.append(stripped)
+        orphans.extend(sidecars)
 
-            # Only delete prunable extensions
-            if orphan.suffix not in _PRUNABLE_EXTENSIONS:
-                logger.warning("Refusing to delete non-prunable extension: %s", orphan)
-                continue
+        # Report orphans
+        for orphan in orphans:
+            print(f"  ORPHAN: {orphan}")
 
-            try:
-                orphan.unlink()
-                logger.info("Deleted orphaned file: %s", orphan)
-                deleted_count += 1
-            except OSError as e:
-                logger.warning("Failed to delete orphaned file %s: %s", orphan, e)
+        # Delete orphaned files (if executing)
+        deleted_count = 0
+        if not dry_run:
+            for orphan in orphans:
+                # Final safety check: realpath inside compiled tree
+                real = Path(os.path.realpath(orphan))
+                try:
+                    real.relative_to(compiled_dir)
+                except ValueError:
+                    logger.warning("Refusing to delete file outside compiled tree: %s -> %s", orphan, real)
+                    continue
+
+                # Only delete prunable extensions
+                if orphan.suffix not in _PRUNABLE_EXTENSIONS:
+                    logger.warning("Refusing to delete non-prunable extension: %s", orphan)
+                    continue
+
+                try:
+                    orphan.unlink()
+                    logger.info("Deleted orphaned file: %s", orphan)
+                    deleted_count += 1
+                except OSError as e:
+                    logger.warning("Failed to delete orphaned file %s: %s", orphan, e)
 
     result = {
         "stale_count": len(scoped_stale),
