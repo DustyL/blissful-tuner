@@ -76,14 +76,15 @@ def preprocess_contents_qwen_image(batch: List[ItemInfo], is_layered: bool) -> t
 
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
-    controls = []
+    controls: list[list[torch.Tensor] | None] = []
     for item in batch:
         if item.control_content is not None and len(item.control_content) > 0:
             controls.append([torch.from_numpy(cc[..., :3]) for cc in item.control_content])  # ensure RGB, remove alpha if present
+        else:
+            controls.append(None)
 
-    if len(controls) > 0:  # controls is list of list of (H, W, C), where H, W can vary
-        controls = [[c.permute(2, 0, 1) for c in cl] for cl in controls]  # list of list of (H, W, C) -> list of list of (C, H, W)
-        controls = [[c / 127.5 - 1.0 for c in cl] for cl in controls]  # normalize to [-1, 1]
+    if not all(c is None for c in controls):
+        controls = [[c.permute(2, 0, 1) / 127.5 - 1.0 for c in cl] if cl is not None else None for cl in controls]
     else:
         controls = None
 
@@ -102,10 +103,15 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
         latents = torch.cat(latents, dim=2)  # (B, C, F, H, W)
 
         if controls is not None:
-            control_latents = [
-                [vae.encode_pixels_to_latents(c.to(vae.device, dtype=vae.dtype).unsqueeze(0))[0] for c in cl] for cl in controls
-            ]
-            # now control_latents is list of list of (C, 1, H, W) tensors
+            control_latents: list[list[torch.Tensor] | None] = []
+            for cl in controls:
+                if cl is not None:
+                    control_latents.append(
+                        [vae.encode_pixels_to_latents(c.to(vae.device, dtype=vae.dtype).unsqueeze(0))[0] for c in cl]
+                    )
+                else:
+                    control_latents.append(None)
+            # now control_latents is dense list: list of (list of (C, 1, H, W) tensors) or None per item
         else:
             control_latents = None
 
