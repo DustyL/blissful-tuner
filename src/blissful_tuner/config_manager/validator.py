@@ -221,8 +221,11 @@ def check_preset_slug_uniqueness(preset_paths: list[Path]) -> None:
     slugs: dict[str, Path] = {}
     for path in preset_paths:
         path = Path(path)
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            raise ConfigValidationError(f"Cannot read preset file {path}: {e}") from e
         slug = data.get("preset", {}).get("slug")
         if slug is None:
             continue
@@ -281,7 +284,10 @@ def _extract_provenance_from_file(path: Path) -> dict[str, str] | None:
 
     Returns None if the file doesn't contain a blissful-config provenance header.
     """
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None  # Treat as "no provenance" — allow overwrite
 
     # Quick check: does this look like a blissful-config output?
     if "Compiled by blissful-config" not in text:

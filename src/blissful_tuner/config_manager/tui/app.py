@@ -25,6 +25,8 @@ from textual.widgets import (
     TabPane,
 )
 
+from blissful_tuner.config_manager import find_compiled_dir, find_meta_dir
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -32,28 +34,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DRAFT_MAX_AGE_DAYS = 7
-
-
-def _find_meta_dir() -> Path:
-    """Find configs/meta/ relative to the repo root."""
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        meta = parent / "configs" / "meta"
-        if meta.is_dir():
-            return meta
-    raise FileNotFoundError("Could not find configs/meta/ directory")
-
-
-def _find_compiled_dir() -> Path:
-    """Find configs/compiled/ relative to the repo root."""
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        configs = parent / "configs"
-        if configs.is_dir():
-            compiled = configs / "compiled"
-            compiled.mkdir(parents=True, exist_ok=True)
-            return compiled
-    raise FileNotFoundError("Could not find configs/ directory")
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +46,7 @@ def _list_machines(meta_dir: Path) -> list[tuple[str, str]]:
     machines_dir = meta_dir / "machines"
     if not machines_dir.is_dir():
         return []
-    return sorted((p.stem, p.stem) for p in machines_dir.glob("*.toml") if p.stem != "default")
+    return sorted((p.stem, p.stem) for p in machines_dir.glob("*.toml"))
 
 
 def _list_personas(meta_dir: Path) -> list[tuple[str, str]]:
@@ -472,7 +452,7 @@ class BlissfulConfigApp(App):
     def __init__(self) -> None:
         super().__init__()
         try:
-            self._meta_dir: Path | None = _find_meta_dir()
+            self._meta_dir: Path | None = find_meta_dir()
         except FileNotFoundError:
             self._meta_dir = None
 
@@ -584,8 +564,10 @@ class BlissfulConfigApp(App):
         try:
             _write_override_toml(draft_path, self._ephemeral_overrides)
             self._draft_path = draft_path
-        except Exception:
-            pass  # Best-effort on abnormal exit
+        except Exception as e:
+            import sys
+
+            print(f"Warning: could not save draft overrides: {e}", file=sys.stderr)
 
     def _offer_draft_restore(self, draft_path: Path) -> None:
         """Push the draft restore modal screen."""
@@ -851,6 +833,7 @@ class BlissfulConfigApp(App):
 
     def _update_preview(self) -> None:
         """Recompute the merged config preview from current selections + ephemeral overrides."""
+        self._has_unknown_keys = False
         machine, arch, persona, preset = self._get_selections()
 
         # If any selection is blank, clear all tables
@@ -994,7 +977,7 @@ class BlissfulConfigApp(App):
         preset_path = self._meta_dir / "presets" / f"{preset}.toml"
 
         try:
-            output_dir = _find_compiled_dir()
+            output_dir = find_compiled_dir()
         except FileNotFoundError:
             status.update("[bold red]Error:[/] Could not find configs/compiled/ directory.")
             return

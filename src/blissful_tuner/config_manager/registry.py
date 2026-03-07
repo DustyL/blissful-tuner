@@ -98,6 +98,7 @@ ARCH_REGISTRY: dict[str, dict[str, Any]] = {
             "i2v": True,
             "cute_attention": True,
         },
+        "warnings": {},
         "constraints": {},
         "cache_suffix": "qwen_image",
     },
@@ -139,6 +140,7 @@ ARCH_REGISTRY: dict[str, dict[str, Any]] = {
             "i2v": True,
             "cute_attention": False,
         },
+        "warnings": {},
         "constraints": {},
         "cache_suffix": "flux2klein9b",
     },
@@ -480,7 +482,7 @@ ARCH_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "warnings": {},
         "constraints": {},
-        "cache_suffix": "flux2klein4b",
+        "cache_suffix": "flux2klein4b",  # Shared with klein-base-4b — same VAE, caches interchangeable
     },
     "flux2_klein9b_distil": {
         "display_name": "FLUX.2 Klein-9B (distilled)",
@@ -684,7 +686,7 @@ ARCH_REGISTRY: dict[str, dict[str, Any]] = {
         },
         "warnings": {},
         "constraints": {},
-        "cache_suffix": "zimage",
+        "cache_suffix": "zimage",  # Shared with zimage_base — same VAE, caches interchangeable
     },
     "kandinsky5": {
         "display_name": "Kandinsky 5",

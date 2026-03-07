@@ -24,7 +24,7 @@ def parse_value(raw: str) -> Any:
     try:
         parsed = tomllib.loads(f"_v = {raw}")
         return parsed["_v"]
-    except Exception:
+    except (ValueError, tomllib.TOMLDecodeError):
         # Fallback: treat as bare string
         return raw
 

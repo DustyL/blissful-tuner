@@ -46,6 +46,17 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+
+
+def _shell_escape(value: str) -> str:
+    """Escape a value for safe inclusion in double-quoted bash strings."""
+    for old, new in [("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("`", "\\`"), ("!", "\\!")]:
+        value = value.replace(old, new)
+    return value
+
+
 _MAX_INTERPOLATION_DEPTH = 10
 
 
@@ -265,8 +276,12 @@ def _build_dataset_toml(
     }
 
     # [[datasets]] — one per resolution
+    from blissful_tuner.config_manager.validator import ConfigValidationError
+
     datasets: list[dict[str, Any]] = []
     for res in resolutions:
+        if not isinstance(res, (list, tuple)) or len(res) < 2:
+            raise ConfigValidationError(f"Resolution must have [width, height], got {res!r}")
         w, h = res[0], res[1]
         entry: dict[str, Any] = {
             "resolution": list(res),
@@ -382,6 +397,7 @@ def compile_config(
         "training_toml": training_toml,
         "dataset_toml": dataset_toml,
         "provenance": provenance,
+        "machine_data": machine_data,
     }
 
 
@@ -418,22 +434,29 @@ def _render_env_sh(
 
     Produces a bash script that exports machine env vars and sources .env.local.
     """
+    from blissful_tuner.config_manager.validator import ConfigValidationError
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    safe_persona = _shell_escape(persona_name)
+    safe_machine = _shell_escape(machine_name)
     lines = [
         "#!/usr/bin/env bash",
-        f"# Environment variables for {persona_name} on {machine_name}",
+        f"# Environment variables for {safe_persona} on {safe_machine}",
         f"# Compiled by blissful-config at {timestamp}",
         "",
     ]
 
     for key, value in sorted(env_vars.items()):
-        lines.append(f'export {key}="{value}"')
+        if not _ENV_KEY_RE.match(key):
+            raise ConfigValidationError(f"Invalid environment variable name '{key}': must match [A-Za-z_][A-Za-z0-9_]*")
+        lines.append(f'export {key}="{_shell_escape(str(value))}"')
 
     lines.append("")
     lines.append("# Source local secrets if present (API keys, tokens, etc.)")
     lines.append("# Create .env.local in the project root to set private variables.")
-    lines.append(f'if [ -f "{blissful_dir}/.env.local" ]; then')
-    lines.append(f'    source "{blissful_dir}/.env.local"')
+    safe_blissful_dir = _shell_escape(blissful_dir)
+    lines.append(f'if [ -f "{safe_blissful_dir}/.env.local" ]; then')
+    lines.append(f'    source "{safe_blissful_dir}/.env.local"')
     lines.append("fi")
     lines.append("")  # trailing newline
 
@@ -574,7 +597,7 @@ def _manifest_lock(manifest_path: Path):
     """Context manager for manifest file locking.
 
     Uses fcntl.flock on Unix for concurrent access safety.
-    Falls back to no-lock on platforms without fcntl (Windows/Mac dev).
+    Falls back to no-lock on platforms without fcntl (Windows).
     """
     lock_path = manifest_path.parent / ".manifest.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -822,8 +845,8 @@ def compile_to_disk(
                 if field not in baseline_section:
                     raise ConfigValidationError(f"Unknown override key '{section_name}.{field}'. Use --allow-unknown to force.")
 
-    # 4. Load machine data for env vars and naming
-    machine_data = load_layer(machine_path)
+    # 4. Reuse machine data from compile_config (avoids TOCTOU re-read)
+    machine_data = result["machine_data"]
     machine = machine_data.get("machine", {})
     machine_name = machine.get("name", "unknown")
     machine_paths_cfg = machine.get("paths", {})
@@ -836,10 +859,9 @@ def compile_to_disk(
     persona_name = provenance["persona_name"]
     preset_slug = provenance["preset_slug"]
 
-    # 5b. Validate persona_name and preset_slug are filesystem-safe.
+    # 5b. Validate persona_name, preset_slug, and machine_name are filesystem-safe.
     #     Type validation (must be string) already done in _build_training_toml.
-    _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
-    for label, value in [("persona name", persona_name), ("preset slug", preset_slug)]:
+    for label, value in [("machine name", machine_name), ("persona name", persona_name), ("preset slug", preset_slug)]:
         if not _SAFE_NAME_RE.match(value):
             raise ConfigValidationError(
                 f"{label.capitalize()} '{value}' contains filesystem-unsafe characters. "
@@ -890,14 +912,20 @@ def compile_to_disk(
     tmp_dataset = out_base / f".tmp_{tmp_id}_{dataset_filename}"
     tmp_env = out_base / f".tmp_{tmp_id}_{env_filename}"
 
-    # Write to temp files
-    tmp_training.write_text(training_str)
-    tmp_dataset.write_text(dataset_str)
-    tmp_env.write_text(env_str)
-
-    # Make temp env.sh executable before rename
-    current_mode = os.stat(tmp_env).st_mode
-    os.chmod(tmp_env, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # Write to temp files (clean up on failure before we enter the lock)
+    written_temps: list[Path] = []
+    try:
+        for tmp, content in [(tmp_training, training_str), (tmp_dataset, dataset_str), (tmp_env, env_str)]:
+            tmp.write_text(content)
+            written_temps.append(tmp)
+        # Make temp env.sh executable before rename
+        current_mode = os.stat(tmp_env).st_mode
+        os.chmod(tmp_env, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except BaseException:
+        for t in written_temps:
+            with contextlib.suppress(OSError):
+                t.unlink()
+        raise
 
     # 10b. Prepare manifest entry BEFORE publishing (for atomic publish+upsert)
     run_id = uuid.uuid4().hex[:12]
@@ -956,8 +984,10 @@ def compile_to_disk(
         except BaseException:
             # Restore previous good artifacts from backups
             for final, backup in backups.items():
-                with contextlib.suppress(OSError):
+                try:
                     os.replace(backup, final)
+                except OSError as e:
+                    logger.error("CRITICAL: Failed to restore backup %s -> %s: %s", backup, final, e)
             # Remove only files that were published (renamed from tmp) during
             # this compile and have no backup to restore from. This avoids
             # accidentally deleting pre-existing files that weren't backed up

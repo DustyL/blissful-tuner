@@ -11,36 +11,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from blissful_tuner.config_manager import find_compiled_dir, find_meta_dir
+
 logger = logging.getLogger(__name__)
-
-
-def _find_meta_dir() -> Path:
-    """Find configs/meta/ relative to the repo root.
-
-    Walks up from this file's location to find the project root
-    (identified by configs/meta/ existing).
-    """
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        meta = parent / "configs" / "meta"
-        if meta.is_dir():
-            return meta
-    raise FileNotFoundError("Could not find configs/meta/ directory")
-
-
-def _find_compiled_dir() -> Path:
-    """Find configs/compiled/ relative to the repo root.
-
-    Creates the directory if it does not exist but configs/ does.
-    """
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        configs = parent / "configs"
-        if configs.is_dir():
-            compiled = configs / "compiled"
-            compiled.mkdir(parents=True, exist_ok=True)
-            return compiled
-    raise FileNotFoundError("Could not find configs/ directory")
 
 
 def _list_personas(meta_dir: Path) -> list[str]:
@@ -59,7 +32,7 @@ def _list_presets(meta_dir: Path) -> list[str]:
     return sorted(p.stem for p in presets_dir.glob("*.toml"))
 
 
-def _parse_set_overrides(set_overrides: list[str] | None) -> dict[str, str]:
+def _validate_set_format(set_overrides: list[str] | None) -> dict[str, str]:
     """Parse --set KEY=VALUE pairs into a dict.
 
     Splits on the first '=' only, so values containing '=' are preserved.
@@ -130,6 +103,7 @@ def main_compile(args: list[str] | None = None) -> int:
     Returns:
         Exit code (0 for success, 1 for usage/input error, 2 for compile error).
     """
+    logging.basicConfig(level=logging.WARNING)
     parser = argparse.ArgumentParser(
         prog="bt-compile",
         description="Compile layered TOML configs into standalone training configs.",
@@ -171,7 +145,7 @@ def main_compile(args: list[str] | None = None) -> int:
 
     if parsed.list_personas:
         try:
-            meta_dir = _find_meta_dir()
+            meta_dir = find_meta_dir()
         except FileNotFoundError:
             print("No configs/meta/ directory found", file=sys.stderr)
             return 0
@@ -181,7 +155,7 @@ def main_compile(args: list[str] | None = None) -> int:
 
     if parsed.list_presets:
         try:
-            meta_dir = _find_meta_dir()
+            meta_dir = find_meta_dir()
         except FileNotFoundError:
             print("No configs/meta/ directory found", file=sys.stderr)
             return 0
@@ -221,7 +195,7 @@ def main_compile(args: list[str] | None = None) -> int:
 
     # --- Validate --set overrides (format check: KEY=VALUE) ---
     try:
-        _parse_set_overrides(parsed.set_overrides)
+        _validate_set_format(parsed.set_overrides)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -231,14 +205,14 @@ def main_compile(args: list[str] | None = None) -> int:
         output_dir = parsed.output_dir
     else:
         try:
-            output_dir = _find_compiled_dir()
+            output_dir = find_compiled_dir()
         except FileNotFoundError:
             print("error: could not find configs/ directory; use --output-dir", file=sys.stderr)
             return 1
 
     # --- Resolve paths ---
     try:
-        meta_dir = _find_meta_dir()
+        meta_dir = find_meta_dir()
     except FileNotFoundError:
         meta_dir = None
 
@@ -285,6 +259,8 @@ def main_compile(args: list[str] | None = None) -> int:
         personas = [(persona_name, persona_path)]
 
     # --- Run compile for each persona ---
+    from blissful_tuner.config_manager.validator import ConfigValidationError
+
     failed = False
     for persona_name, persona_path in personas:
         try:
@@ -303,8 +279,11 @@ def main_compile(args: list[str] | None = None) -> int:
             print(f"  Compiled: {persona_name}/{parsed.arch}/{parsed.preset}")
             print(f"    Training: {result['training_toml_path']}")
             print(f"    Dataset:  {result['dataset_toml_path']}")
-        except Exception as e:
-            print(f"  FAILED: {persona_name}/{parsed.arch}/{parsed.preset}: {e}", file=sys.stderr)
+        except (ConfigValidationError, FileNotFoundError, KeyError, ValueError) as e:
+            print(
+                f"  FAILED: {persona_name}/{parsed.arch}/{parsed.preset}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
             failed = True
 
     return 2 if failed else 0
@@ -318,6 +297,7 @@ def main_diff(args: list[str] | None = None) -> int:
     Returns:
         Exit code: 0 if no differences, 1 if differences found, 2 on error.
     """
+    logging.basicConfig(level=logging.WARNING)
     parser = argparse.ArgumentParser(
         prog="bt-diff",
         description="Compare two TOML config files semantically.",
@@ -345,10 +325,18 @@ def main_diff(args: list[str] | None = None) -> int:
             return 2
 
     # Load both files
-    with open(parsed.file_a, "rb") as f:
-        data_a = tomllib.load(f)
-    with open(parsed.file_b, "rb") as f:
-        data_b = tomllib.load(f)
+    try:
+        with open(parsed.file_a, "rb") as f:
+            data_a = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        print(f"error: invalid TOML in {parsed.file_a}: {e}", file=sys.stderr)
+        return 2
+    try:
+        with open(parsed.file_b, "rb") as f:
+            data_b = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        print(f"error: invalid TOML in {parsed.file_b}: {e}", file=sys.stderr)
+        return 2
 
     # Optionally flatten
     if parsed.flatten:
@@ -406,6 +394,8 @@ def find_stale_entries(compiled_dir: Path, meta_dir: Path | None = None) -> list
 
     stale: list[dict[str, Any]] = []
     for entry in manifest.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
         # Use source file stems if available (fix #6: persona name != filename)
         persona_stem = entry.get("persona_source", entry.get("persona", ""))
         arch = entry.get("arch", "")
@@ -714,6 +704,7 @@ def main_prune(args: list[str] | None = None) -> int:
     Returns:
         Exit code: 0 for success, 1 for error.
     """
+    logging.basicConfig(level=logging.WARNING)
     parser = argparse.ArgumentParser(
         prog="bt-prune",
         description="Clean up stale compiled training config artifacts.",
@@ -735,7 +726,7 @@ def main_prune(args: list[str] | None = None) -> int:
         compiled_dir = parsed.compiled_dir
     else:
         try:
-            compiled_dir = _find_compiled_dir()
+            compiled_dir = find_compiled_dir()
         except FileNotFoundError:
             print("error: could not find configs/compiled/ directory; use --compiled-dir", file=sys.stderr)
             return 1
@@ -749,7 +740,7 @@ def main_prune(args: list[str] | None = None) -> int:
         meta_dir = parsed.meta_dir
     else:
         try:
-            meta_dir = _find_meta_dir()
+            meta_dir = find_meta_dir()
         except FileNotFoundError:
             meta_dir = None
 
