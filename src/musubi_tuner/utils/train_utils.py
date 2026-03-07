@@ -1,14 +1,37 @@
 import argparse
+import json
 from blissful_tuner.blissful_logger import BlissfulLogger
 import os
+from pathlib import Path
 import shutil
-from typing import Callable
+import sys
+import time
+from typing import Any, Callable
 
 import accelerate
 
 from musubi_tuner.utils import huggingface_utils
 
 logger = BlissfulLogger(__name__, "green")
+
+SENSITIVE_MANIFEST_ARGS = {"wandb_api_key", "huggingface_token"}
+RUN_MANIFEST_ENV_KEYS = (
+    "PYTHONUNBUFFERED",
+    "HF_HOME",
+    "TRANSFORMERS_CACHE",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "CUDA_MODULE_LOADING",
+    "TOKENIZERS_PARALLELISM",
+    "CUDA_VISIBLE_DEVICES",
+    "ACCELERATE_CONFIG_FILE",
+    "CACHE_MASK_GAMMA",
+    "CACHE_MASK_MIN_WEIGHT",
+    "RUN_MANIFEST_LAUNCHER_SCRIPT",
+    "RUN_MANIFEST_ENV_SCRIPT",
+    "RUN_MANIFEST_INVOCATION_NOTE",
+)
 
 
 # checkpointファイル名
@@ -56,6 +79,132 @@ def get_sanitized_config_or_none(args: argparse.Namespace):
                 filtered_args[k] = f"{v}"
 
     return filtered_args
+
+
+def _serialize_manifest_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_manifest_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _serialize_manifest_value(v) for k, v in value.items()}
+    return str(value)
+
+
+def _resolve_optional_path(path_like: str | os.PathLike[str] | None, *, suffix: str | None = None) -> Path | None:
+    if not path_like:
+        return None
+
+    path = Path(path_like).expanduser()
+    candidates = [path]
+    if suffix and path.suffix != suffix:
+        candidates.append(path.with_suffix(suffix))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    return None
+
+
+def _copy_snapshot_if_present(src: Path | None, dest_dir: Path, dest_name: str) -> dict[str, str] | None:
+    if src is None or not src.exists() or not src.is_file():
+        return None
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / dest_name
+    dest_path.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+    return {
+        "source_path": str(src),
+        "snapshot_path": str(dest_path),
+    }
+
+
+def get_run_manifest(args: argparse.Namespace, *, tracker_name: str | None = None) -> dict[str, Any]:
+    manifest_args: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if key in SENSITIVE_MANIFEST_ARGS:
+            continue
+        manifest_args[key] = _serialize_manifest_value(value)
+
+    env = {key: os.environ[key] for key in RUN_MANIFEST_ENV_KEYS if key in os.environ}
+
+    return {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "cwd": os.getcwd(),
+        "python_executable": sys.executable,
+        "argv": sys.argv,
+        "tracker_name": tracker_name,
+        "args": manifest_args,
+        "env": env,
+    }
+
+
+def write_run_manifest(
+    args: argparse.Namespace,
+    *,
+    run_dir: str | os.PathLike[str] | None,
+    tracker_name: str | None = None,
+) -> dict[str, str]:
+    output_dir = Path(args.output_dir).expanduser().resolve() if getattr(args, "output_dir", None) else None
+    primary_run_dir = Path(run_dir).expanduser().resolve() if run_dir else None
+    run_id = primary_run_dir.name if primary_run_dir else time.strftime("%Y%m%d%H%M%S", time.localtime())
+
+    roots: list[Path] = []
+    if primary_run_dir is not None:
+        roots.append(primary_run_dir)
+    if output_dir is not None:
+        roots.append(output_dir / "run_manifests" / run_id)
+
+    unique_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        root_key = str(root)
+        if root_key in seen:
+            continue
+        seen.add(root_key)
+        unique_roots.append(root)
+
+    if not unique_roots:
+        return {}
+
+    manifest = get_run_manifest(args, tracker_name=tracker_name)
+    training_config = _resolve_optional_path(getattr(args, "config_file", None), suffix=".toml")
+    dataset_config = _resolve_optional_path(getattr(args, "dataset_config", None))
+    sample_prompts = _resolve_optional_path(getattr(args, "sample_prompts", None))
+    tracker_config = _resolve_optional_path(getattr(args, "log_tracker_config", None))
+    launcher_script = _resolve_optional_path(os.environ.get("RUN_MANIFEST_LAUNCHER_SCRIPT"))
+    launcher_env = _resolve_optional_path(os.environ.get("RUN_MANIFEST_ENV_SCRIPT"))
+    invocation_note = _resolve_optional_path(os.environ.get("RUN_MANIFEST_INVOCATION_NOTE"))
+
+    created_paths: dict[str, str] = {}
+    for root in unique_roots:
+        root.mkdir(parents=True, exist_ok=True)
+        snapshot_dir = root / "run_snapshot"
+        manifest_path = root / "run_manifest.json"
+
+        snapshots = {
+            "training_config": _copy_snapshot_if_present(training_config, snapshot_dir, "training_config.toml"),
+            "dataset_config": _copy_snapshot_if_present(dataset_config, snapshot_dir, "dataset_config.toml"),
+            "sample_prompts": _copy_snapshot_if_present(sample_prompts, snapshot_dir, "sample_prompts.txt"),
+            "tracker_config": _copy_snapshot_if_present(tracker_config, snapshot_dir, "tracker_config.toml"),
+            "launcher_script": _copy_snapshot_if_present(launcher_script, snapshot_dir, "launcher_script.sh"),
+            "launcher_env": _copy_snapshot_if_present(launcher_env, snapshot_dir, "launcher_env.sh"),
+            "invocation_note": _copy_snapshot_if_present(invocation_note, snapshot_dir, "invocation_note.txt"),
+        }
+
+        manifest_to_write = dict(manifest)
+        manifest_to_write["snapshots"] = {k: v for k, v in snapshots.items() if v is not None}
+        manifest_path.write_text(json.dumps(manifest_to_write, indent=2, sort_keys=True), encoding="utf-8")
+
+        if root == unique_roots[0]:
+            created_paths["manifest_json"] = str(manifest_path)
+            created_paths["snapshot_dir"] = str(snapshot_dir)
+
+    return created_paths
 
 
 class LossRecorder:

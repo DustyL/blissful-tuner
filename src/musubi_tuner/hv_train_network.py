@@ -2332,11 +2332,15 @@ class NetworkTrainer:
                 init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
+            tracker_name = "network_train" if args.log_tracker_name is None else args.log_tracker_name
             accelerator.init_trackers(
-                "network_train" if args.log_tracker_name is None else args.log_tracker_name,
+                tracker_name,
                 config=train_utils.get_sanitized_config_or_none(args),
                 init_kwargs=init_kwargs,
             )
+            manifest_paths = train_utils.write_run_manifest(args, run_dir=accelerator.project_dir, tracker_name=tracker_name)
+            if manifest_paths:
+                logger.info(f"saved run manifest: {manifest_paths['manifest_json']}")
 
         # TODO skip until initial step
         progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
