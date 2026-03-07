@@ -10,7 +10,10 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
+    ARCHITECTURE_QWEN_IMAGE_EDIT_FULL,
+    ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
+    ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL,
     ItemInfo,
     save_text_encoder_output_cache_qwen_image,
 )
@@ -31,6 +34,7 @@ def encode_and_save_batch(
     batch: list[ItemInfo],
     device: torch.device,
     accelerator: Optional[accelerate.Accelerator],
+    architecture: str = ARCHITECTURE_QWEN_IMAGE_FULL,
 ):
     is_edit = vl_processor is not None
     prompts = [item.caption for item in batch]
@@ -97,7 +101,7 @@ def encode_and_save_batch(
     for item, (embed_i, mask_i) in zip(batch, zip(embed, mask)):
         txt_len = mask_i.to(dtype=torch.bool).sum().item()  # length of the text in the batch
         embed_i = embed_i[:txt_len]
-        save_text_encoder_output_cache_qwen_image(item, embed_i)
+        save_text_encoder_output_cache_qwen_image(item, embed_i, architecture=architecture)
 
 
 def main():
@@ -116,10 +120,13 @@ def main():
     user_config = config_utils.load_user_config(args.dataset_config)
     if args.is_edit:
         architecture = ARCHITECTURE_QWEN_IMAGE_EDIT
+        architecture_full = ARCHITECTURE_QWEN_IMAGE_EDIT_FULL
     elif args.is_layered:
         architecture = ARCHITECTURE_QWEN_IMAGE_LAYERED
+        architecture_full = ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL
     else:
         architecture = ARCHITECTURE_QWEN_IMAGE
+        architecture_full = ARCHITECTURE_QWEN_IMAGE_FULL
     blueprint = blueprint_generator.generate(user_config, args, architecture=architecture)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
@@ -152,7 +159,9 @@ def main():
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
         nonlocal tokenizer, text_encoder, vl_processor, device, accelerator, args
-        encode_and_save_batch(tokenizer, text_encoder, vl_processor, args.model_version, batch, device, accelerator)
+        encode_and_save_batch(
+            tokenizer, text_encoder, vl_processor, args.model_version, batch, device, accelerator, architecture=architecture_full
+        )
 
     cache_text_encoder_outputs.process_text_encoder_batches(
         args,

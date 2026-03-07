@@ -582,6 +582,7 @@ def save_latent_cache_qwen_image(
     latent: torch.Tensor,
     control_latent: Optional[list[torch.Tensor]],
     mask_weights: Optional[torch.Tensor] = None,
+    architecture: str = ARCHITECTURE_QWEN_IMAGE_FULL,
 ):
     """Qwen-Image architecture with optional mask weights for mask-weighted loss training."""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
@@ -607,7 +608,7 @@ def save_latent_cache_qwen_image(
         mask_dtype_str = dtype_to_str(torch.float16)
         sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
-    save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
+    save_latent_cache_common(item_info, sd, architecture)
 
 
 def save_latent_cache_kandinsky5(
@@ -925,13 +926,15 @@ def save_text_encoder_output_cache_flux_2(item_info: ItemInfo, ctx_vec: torch.Te
     save_text_encoder_output_cache_common(item_info, sd, arch_full)
 
 
-def save_text_encoder_output_cache_qwen_image(item_info: ItemInfo, embed: torch.Tensor):
+def save_text_encoder_output_cache_qwen_image(
+    item_info: ItemInfo, embed: torch.Tensor, architecture: str = ARCHITECTURE_QWEN_IMAGE_FULL
+):
     """Qwen-Image architecture."""
     sd = {}
     dtype_str = dtype_to_str(embed.dtype)
     sd[f"varlen_vl_embed_{dtype_str}"] = embed.detach().cpu()
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
+    save_text_encoder_output_cache_common(item_info, sd, architecture)
 
 
 def save_text_encoder_output_cache_kandinsky5(
