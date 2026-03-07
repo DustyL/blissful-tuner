@@ -223,8 +223,8 @@ ARCH_REGISTRY: dict[str, dict[str, Any]] = {
             "frame_extraction": "head",
         },
         "supports": {
-            "mask_loss": True,
-            "prior_preservation": True,
+            "mask_loss": False,  # HV cache_latents.py does not currently store mask_weights
+            "prior_preservation": False,  # Requires mask_loss
             "latent_preview": True,
             "cfg_schedule": True,
             "cfgzerostar": True,

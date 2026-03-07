@@ -204,3 +204,9 @@ class TestRegistryCompleteness:
             "kandinsky5",
         }
         assert set(ARCH_REGISTRY.keys()) == expected
+
+    def test_hv_mask_loss_not_supported(self):
+        """HunyuanVideo cache doesn't produce mask_weights — registry must reflect this."""
+        arch = ARCH_REGISTRY["hv"]
+        assert arch["supports"]["mask_loss"] is False, "HV cache_latents.py does not store masks"
+        assert arch["supports"]["prior_preservation"] is False, "Prior preservation requires mask_loss"
