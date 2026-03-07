@@ -437,8 +437,9 @@ def log_mask_loss_banner(
             pairs_str = ", ".join(f"(gamma={g}, min_weight={m})" for g, m in sorted(cache_mask_transform_pairs))
             logger.warning(
                 "  WARNING: Mixed cache mask metadata detected across sampled cache files: " + pairs_str + ". "
-                "This can cause inconsistent masking behavior across items. "
-                "Recommendation: use a fresh cache_directory and recache latents to make these consistent."
+                "This usually happens when re-caching with --skip_existing after changing "
+                "--cache_mask_gamma or --cache_mask_min_weight. Older cache files retain their original baked values. "
+                "Fix: use a fresh cache_directory and recache ALL latents with consistent mask transform params."
             )
 
             if prior_weight > 0 and prior_threshold is not None:
