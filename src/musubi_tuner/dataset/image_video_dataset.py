@@ -2816,7 +2816,10 @@ class VideoDataset(BaseDataset):
             mask_by_basename_no_ext: dict[str, str] = {}
             for mask_path in all_mask_paths:
                 mask_basename_no_ext = os.path.splitext(os.path.basename(mask_path))[0]
-                mask_by_basename_no_ext[mask_basename_no_ext] = mask_path
+                if mask_basename_no_ext in mask_by_basename_no_ext:
+                    logger.warning(f"Duplicate video mask basename '{mask_basename_no_ext}', keeping first")
+                else:
+                    mask_by_basename_no_ext[mask_basename_no_ext] = mask_path
 
             if hasattr(self.datasource, "video_paths"):
                 video_paths = self.datasource.video_paths
