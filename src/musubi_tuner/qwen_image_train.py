@@ -634,12 +634,11 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
 
             for step, batch in enumerate(train_dataloader):
                 # Fail-fast validation: ERROR if mask loss enabled but no masks in batch
-                if step == 0:
-                    require_mask_weights_if_enabled(
-                        batch,
-                        args,
-                        cache_hint="Recache: python qwen_image_cache_latents.py --dataset_config ... --vae ...",
-                    )
+                require_mask_weights_if_enabled(
+                    batch,
+                    args,
+                    cache_hint="Recache: python qwen_image_cache_latents.py --dataset_config ... --vae ...",
+                )
 
                 latents = batch["latents"]
 

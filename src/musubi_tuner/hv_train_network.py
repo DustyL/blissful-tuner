@@ -2472,15 +2472,14 @@ class NetworkTrainer:
                         mark_step_begin()
 
                 # Fail-fast validation: ERROR if mask loss enabled but no masks in batch
-                if step == 0:
-                    require_mask_weights_if_enabled(
-                        batch,
-                        args,
-                        cache_hint=(
-                            "Recache with your architecture's cache script (WAN: wan_cache_latents.py). "
-                            "Note: HunyuanVideo cache_latents.py does not currently store masks."
-                        ),
-                    )
+                require_mask_weights_if_enabled(
+                    batch,
+                    args,
+                    cache_hint=(
+                        "Recache with your architecture's cache script (WAN: wan_cache_latents.py). "
+                        "Note: HunyuanVideo cache_latents.py does not currently store masks."
+                    ),
+                )
 
                 latents = batch["latents"]
 
