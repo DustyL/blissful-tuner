@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from blissful_tuner.config_manager.compiler import compile_to_disk
+from blissful_tuner.config_manager.compiler import _ENV_KEY_RE, _SAFE_NAME_RE, _shell_escape, compile_to_disk
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -1211,3 +1211,71 @@ class TestNonStringSlugType:
                 preset_path=FIXTURES / "presets" / "test_adamw.toml",
                 output_dir=output_dir,
             )
+
+
+class TestShellEscape:
+    """_shell_escape handles dangerous shell characters."""
+
+    def test_dollar_escaped(self):
+        assert _shell_escape("$(whoami)") == "\\$(whoami)"
+
+    def test_backtick_escaped(self):
+        assert _shell_escape("`id`") == "\\`id\\`"
+
+    def test_double_quote_escaped(self):
+        assert _shell_escape('say "hello"') == 'say \\"hello\\"'
+
+    def test_backslash_escaped(self):
+        assert _shell_escape("a\\b") == "a\\\\b"
+
+    def test_exclamation_escaped(self):
+        assert _shell_escape("hello!") == "hello\\!"
+
+    def test_safe_value_unchanged(self):
+        assert _shell_escape("/opt/blissful-tuner") == "/opt/blissful-tuner"
+
+    def test_combined_dangerous(self):
+        result = _shell_escape('$(rm -rf /)"`evil`"$HOME')
+        assert "\\$" in result
+        assert "\\`" in result
+
+
+class TestEnvKeyValidation:
+    """Invalid env var keys are rejected by _ENV_KEY_RE."""
+
+    def test_valid_key(self):
+        assert _ENV_KEY_RE.match("CUDA_VISIBLE_DEVICES")
+
+    def test_valid_underscore_start(self):
+        assert _ENV_KEY_RE.match("_PRIVATE")
+
+    def test_invalid_key_with_spaces(self):
+        assert not _ENV_KEY_RE.match("BAD KEY")
+
+    def test_invalid_key_with_equals(self):
+        assert not _ENV_KEY_RE.match("KEY=VALUE")
+
+    def test_invalid_key_starts_with_number(self):
+        assert not _ENV_KEY_RE.match("1BAD")
+
+    def test_invalid_empty(self):
+        assert not _ENV_KEY_RE.match("")
+
+
+class TestMachineNameValidation:
+    """Unsafe machine names are rejected by _SAFE_NAME_RE."""
+
+    def test_valid_name(self):
+        assert _SAFE_NAME_RE.match("my-machine")
+
+    def test_path_traversal_rejected(self):
+        assert not _SAFE_NAME_RE.match("../../etc")
+
+    def test_slash_rejected(self):
+        assert not _SAFE_NAME_RE.match("foo/bar")
+
+    def test_space_rejected(self):
+        assert not _SAFE_NAME_RE.match("bad name")
+
+    def test_dot_start_rejected(self):
+        assert not _SAFE_NAME_RE.match(".hidden")

@@ -71,6 +71,17 @@ class TestParseValue:
     def test_nested_array(self):
         assert parse_value("[[1, 2], [3, 4]]") == [[1, 2], [3, 4]]
 
+    def test_non_toml_error_propagates(self):
+        """Errors other than ValueError/TOMLDecodeError should propagate."""
+        import unittest.mock
+
+        with unittest.mock.patch(
+            "blissful_tuner.config_manager.value_parser.tomllib.loads",
+            side_effect=RuntimeError("boom"),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                parse_value("anything")
+
 
 class TestParseAndTypecheck:
     def test_matching_type_passes(self):

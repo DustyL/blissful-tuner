@@ -159,6 +159,23 @@ class TestFindStaleEntries:
         assert len(stale) == 1
         assert "arch" in stale[0]["reason"].lower()
 
+    def test_non_dict_entry_skipped(self, tmp_path):
+        """Non-dict manifest entries are skipped gracefully."""
+        compiled_dir = tmp_path / "compiled"
+        compiled_dir.mkdir()
+        meta_dir = tmp_path / "meta"
+
+        _create_persona(meta_dir, "Alice")
+        _create_preset(meta_dir, "test_adamw")
+
+        # Write manifest with a malformed entry (string instead of dict)
+        manifest_path = compiled_dir / "manifest.toml"
+        manifest_path.write_text('schema_version = 1\ncompiler_version = "0.1.0"\nentries = ["not_a_dict"]\n')
+
+        # Should not crash
+        stale = find_stale_entries(compiled_dir, meta_dir=meta_dir)
+        assert isinstance(stale, list)
+
     def test_multiple_reasons_all_reported(self, tmp_path):
         """Multiple stale entries with different reasons are all found."""
         compiled_dir = tmp_path / "compiled"

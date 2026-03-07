@@ -528,6 +528,16 @@ class TestOutputPathCollision:
         # Should not raise (no provenance to conflict with)
         check_output_path_collision(path, provenance)
 
+    def test_unreadable_file_allows_overwrite(self, tmp_path):
+        """If the existing file can't be read, treat as no provenance — allow overwrite."""
+        from blissful_tuner.config_manager.validator import _extract_provenance_from_file
+
+        path = tmp_path / "binary.toml"
+        path.write_bytes(b"\x80\x81\x82\x83")  # Invalid UTF-8
+
+        result = _extract_provenance_from_file(path)
+        assert result is None
+
 
 # ===========================================================================
 # Edge cases and integration

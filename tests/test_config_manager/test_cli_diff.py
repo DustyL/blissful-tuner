@@ -100,3 +100,14 @@ class TestBtDiffCLI:
         b = tmp_path / "nonexistent.toml"
         result = main_diff(["--quiet", str(a), str(b)])
         assert result != 0
+
+    def test_invalid_toml_exits_2(self, tmp_path, capsys):
+        """Invalid TOML file should produce clean error, not traceback."""
+        a = tmp_path / "a.toml"
+        b = tmp_path / "b.toml"
+        a.write_text("this is not [valid toml = ???")
+        self._write_toml(b, {"training": {"lr": 5e-5}})
+        result = main_diff([str(a), str(b)])
+        assert result == 2
+        captured = capsys.readouterr()
+        assert "invalid toml" in captured.err.lower() or "error" in captured.err.lower()

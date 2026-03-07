@@ -3,7 +3,8 @@
 import pytest
 from pathlib import Path
 
-from blissful_tuner.config_manager.compiler import compile_config, load_layer
+from blissful_tuner.config_manager.compiler import _build_dataset_toml, compile_config, load_layer
+from blissful_tuner.config_manager.validator import ConfigValidationError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -312,3 +313,15 @@ class TestCompileConfig:
         assert training["model"]["dit_high_noise"] == "/test/models/WAN/Wan-2.2-T2V-High-Noise-BF16.safetensors"
         assert training["model"]["vae"] == "/test/models/WAN/Wan2_1_VAE_bf16.safetensors"
         assert training["model"]["t5"] == "/test/models/WAN/umt5-xxl-enc-bf16.safetensors"
+
+
+class TestMalformedResolution:
+    def test_single_element_resolution_raises(self):
+        """[[512]] resolution should raise ConfigValidationError."""
+        arch = {"cache_suffix": "test", "dataset_defaults": {"default_resolutions": [[1024, 1024]]}}
+        persona_data = {"dataset": {"resolutions": [[512]], "image_directory": "/test/images"}}
+        machine_data = {"machine": {"hardware": {"default_batch_size": 1}}}
+        context = {"machine": {}, "persona": {}, "dataset": persona_data["dataset"]}
+
+        with pytest.raises(ConfigValidationError, match="Resolution must have"):
+            _build_dataset_toml(arch, "test", persona_data, machine_data, context)

@@ -10,7 +10,7 @@ import pytest
 from blissful_tuner.config_manager.cli import (
     _list_personas,
     _list_presets,
-    _parse_set_overrides,
+    _validate_set_format,
     main_compile,
     run_compile,
 )
@@ -52,18 +52,18 @@ class TestListPersonas:
     """--list-personas lists TOML stems from personas directory."""
 
     def test_list_personas_returns_zero(self):
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=FIXTURES):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=FIXTURES):
             assert main_compile(["--list-personas"]) == 0
 
     def test_list_personas_prints_names(self, capsys):
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=FIXTURES):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=FIXTURES):
             main_compile(["--list-personas"])
         out = capsys.readouterr().out
         assert "TESTPERSONA" in out
 
     def test_list_personas_missing_dir(self, capsys, tmp_path):
         """Prints error when personas dir doesn't exist."""
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=tmp_path):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=tmp_path):
             rc = main_compile(["--list-personas"])
         assert rc == 0  # Still returns 0, just prints nothing
 
@@ -72,11 +72,11 @@ class TestListPresets:
     """--list-presets lists TOML stems from presets directory."""
 
     def test_list_presets_returns_zero(self):
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=FIXTURES):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=FIXTURES):
             assert main_compile(["--list-presets"]) == 0
 
     def test_list_presets_prints_names(self, capsys):
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=FIXTURES):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=FIXTURES):
             main_compile(["--list-presets"])
         out = capsys.readouterr().out
         assert "test_adamw" in out
@@ -91,33 +91,33 @@ class TestSetOverrideParsing:
     """--set key=value parsing into a dict."""
 
     def test_parse_single_override(self):
-        result = _parse_set_overrides(["learning_rate=1e-4"])
+        result = _validate_set_format(["learning_rate=1e-4"])
         assert result == {"learning_rate": "1e-4"}
 
     def test_parse_multiple_overrides(self):
-        result = _parse_set_overrides(["learning_rate=1e-4", "seed=123"])
+        result = _validate_set_format(["learning_rate=1e-4", "seed=123"])
         assert result == {"learning_rate": "1e-4", "seed": "123"}
 
     def test_parse_dotted_key(self):
-        result = _parse_set_overrides(["training.seed=42"])
+        result = _validate_set_format(["training.seed=42"])
         assert result == {"training.seed": "42"}
 
     def test_parse_value_with_equals(self):
         """Value containing '=' should work (split on first '=' only)."""
-        result = _parse_set_overrides(["optimizer_args=betas=(0.9, 0.99)"])
+        result = _validate_set_format(["optimizer_args=betas=(0.9, 0.99)"])
         assert result == {"optimizer_args": "betas=(0.9, 0.99)"}
 
     def test_parse_empty_list(self):
-        result = _parse_set_overrides([])
+        result = _validate_set_format([])
         assert result == {}
 
     def test_parse_none(self):
-        result = _parse_set_overrides(None)
+        result = _validate_set_format(None)
         assert result == {}
 
     def test_parse_missing_equals_raises(self):
         with pytest.raises(ValueError, match="Invalid --set format"):
-            _parse_set_overrides(["no_equals_here"])
+            _validate_set_format(["no_equals_here"])
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ class TestAllFlag:
 
     def test_all_flag_compiles_multiple_personas(self, tmp_path):
         """--all should iterate all .toml files in personas dir."""
-        with patch("blissful_tuner.config_manager.cli._find_meta_dir", return_value=FIXTURES):
+        with patch("blissful_tuner.config_manager.cli.find_meta_dir", return_value=FIXTURES):
             rc = main_compile(
                 [
                     "--all",
@@ -300,7 +300,7 @@ class TestAllFlag:
 
 
 # ---------------------------------------------------------------------------
-# _find_meta_dir and listing helpers
+# find_meta_dir and listing helpers
 # ---------------------------------------------------------------------------
 
 
