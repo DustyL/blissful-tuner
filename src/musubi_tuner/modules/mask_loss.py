@@ -316,6 +316,14 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     if mask_area_scale_beta < 0:
         raise ValueError("--mask_area_scale_beta must be >= 0")
 
+    if mask_area_scale_beta > 0 and prior_preservation_weight > 0:
+        _logger.warning(
+            f"--mask_area_scale_beta={mask_area_scale_beta} with --prior_preservation_weight={prior_preservation_weight}: "
+            "Area-scale beta reduces target loss for small masks, but prior loss is independently normalized. "
+            "For tiny masks (<10% coverage), training may become prior-dominated. "
+            "Consider reducing --prior_preservation_weight or --mask_area_scale_beta if target learning is too weak."
+        )
+
     if prior_preservation_weight > 0 and mask_min_weight > 0:
         _logger.warning(
             f"--prior_preservation_weight={prior_preservation_weight} with --mask_min_weight={mask_min_weight}: "

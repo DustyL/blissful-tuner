@@ -823,6 +823,25 @@ class TestValidateMaskLossArgs(unittest.TestCase):
         with self.assertRaises(ValueError, msg="--mask_area_scale_beta must be >= 0"):
             validate_mask_loss_args(args)
 
+    def test_warns_area_scale_beta_with_prior_preservation(self) -> None:
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=None,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=0,
+            mask_area_scale_beta=0.5,
+            normalize_per_sample=False,
+        )
+
+        with self.assertLogs("musubi_tuner.modules.mask_loss", level="WARNING") as cm:
+            validate_mask_loss_args(args)
+
+        joined = "\n".join(cm.output)
+        self.assertIn("mask_area_scale_beta", joined)
+        self.assertIn("prior", joined.lower())
+
     def test_raises_error_for_even_mask_blur_kernel_size(self) -> None:
         args = argparse.Namespace(
             use_mask_loss=True,
