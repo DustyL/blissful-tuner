@@ -2813,7 +2813,7 @@ class VideoDataset(BaseDataset):
         if mask_directory is not None:
             self.mask_paths = {}
             logger.info(f"glob mask images in {mask_directory}")
-            all_mask_paths = set(glob_images(mask_directory))
+            all_mask_paths = glob_images(mask_directory)
             logger.info(f"found {len(all_mask_paths)} mask images")
 
             mask_by_basename_no_ext: dict[str, str] = {}
