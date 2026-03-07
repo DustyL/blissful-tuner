@@ -788,6 +788,11 @@ loss = apply_masked_loss_with_prior(
 )
 ```
 
+> **Note:** Prior preservation (`--prior_preservation_weight > 0`) is **not yet supported** with
+> `layout="layered"`. The example above passes `prior_loss_unreduced=None` which disables prior
+> preservation. Attempting to use prior preservation with layered layout raises `NotImplementedError`.
+> Use `layout="video"` for prior preservation workflows.
+
 High-level steps performed:
 1. Normalize mask shape to `(B, 1, F, H, W)` (accepts `(B, F, H, W)` too).
 2. If `layout="layered"`, optionally drop base-frame weights, then permute to match `(B, L, C, H, W)`.
