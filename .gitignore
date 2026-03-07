@@ -19,6 +19,7 @@ references/
 # START blissful-tuner
 .pylintrc
 nvidia-python-packages.txt
+requirements-cuda-dev.txt
 docs/fork_analysis.md
 docs/archive/
 docs/plans/

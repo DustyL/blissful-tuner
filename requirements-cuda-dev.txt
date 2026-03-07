@@ -14,18 +14,19 @@ git+https://github.com/huggingface/transformers.git
 uv pip install \
 git+https://github.com/huggingface/pytorch-image-models.git \
 git+https://github.com/Delgan/loguru.git \
+git+https://github.com/endman100/BasicSR-py313.git
 
 uv pip install \
 git+https://github.com/Textualize/rich.git \
 git+https://github.com/hamdanal/rich-argparse.git \
 git+https://github.com/celsiusnarhwal/rich-tracebacks.git \
 git+https://github.com/prompt-toolkit/python-prompt-toolkit.git 
-git+https://github.com/matplotlib/matplotlib.git \
+git+https://github.com/matplotlib/matplotlib.git 
 
 uv pip install \
 git+https://github.com/chaiNNer-org/spandrel.git \
 git+https://github.com/ultralytics/ultralytics.git \
-git+https://github.com/pypa/hatch.git \
+git+https://github.com/pypa/hatch.git 
 
 uv pip install \
 git+https://github.com/LoganBooker/prodigy-plus-schedule-free.git \
@@ -43,7 +44,6 @@ ascii-magic \
 tensorboard \
 ruff \
 facexlib \
-cupy-cuda13x \
 lpips \
 omegaconf \
 safetensors \
@@ -58,8 +58,10 @@ PySide6 \
 opencv-python \
 av \
 huggingface_hub[mcp,torch,dev] \
-tokenizers
+tokenizers \
+yacs
 
+cupy-cuda13x
 
 uv pip install "cuda-toolkit[all]==13.*" -U 
 uv pip install -U \
@@ -87,5 +89,6 @@ av
 https://github.com/kozistr/pytorch_optimizer.git
 git+https://github.com/omry/omegaconf.git \
 
+--extra-index-url  https://download.pytorch.org/whl/nightly/cpu 
 
-basicsr
+https://download.pytorch.org/whl/nightly/cpu/torch-2.12.0.dev20260306-cp312-cp312-macosx_11_0_arm64.whl
