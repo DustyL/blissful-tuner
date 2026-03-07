@@ -316,6 +316,14 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     if mask_area_scale_beta < 0:
         raise ValueError("--mask_area_scale_beta must be >= 0")
 
+    if mask_area_scale_beta > 0 and prior_preservation_weight > 0:
+        _logger.warning(
+            f"--mask_area_scale_beta={mask_area_scale_beta} with --prior_preservation_weight={prior_preservation_weight}: "
+            "Area-scale beta reduces target loss for small masks, but prior loss is independently normalized. "
+            "For tiny masks (<10% coverage), training may become prior-dominated. "
+            "Consider reducing --prior_preservation_weight or --mask_area_scale_beta if target learning is too weak."
+        )
+
     if prior_preservation_weight > 0 and mask_min_weight > 0:
         _logger.warning(
             f"--prior_preservation_weight={prior_preservation_weight} with --mask_min_weight={mask_min_weight}: "
@@ -665,9 +673,10 @@ def apply_masked_loss_with_prior(
             raise ValueError("prior_weight_per_sample must be >= 0 for all samples")
         prior_weight_per_sample = prior_weight_per_sample.to(device=loss.device, dtype=torch.float32)
 
-    # Ensure mask weights match loss device/dtype to prevent mixed-precision collisions.
+    # Move mask to loss device but keep in float32 for precision during processing
+    # (gamma, min_weight, blur). Cast to loss.dtype only at broadcast multiply points.
     # Note: mask_weights may be stored as float16 in cache files to reduce disk I/O.
-    mask_weights = mask_weights.to(loss.device, dtype=loss.dtype)
+    mask_weights = mask_weights.to(device=loss.device, dtype=torch.float32)
 
     # Compact mask is broadcast-compatible with loss; compute channel factor for weight sums.
     # Video: mask (B,1,F,H,W), loss (B,C,F,H,W) → C = loss.shape[1]
@@ -764,7 +773,7 @@ def apply_masked_loss_with_prior(
 
     # === Target Loss (inside mask) ===
     # Broadcasting: loss (B,C,F,H,W) * compact mask (B,1,F,H,W) → (B,C,F,H,W)
-    target_loss_weighted = loss * mask_processed
+    target_loss_weighted = loss * mask_processed.to(dtype=loss.dtype)
 
     mask_area_scale_beta = float(getattr(args, "mask_area_scale_beta", 0.0))
 
@@ -819,7 +828,7 @@ def apply_masked_loss_with_prior(
                     f"loss shape {tuple(loss.shape)} after dimension normalization"
                 )
 
-            prior_loss_weighted = prior_loss_unreduced * prior_mask
+            prior_loss_weighted = prior_loss_unreduced * prior_mask.to(dtype=loss.dtype)
 
             if normalize_per_sample:
                 reduce_dims = tuple(range(1, loss.ndim))

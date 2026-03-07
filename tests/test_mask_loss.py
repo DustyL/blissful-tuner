@@ -312,6 +312,52 @@ class TestMaskedLossWithPrior(unittest.TestCase):
         # Weighted mean of all-ones loss with constant 0.5 mask is still 1.0
         self.assertTrue(torch.allclose(out, torch.tensor(1.0), rtol=0, atol=1e-6))
 
+    def test_gamma_processing_uses_float32_precision(self) -> None:
+        """Mask gamma/min_weight processing should use float32 for precision.
+
+        bfloat16 has ~3.3 decimal digits. For mask=0.002 with gamma=0.3,
+        the power operation in bf16 vs float32 produces measurably different results.
+        This test verifies the result matches float32 reference, not bf16.
+        """
+        mask_val = 0.002
+        gamma = 0.3
+        loss = torch.ones(1, 16, 1, 4, 4, dtype=torch.bfloat16)
+        mask_weights = torch.full((1, 1, 4, 4), mask_val, dtype=torch.float16)
+
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            mask_gamma=gamma,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=0,
+            mask_area_scale_beta=0.0,
+            prior_preservation_weight=0.0,
+            prior_mask_threshold=None,
+            normalize_per_sample=False,
+        )
+
+        stats: dict[str, torch.Tensor] = {}
+        _ = apply_masked_loss_with_prior(
+            loss,
+            mask_weights,
+            prior_loss_unreduced=None,
+            stats=stats,
+            args=args,
+            layout="video",
+        )
+
+        # The processed mask mean should match float32 gamma: 0.002^0.3
+        f32_ref = float(mask_val**gamma)
+        bf16_ref = float(torch.tensor(mask_val, dtype=torch.bfloat16) ** gamma)
+        processed_mean = stats["mask/processed_mean"].item()
+
+        # Should match float32 reference, not bf16
+        self.assertAlmostEqual(
+            processed_mean,
+            f32_ref,
+            places=4,
+            msg=f"Mask processing should use float32 precision: got {processed_mean}, float32 ref={f32_ref}, bf16 ref={bf16_ref}",
+        )
+
     def test_layered_layout_matches_apply_masked_loss(self) -> None:
         loss = torch.tensor([[[[[1.0]]], [[[3.0]]]]])  # (B=1,L=2,C=1,H=1,W=1)
         mask_weights = torch.tensor([[[[[0.0]], [[1.0]], [[0.5]]]]])  # (B=1,1,F=3,H=1,W=1)
@@ -776,6 +822,25 @@ class TestValidateMaskLossArgs(unittest.TestCase):
 
         with self.assertRaises(ValueError, msg="--mask_area_scale_beta must be >= 0"):
             validate_mask_loss_args(args)
+
+    def test_warns_area_scale_beta_with_prior_preservation(self) -> None:
+        args = argparse.Namespace(
+            use_mask_loss=True,
+            prior_preservation_weight=1.0,
+            prior_mask_threshold=None,
+            mask_gamma=1.0,
+            mask_min_weight=0.0,
+            mask_blur_kernel_size=0,
+            mask_area_scale_beta=0.5,
+            normalize_per_sample=False,
+        )
+
+        with self.assertLogs("musubi_tuner.modules.mask_loss", level="WARNING") as cm:
+            validate_mask_loss_args(args)
+
+        joined = "\n".join(cm.output)
+        self.assertIn("mask_area_scale_beta", joined)
+        self.assertIn("prior", joined.lower())
 
     def test_raises_error_for_even_mask_blur_kernel_size(self) -> None:
         args = argparse.Namespace(
