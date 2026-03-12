@@ -1,3 +1,7 @@
+from musubi_tuner._early_runtime_filters import apply_early_runtime_filters
+
+apply_early_runtime_filters()
+
 import ast
 import asyncio
 from contextlib import contextmanager
