@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
 SharedEpoch = Optional["Synchronized[int]"]
 
-
 import numpy as np
 import torch
 from safetensors.torch import save_file, load_file
@@ -2237,7 +2236,7 @@ class BaseDataset(torch.utils.data.Dataset):
         assert self.shared_epoch is not None, "shared_epoch is None"
         epoch = self.shared_epoch.value
         if epoch > self.current_epoch:
-            logger.info(f"epoch is incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
+            logger.debug(f"epoch is incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
             num_epochs = epoch - self.current_epoch
             for _ in range(num_epochs):
                 self.current_epoch += 1
