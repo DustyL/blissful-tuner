@@ -1,21 +1,15 @@
 import math
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
-from blissful_tuner.blissful_logger import BlissfulLogger
-
-logger = BlissfulLogger(__name__, "green")
-
 
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
     from flash_attn.flash_attn_interface import flash_attn_func
-
-    logger.info("Flash Attention is installed!")
 except ImportError:
-    logger.info("Flash Attention is not installed!")
     flash_attn = None
     flash_attn_varlen_func = None
     _flash_attn_forward = None
@@ -23,19 +17,13 @@ except ImportError:
 
 try:
     from sageattention import sageattn_varlen, sageattn
-
-    logger.info("Sage Attention is installed!")
 except ImportError:
-    logger.info("Sage Attention is not installed!")
     sageattn_varlen = None
     sageattn = None
 
 try:
     import xformers.ops as xops
-
-    logger.info("Xformers is installed!")
 except ImportError:
-    logger.info("Xformers is not installed!")
     xops = None
 
 try:
@@ -43,12 +31,24 @@ try:
     from flash_attn.cute.interface import flash_attn_varlen_func as cute_flash_attn_varlen_func
 
     CUTE_AVAILABLE = True
-    logger.info("CuTE (CUDA Templates) is installed!")
 except ImportError:
     CUTE_AVAILABLE = False
     cute_flash_attn_func = None
     cute_flash_attn_varlen_func = None
-    logger.info("CuTE (CUDA Templates) is not installed!")
+
+
+def get_attention_backend_status() -> Dict[str, bool]:
+    """Return a dict of attention backend name -> availability (bool).
+
+    Pure data helper — no logging or side effects.
+    """
+    return {
+        "Flash Attention": flash_attn is not None,
+        "Sage Attention": sageattn is not None,
+        "Xformers": xops is not None,
+        "CuTE": CUTE_AVAILABLE,
+    }
+
 
 MEMORY_LAYOUT = {
     "flash": (

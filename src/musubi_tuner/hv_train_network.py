@@ -1932,6 +1932,14 @@ class NetworkTrainer:
             logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
 
+        # Log attention backend availability once on the main rank only.
+        if is_main_process:
+            from musubi_tuner.hunyuan_model.attention import get_attention_backend_status
+
+            for backend, available in get_attention_backend_status().items():
+                tag = "available" if available else "not found"
+                logger.info(f"Attention backend: {backend} — {tag}")
+
         # prepare dtype
         weight_dtype = torch.float32
         if args.mixed_precision == "fp16":
