@@ -16,6 +16,8 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     read_config_from_file,
     should_sample_images,
+    should_sample_on_step,
+    should_sample_on_epoch,
     load_prompts,
 )
 from musubi_tuner.kandinsky5.configs import TASK_CONFIGS, TaskConfig
@@ -168,10 +170,22 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
             "method": getattr(attn_conf, "method", "topcdf"),
         }
 
-    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
+    def sample_images(
+        self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype, trigger=None
+    ):
         """Use kandinsky5.generation_utils for quick qualitative checks with on-demand loading/offload."""
-        if not should_sample_images(args, steps, epoch):
-            return
+        if trigger == "step":
+            if not should_sample_on_step(args, steps):
+                return
+        elif trigger == "epoch":
+            if not should_sample_on_epoch(args, epoch):
+                return
+        elif trigger == "initial":
+            if not getattr(args, "sample_at_first", False):
+                return
+        else:
+            if not should_sample_images(args, steps, epoch):
+                return
         if not sample_parameters:
             logger.warning("No sample prompts provided; skipping sampling.")
             return

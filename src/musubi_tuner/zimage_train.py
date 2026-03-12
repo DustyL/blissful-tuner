@@ -32,7 +32,8 @@ from musubi_tuner.hv_train_network import (
     prepare_accelerator,
     setup_parser_common,
     read_config_from_file,
-    should_sample_images,
+    should_sample_on_step,
+    should_sample_on_epoch,
     set_seed,
 )
 import logging
@@ -502,9 +503,9 @@ class ZImageTrainer(ZImageNetworkTrainer):
                 os.remove(old_ckpt_file)
 
         # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        if should_sample_on_step(args, 0):
             optimizer_eval_fn()
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="initial")
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
@@ -596,13 +597,15 @@ class ZImageTrainer(ZImageNetworkTrainer):
                     global_step += 1
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
-                    should_sampling = should_sample_images(args, global_step, epoch=None)
+                    should_sampling = should_sample_on_step(args, global_step)
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
                     if should_sampling or should_saving:
                         optimizer_eval_fn()
                         if should_sampling:
-                            self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            self.sample_images(
+                                accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="step"
+                            )
 
                         if should_saving:
                             accelerator.wait_for_everyone()
@@ -668,7 +671,10 @@ class ZImageTrainer(ZImageNetworkTrainer):
                     if args.save_state:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            if should_sample_on_epoch(args, epoch + 1):
+                self.sample_images(
+                    accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="epoch"
+                )
             optimizer_train_fn()
 
             # end of epoch

@@ -389,18 +389,27 @@ def validate_mask_loss_args(args: argparse.Namespace) -> None:
     validate_mask_loss_args_impl(args)
 
 
+def should_sample_on_step(args, step: int) -> bool:
+    """Check whether to sample based on step count only."""
+    if step == 0:
+        return getattr(args, "sample_at_first", False)
+    return args.sample_every_n_steps is not None and step % args.sample_every_n_steps == 0
+
+
+def should_sample_on_epoch(args, epoch: int) -> bool:
+    """Check whether to sample based on epoch count only."""
+    if epoch == 0:
+        return getattr(args, "sample_at_first", False)
+    return args.sample_every_n_epochs is not None and epoch % args.sample_every_n_epochs == 0
+
+
 def should_sample_images(args, steps, epoch=None):
+    """Compatibility wrapper — prefer should_sample_on_step / should_sample_on_epoch directly."""
     if steps == 0:
-        if not args.sample_at_first:
-            return False
-    else:
-        should_sample_by_steps = args.sample_every_n_steps is not None and steps % args.sample_every_n_steps == 0
-        should_sample_by_epochs = (
-            args.sample_every_n_epochs is not None and epoch is not None and epoch % args.sample_every_n_epochs == 0
-        )
-        if not should_sample_by_steps and not should_sample_by_epochs:
-            return False
-    return True
+        return getattr(args, "sample_at_first", False)
+    by_steps = args.sample_every_n_steps is not None and steps % args.sample_every_n_steps == 0
+    by_epochs = args.sample_every_n_epochs is not None and epoch is not None and epoch % args.sample_every_n_epochs == 0
+    return by_steps or by_epochs
 
 
 class NetworkTrainer:
@@ -1268,10 +1277,29 @@ class NetworkTrainer:
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
 
-    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
-        """architecture independent sample images"""
-        if not should_sample_images(args, steps, epoch):
-            return
+    def sample_images(
+        self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype, trigger=None
+    ):
+        """architecture independent sample images
+
+        Args:
+            trigger: "step", "epoch", or "initial".  When set, only the
+                     matching condition is checked.  ``None`` falls back to
+                     the legacy combined predicate for compatibility.
+        """
+        if trigger == "step":
+            if not should_sample_on_step(args, steps):
+                return
+        elif trigger == "epoch":
+            if not should_sample_on_epoch(args, epoch):
+                return
+        elif trigger == "initial":
+            if not getattr(args, "sample_at_first", False):
+                return
+        else:
+            # Legacy fallback (used by subclasses that haven't been updated)
+            if not should_sample_images(args, steps, epoch):
+                return
 
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
@@ -2414,9 +2442,9 @@ class NetworkTrainer:
                 os.remove(old_ckpt_file)
 
         # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        if should_sample_on_step(args, 0):
             optimizer_eval_fn()
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="initial")
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
@@ -2754,13 +2782,15 @@ class NetworkTrainer:
                     global_step += 1
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
-                    should_sampling = should_sample_images(args, global_step, epoch=None)
+                    should_sampling = should_sample_on_step(args, global_step)
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
                     if should_sampling or should_saving:
                         optimizer_eval_fn()
                         if should_sampling:
-                            self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            self.sample_images(
+                                accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="step"
+                            )
 
                         if should_saving:
                             accelerator.wait_for_everyone()
@@ -2862,7 +2892,12 @@ class NetworkTrainer:
                     if args.save_state:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            # Only run epoch-end sampling if epoch-based sampling is configured.
+            # Step-based sampling (sample_every_n_steps) is already handled inside the step loop.
+            if should_sample_on_epoch(args, epoch + 1):
+                self.sample_images(
+                    accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype, trigger="epoch"
+                )
             optimizer_train_fn()
 
             # end of epoch

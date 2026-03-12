@@ -1180,7 +1180,10 @@ class FineTuningTrainer:
                     if args.save_state:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, transformer, sample_parameters)
+            if args.sample_every_n_epochs is not None:
+                self.sample_images(
+                    accelerator, args, epoch + 1, global_step, accelerator.device, vae, transformer, sample_parameters
+                )
             optimizer_train_fn()
 
             # end of epoch
