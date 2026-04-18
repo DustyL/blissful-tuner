@@ -910,17 +910,23 @@ def save_text_encoder_output_cache_flux_kontext(item_info: ItemInfo, t5_vec: tor
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_FLUX_KONTEXT_FULL)
 
 
-def save_text_encoder_output_cache_flux_2(item_info: ItemInfo, ctx_vec: torch.Tensor, arch_full: str):
+def save_text_encoder_output_cache_flux_2(
+    item_info: ItemInfo, ctx_vec: torch.Tensor, arch_full: str, ctx_seq_len: Optional[torch.Tensor] = None
+):
     """Flux 2 architecture.
 
     Args:
         item_info: The item info containing cache path and metadata.
         ctx_vec: The context vector from text encoder.
         arch_full: The full architecture name (e.g., 'flux_2_dev', 'flux_2_klein_4b').
+        ctx_seq_len: Optional scalar int32 tensor with the real (non-padded) token count.
     """
     sd = {}
     dtype_str = dtype_to_str(ctx_vec.dtype)
     sd[f"ctx_vec_{dtype_str}"] = ctx_vec.detach().cpu()
+
+    if ctx_seq_len is not None:
+        sd["ctx_seq_len_int32"] = ctx_seq_len.detach().cpu().to(torch.int32)
 
     save_text_encoder_output_cache_common(item_info, sd, arch_full)
 
@@ -1357,6 +1363,9 @@ class BucketBatchManager:
                     content_key = content_key.replace("varlen_", "")
 
                 if content_key.endswith("_mask"):
+                    pass
+                elif content_key == "ctx_seq_len":
+                    # Legacy FLUX.2 caches briefly wrote this key without a dtype suffix.
                     pass
                 else:
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype

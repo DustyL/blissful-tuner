@@ -7,6 +7,7 @@ from accelerate import Accelerator
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from musubi_tuner.flux_2 import flux2_models, flux2_utils
+from musubi_tuner.flux_2.text_trim import maybe_trim_ctx_vec
 from musubi_tuner.flux_2.flux2_utils import (
     Flux2ModelInfo,
     FLUX2_SUPPORTED_ATTN_MODES,
@@ -32,6 +33,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.model_version_info: Flux2ModelInfo | None = None
+        self._trim_warned_state: dict = {}
 
     # region model specific
 
@@ -318,14 +320,14 @@ class Flux2NetworkTrainer(NetworkTrainer):
             attn_mode = "torch"
 
         if attn_mode not in FLUX2_SUPPORTED_ATTN_MODES:
-            if attn_mode in {"flash3", "cute"}:
+            if attn_mode == "flash3":
                 raise ValueError(
                     f"Attention mode '{attn_mode}' is not supported for FLUX.2 training. "
-                    "Use --sdpa, --flash_attn, --sage_attn, or --xformers instead."
+                    "Use --sdpa, --flash_attn, --sage_attn, --xformers, or --cute instead."
                 )
             raise ValueError(
                 f"Attention mode '{attn_mode}' is not supported for FLUX.2 training. "
-                f"Supported: {sorted(FLUX2_SUPPORTED_ATTN_MODES)}. Use --sdpa, --flash_attn, --sage_attn, or --xformers."
+                f"Supported: {sorted(FLUX2_SUPPORTED_ATTN_MODES)}. Use --sdpa, --flash_attn, --sage_attn, --xformers, or --cute."
             )
 
         if attn_mode in FLUX2_CUDA_ONLY_ATTN_MODES and accelerator.device.type != "cuda":
@@ -333,6 +335,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
                 "flash": "--flash_attn",
                 "xformers": "--xformers",
                 "sageattn": "--sage_attn",
+                "cute": "--cute",
             }
             raise ValueError(
                 f"{flag_map[attn_mode]} requires a CUDA device, but Accelerate is using '{accelerator.device.type}'. "
@@ -346,6 +349,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
             raise ValueError("--xformers requires xformers. Install with: pip install xformers")
         if attn_mode == "sageattn" and attention_module.sageattn is None:
             raise ValueError("--sage_attn requires sageattention. Install with: pip install sageattention")
+        # CuTE preflight runs in NetworkTrainer.train() before this method is called.
 
         model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
         model = flux2_utils.load_flow_model(
@@ -427,7 +431,11 @@ class Flux2NetworkTrainer(NetworkTrainer):
         if self.model_version_info is None:
             raise RuntimeError("model_version_info not set - call handle_model_specific_args first")
         flux2_utils.validate_ctx_vec_dim(ctx_vec, self.model_version_info, source="Flux2NetworkTrainer.call_dit_and_get_target()")
-        ctx, ctx_ids = flux2_utils.batched_prc_txt(ctx_vec)  # [1, 512, 15360], [1, 512, 4]
+
+        # Trim text: reduce padded ctx_vec to rounded batch-max before prc_txt
+        ctx_vec = maybe_trim_ctx_vec(ctx_vec, batch, args, self._trim_warned_state)
+
+        ctx, ctx_ids = flux2_utils.batched_prc_txt(ctx_vec)
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -491,6 +499,26 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         help=(
             "guidance embedding scale used during training (DEV only; default: 1.0) / "
             "学習時のガイダンス埋め込みスケール（DEVのみ、デフォルト: 1.0）"
+        ),
+    )
+    parser.add_argument(
+        "--flux2_text_seqlen_mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "trim"],
+        help=(
+            "Text sequence length handling: 'fixed' pads to 512 (default), "
+            "'trim' trims to rounded batch-max real length (rounded up to --pad_text_seq_len_multiple; "
+            "requires re-cached text with ctx_seq_len)."
+        ),
+    )
+    parser.add_argument(
+        "--pad_text_seq_len_multiple",
+        type=int,
+        default=None,
+        help=(
+            "Round text sequence length to this multiple for compile graph stability "
+            "(default: 32 when --compile, 1 otherwise)."
         ),
     )
     flux2_utils.add_model_version_args(parser)

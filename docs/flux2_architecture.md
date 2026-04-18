@@ -1045,11 +1045,12 @@ FLUX.2 supports the following attention implementations:
 | Mode | Device | Notes |
 |------|--------|-------|
 | `torch` | Any | Standard PyTorch SDPA (default) |
-| `flash` | CUDA only | Flash Attention (fastest) |
+| `flash` | CUDA only | Flash Attention 2 |
 | `xformers` | CUDA only | Memory-efficient attention |
 | `sageattn` | CUDA only | SageAttention |
+| `cute` | CUDA only | CuTE (FA4 CUDA Templates) — Hopper/Blackwell GPUs, see `docs/cute_attention.md` |
 
-> **Not supported:** `flash3`, `cute` — these will raise an explicit error for FLUX.2.
+> **Not supported:** `flash3` — will raise an explicit error for FLUX.2.
 
 ---
 

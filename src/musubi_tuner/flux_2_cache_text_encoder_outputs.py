@@ -35,25 +35,17 @@ def encode_and_save_batch(
     # Use bfloat16 for autocast when text embedder uses FP8 (itemsize == 1 byte)
     autocast_dtype = torch.bfloat16 if text_embedder.dtype.itemsize == 1 else text_embedder.dtype
     with torch.autocast(device_type=device.type, dtype=autocast_dtype), torch.no_grad():
-        ctx_vec = text_embedder(prompts)
-        ## TODO train with guidance ?
-        # if guidance_distilled:
-        #     ctx_vec = text_embedder(prompts)
-        # else:
-        #     if len(prompts) > 1:
-        #         raise NotImplementedError("Only works with batch size 1")
-        #     ctx_empty = text_embedder([""]).to(torch.bfloat16)
-        #     ctx_prompt = text_embedder(prompts).to(torch.bfloat16)
-        #     ctx_vec = torch.cat([ctx_empty, ctx_prompt], dim=0)
+        result = text_embedder(prompts, return_seq_lens=True)
+        ctx_vec, ctx_seq_len = result  # ctx_seq_len: [B] int32 on CPU
         ctx_vec = ctx_vec.to(torch.bfloat16)
         flux2_utils.validate_ctx_vec_dim(
             ctx_vec, _model_version_info, source="flux_2_cache_text_encoder_outputs.encode_and_save_batch()"
         )
-        ctx_vec = ctx_vec.cpu()  # [1, 512, 15360]
+        ctx_vec = ctx_vec.cpu()  # [B, 512, D]
 
-    # save prompt cache
-    for item, _ctx_vec in zip(batch, ctx_vec):
-        save_text_encoder_output_cache_flux_2(item, _ctx_vec, arch_full=arch_full)
+    # save prompt cache (per-sample ctx_seq_len scalar)
+    for item, _ctx_vec, _seq_len in zip(batch, ctx_vec, ctx_seq_len):
+        save_text_encoder_output_cache_flux_2(item, _ctx_vec, arch_full=arch_full, ctx_seq_len=_seq_len)
 
 
 def main():

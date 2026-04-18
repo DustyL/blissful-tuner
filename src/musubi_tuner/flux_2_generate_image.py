@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
         "--attn_mode",
         type=str,
         default="torch",
-        choices=["flash", "torch", "sageattn", "xformers", "sdpa"],  #  "flash2", "flash3",
+        choices=["flash", "torch", "sageattn", "xformers", "sdpa", "cute"],  #  "flash2", "flash3",
         help="attention mode",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
@@ -276,6 +276,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--attn_mode xformers requires xformers. Install with: pip install xformers")
     if args.attn_mode == "sageattn" and attention_module.sageattn is None:
         raise ValueError("--attn_mode sageattn requires sageattention. Install with: pip install sageattention")
+    if args.attn_mode == "cute":
+        ok, detail = attention_module.probe_cute_runtime(requested_device, needs_backward=False)
+        if not ok:
+            raise ValueError(
+                f"--attn_mode cute preflight failed on this GPU: {detail}. "
+                "Either install a CuTE build that supports your architecture, "
+                "or use --attn_mode flash / sdpa. See docs/cute_attention.md."
+            )
 
     # Validate arguments
     if args.from_file and args.interactive:

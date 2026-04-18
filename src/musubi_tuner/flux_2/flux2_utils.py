@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 # Attention backend configuration for FLUX.2
 # Note: "sdpa" is normalized to "torch" at the CLI level (treat as alias, not backend)
-FLUX2_SUPPORTED_ATTN_MODES = frozenset({"torch", "flash", "xformers", "sageattn"})
-FLUX2_CUDA_ONLY_ATTN_MODES = frozenset({"flash", "xformers", "sageattn"})
+FLUX2_SUPPORTED_ATTN_MODES = frozenset({"torch", "flash", "xformers", "sageattn", "cute"})
+FLUX2_CUDA_ONLY_ATTN_MODES = frozenset({"flash", "xformers", "sageattn", "cute"})
 
 M3_TOKENIZER_ID = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 OUTPUT_LAYERS_MISTRAL = [10, 20, 30]
@@ -863,7 +863,7 @@ class Mistral3Embedder(nn.Module):
         self.mistral3.to(*args, **kwargs)
         return self
 
-    def forward(self, txt: list[str]):
+    def forward(self, txt: list[str], return_seq_lens: bool = False):
         if not isinstance(txt, list):
             txt = [txt]
 
@@ -896,7 +896,12 @@ class Mistral3Embedder(nn.Module):
         )
 
         out = torch.stack([output.hidden_states[k] for k in OUTPUT_LAYERS_MISTRAL], dim=1)
-        return rearrange(out, "b c l d -> b l (c d)")
+        out = rearrange(out, "b c l d -> b l (c d)")
+
+        if return_seq_lens:
+            ctx_seq_len = attention_mask.sum(dim=1).to(torch.int32).cpu()
+            return out, ctx_seq_len
+        return out
 
     @staticmethod
     def _validate_and_process_images(img: list[list[Image.Image]] | list[Image.Image]) -> list[list[Image.Image]]:
@@ -1009,7 +1014,7 @@ class Qwen3Embedder(nn.Module):
         self.model.to(*args, **kwargs)
         return self
 
-    def forward(self, txt: list[str] | str):
+    def forward(self, txt: list[str] | str, return_seq_lens: bool = False):
         if not isinstance(txt, list):
             txt = [txt]
 
@@ -1042,7 +1047,12 @@ class Qwen3Embedder(nn.Module):
         )
 
         out = torch.stack([output.hidden_states[k] for k in OUTPUT_LAYERS_QWEN3], dim=1)
-        return rearrange(out, "b c l d -> b l (c d)")
+        out = rearrange(out, "b c l d -> b l (c d)")
+
+        if return_seq_lens:
+            ctx_seq_len = attention_mask.sum(dim=1).to(torch.int32).cpu()
+            return out, ctx_seq_len
+        return out
 
 
 def load_text_embedder(
