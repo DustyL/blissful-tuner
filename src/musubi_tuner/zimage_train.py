@@ -188,10 +188,23 @@ class ZImageTrainer(ZImageNetworkTrainer):
         elif args.flash3:
             logger.warning("flash3 is not separately supported for Z-Image, falling back to flash")
             attn_mode = "flash"
+        elif args.cute:
+            attn_mode = "cute"
         else:
             raise ValueError(
-                "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
+                "either --sdpa, --flash-attn, --flash3, --sage-attn, --xformers or --cute must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformers, --cuteのいずれかを指定してください"
             )
+
+        if attn_mode == "cute":
+            from musubi_tuner.modules.attention import probe_cute_runtime
+
+            ok, detail = probe_cute_runtime(accelerator.device, needs_backward=True)
+            if not ok:
+                raise ValueError(
+                    f"--cute preflight failed on this GPU: {detail}. "
+                    "Either install a CuTE build that supports your architecture, "
+                    "or use --flash_attn / --sdpa. See docs/cute_attention.md."
+                )
         transformer = self.load_transformer(accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_dtype)
 
         if blocks_to_swap > 0:

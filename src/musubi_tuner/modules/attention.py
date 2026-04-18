@@ -43,6 +43,58 @@ def _cute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal
     return cute_flash_attn_func(q, k, v, causal=causal)
 
 
+# Cache keyed by (device_capability, needs_backward, dtype) for the process lifetime.
+_CUTE_PROBE_CACHE: dict[tuple, tuple[bool, str]] = {}
+
+
+def probe_cute_runtime(
+    device: torch.device,
+    *,
+    needs_backward: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[bool, str]:
+    """Verify CuTE kernels actually execute on `device`.
+
+    ``CUTE_AVAILABLE`` only confirms the Python side imports. On some GPUs
+    (notably SM120 with non-TMA-optimized CuTE builds) kernels JIT-compile on
+    first use and can fail there. Call this before model load so training fails
+    fast with a clear error instead of mid-step after VAE/TE setup.
+
+    Returns ``(ok, detail)``. ``detail`` is the captured error text when
+    ``ok`` is ``False`` and empty when ``ok`` is ``True``. Results are cached.
+    """
+    if not CUTE_AVAILABLE:
+        return False, (
+            "CuTE not importable. Install flash-attention with CuTE support "
+            "(flash_attn.cute.interface). See docs/cute_attention.md."
+        )
+    if device.type != "cuda":
+        return False, f"CuTE requires a CUDA device, got '{device.type}'."
+
+    cap = torch.cuda.get_device_capability(device)
+    key = (cap, needs_backward, dtype)
+    if key in _CUTE_PROBE_CACHE:
+        return _CUTE_PROBE_CACHE[key]
+
+    # Minimal shape that still triggers the kernel variants most training runs use
+    # (head_dim=128, bf16). Kept small so first-run JIT completes in ~seconds.
+    B, S, H, D = 1, 128, 4, 128
+    try:
+        q = torch.randn(B, S, H, D, device=device, dtype=dtype, requires_grad=needs_backward)
+        k = torch.randn(B, S, H, D, device=device, dtype=dtype, requires_grad=needs_backward)
+        v = torch.randn(B, S, H, D, device=device, dtype=dtype, requires_grad=needs_backward)
+        out = _cute_attention(q, k, v, causal=False)
+        out_t = out[0] if isinstance(out, tuple) else out
+        if needs_backward:
+            out_t.float().sum().backward()
+        result: tuple[bool, str] = (True, "")
+    except Exception as e:
+        result = (False, f"{type(e).__name__}: {e}")
+
+    _CUTE_PROBE_CACHE[key] = result
+    return result
+
+
 @torch.compiler.disable
 def _cute_attention_varlen(
     q: torch.Tensor,

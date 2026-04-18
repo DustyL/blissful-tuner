@@ -1309,6 +1309,17 @@ def main():
     logger.info(f"Using device: {device}")
     args.device = device
 
+    if args.attn_mode == "cute":
+        from musubi_tuner.modules.attention import probe_cute_runtime
+
+        ok, detail = probe_cute_runtime(device, needs_backward=False)
+        if not ok:
+            raise ValueError(
+                f"--attn_mode cute preflight failed on this GPU: {detail}. "
+                "Either install a CuTE build that supports your architecture, "
+                "or use --attn_mode flash / sdpa. See docs/cute_attention.md."
+            )
+
     if latents_mode:
         # Original latent decode mode
         original_base_names = []

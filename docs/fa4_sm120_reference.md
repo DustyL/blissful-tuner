@@ -36,10 +36,11 @@ RTX 5090 = SM 12.0 (arch=120). Key facts:
 
 ### SM120 Implications for Blissful Tuner
 
-All existing CuTE wrappers in blissful-tuner work on SM120 with **no code changes** — the FA4 dispatch in `interface.py` handles architecture routing automatically. The only potential issue:
+All existing CuTE wrappers in blissful-tuner work on SM120 with **no code changes** — the FA4 dispatch in `interface.py` handles architecture routing automatically. Known architecture-specific notes:
 
-- **WAN's `deterministic=True`:** The WAN attention wrapper passes `deterministic=deterministic` to CuTE. If `deterministic=True` is set at training time, SM120 backward will assert-fail. SM120 requires `deterministic=False`.
+- **WAN's `deterministic` parameter:** WAN is the only architecture that exposes `deterministic` to CuTE. SM120 does not support deterministic backward. The WAN CuTE wrappers (`_cute_attention`, `_cute_attention_varlen`) include an automatic SM120 guard that detects the GPU on first call and overrides `deterministic=True` to `False` with a one-time warning. Datacenter Blackwell (B200/B300) and Hopper are unaffected.
 - **SM90 varlen backward restriction:** Still applies on Hopper. SM120 does NOT have this restriction — varlen backward works fine.
+- **FLUX.2:** Now fully supported via `--cute` or `cute = true`. Routes through unified attention (`src/musubi_tuner/modules/attention.py`) which already had complete CuTE support.
 
 ## JIT Compile Caching (Two Layers)
 
@@ -53,8 +54,7 @@ Low-level NVIDIA CuTe DSL compilation cache. Caches compiled PTX/CUBIN from the 
 export CUTE_DSL_CACHE_DIR="/path/to/cache/cute_dsl"
 ```
 
-- Currently set only in `configs/DLAY/QWEN-IMAGE/env_qwen2512.sh`
-- Should be set in ALL training env scripts that use CuTE
+- Set in all DLAY env scripts (`configs/DLAY/*/env_*.sh`)
 
 ### Layer 2: FA4 Kernel Cache (`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED`)
 
@@ -64,8 +64,8 @@ Higher-level FA4 kernel cache. Cache key includes dtype, head_dim, causal, mask/
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 ```
 
-- **NOT currently set in any blissful-tuner env script or code**
-- This is the main practical improvement available — enabling it avoids re-compiling FA4 kernel variants across training runs
+- Set in all DLAY env scripts (`configs/DLAY/*/env_*.sh`)
+- Avoids re-compiling FA4 kernel variants across training runs
 - Can reduce startup from minutes to seconds on subsequent runs
 
 ### Recommended Cache Setup
@@ -139,7 +139,7 @@ The wrappers would need a `return_lse: bool = False` parameter, and callers woul
 | Qwen-Image | (same as HunyuanVideo) | (same) | Yes | `causal` only |
 | HunyuanVideo 1.5 | `src/musubi_tuner/modules/attention.py` | `_cute_attention`, `_cute_attention_varlen` | Yes | `causal` only |
 | Z-Image | (same as HV1.5) | (same) | Yes | `causal` only |
-| FLUX.2 | (same as HV1.5, unified attention) | (same) | Yes | `causal` only |
+| FLUX.2 (all variants) | (same as HV1.5, unified attention) | (same) | Yes | `causal` only |
 | FLUX 1.0 | (inherited from FLUX.2) | (same) | Yes | |
 | FramePack | (inherited from WAN/HV) | (same) | Yes | |
 
@@ -234,5 +234,5 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)` — last dim contiguous, 1
 - `~/flash-attention/flash_attn/cute/flash_fwd.py` — SM80 base forward (split-KV refactored)
 
 ### Existing Documentation
-- `docs/cute_attention.md` — User-facing CuTE training guide (update GPU requirements to include SM120)
-- `configs/DLAY/QWEN-IMAGE/env_qwen2512.sh` — Only env script with `CUTE_DSL_CACHE_DIR`
+- `docs/cute_attention.md` — User-facing CuTE training guide (includes SM120 GPU requirements)
+- `configs/DLAY/*/env_*.sh` — All DLAY env scripts set `CUTE_DSL_CACHE_DIR` and `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED`

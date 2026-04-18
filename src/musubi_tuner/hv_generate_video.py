@@ -556,6 +556,18 @@ def main():
 
     device = args.device if args.device is not None else "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
+
+    if args.attn_mode == "cute":
+        from musubi_tuner.modules.attention import probe_cute_runtime
+
+        ok, detail = probe_cute_runtime(device, needs_backward=False)
+        if not ok:
+            raise ValueError(
+                f"--attn_mode cute preflight failed on this GPU: {detail}. "
+                "Either install a CuTE build that supports your architecture, "
+                "or use --attn_mode flash / sdpa. See docs/cute_attention.md."
+            )
+
     dit_dtype = torch.bfloat16
     dit_weight_dtype = torch.float8_e4m3fn if args.fp8 and not args.fp8_scaled else dit_dtype
     logger.info(f"Using device: {device}, DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")

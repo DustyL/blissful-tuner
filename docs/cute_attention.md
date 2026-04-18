@@ -7,27 +7,33 @@ CuTE (“CUDA Templates”) is an attention backend exposed via `flash_attn.cute
 In blissful-tuner, CuTE is enabled with `--cute` (or `cute = true` in a TOML config), and is supported in:
 - WAN 2.1/2.2 (`src/musubi_tuner/wan/modules/attention.py`)
 - HunyuanVideo + Qwen-Image (`src/musubi_tuner/hunyuan_model/attention.py`)
-- HunyuanVideo 1.5 + Z-Image (`src/musubi_tuner/modules/attention.py`)
+- HunyuanVideo 1.5 + Z-Image + FLUX.2 (`src/musubi_tuner/modules/attention.py`)
 
 ## Requirements
 
-- GPU: Hopper (SM 9.0+) or Blackwell (SM 10.0+). B300 = SM 10.3.
+- GPU: Hopper (SM 9.0+), Blackwell datacenter (SM 10.0+), or Blackwell GeForce (SM 12.0). Specifically:
+  - Hopper: H100/H200 (SM 9.0)
+  - Blackwell datacenter: B200 (SM 10.0), B300 (SM 10.3)
+  - Blackwell GeForce: RTX 5090 (SM 12.0)
 - `flash-attention` with CuTE enabled (example in this repo: `2.8.3+varlen.sm103`)
+  - For SM 12.0 (RTX 5090): requires the `feat/sm120-support` branch or equivalent patches
 - CuTE runtime deps:
   - `quack-kernels>=0.2.10`
   - `nvidia-cutlass-dsl>=4.4.0`
   - `apache-tvm-ffi>=0.1.5,<0.2`
   - `torch-c-dlpack-ext`
 
-### Important Limitation (Hopper / SM90)
+### Architecture-Specific Limitations
 
-Upstream CuTE currently does **not** support **variable-length (varlen) backward** on Hopper (SM90). In practice:
+**Hopper (SM90):** Does **not** support variable-length (varlen) backward. In practice:
 - Inference: varlen CuTE is fine (`torch.no_grad()` / no backward).
 - Training: if your model uses CuTE varlen (e.g. to handle padded sequences), it will fail on SM90 during backward.
 
 Workarounds:
 - Use `--split_attn` (forces per-sample fixed-length attention).
 - Or switch to `--flash-attn` / `--sage-attn` for varlen training on SM90.
+
+**Blackwell GeForce / SM120 (RTX 5090):** Does **not** support `deterministic=True` in backward. This only affects WAN, which is the only architecture that exposes the `deterministic` parameter to CuTE. The WAN CuTE wrapper automatically detects SM120 and overrides to `deterministic=False` with a one-time warning. Datacenter Blackwell (B200/B300) and Hopper are unaffected.
 
 Quick checks:
 ```bash
@@ -38,15 +44,27 @@ python -c "from flash_attn.cute import flash_attn_func; print('CuTE OK')"
 
 ## Recommended Environment
 
-For Qwen-Image-2512 training on B300, source:
+All DLAY env scripts configure CuTE caching automatically. Source the one for your architecture:
 ```bash
-source configs/DLAY/QWEN-IMAGE/env_qwen2512.sh
+source configs/DLAY/QWEN-IMAGE/env_qwen2512.sh       # Qwen-Image
+source configs/DLAY/FLUX2-KLEIN-9B/env_flux2klein9b.sh # FLUX.2 Klein-9B
+source configs/DLAY/WAN22/env_wan22.sh                 # WAN 2.2
+source configs/DLAY/ZIMAGE-TURBO/env_zimage_turbo.sh   # Z-Image Turbo
+# ... etc.
 ```
 
-This configures:
+These configure:
 - `TORCHINDUCTOR_CACHE_DIR` (torch.compile cache)
-- `CUTE_DSL_CACHE_DIR` (CuTE JIT cache)
-- allocator settings that avoid known CUDAGraph + `cudaMallocAsync` issues on the B300 torch nightly
+- `CUTE_DSL_CACHE_DIR` (CuTE DSL low-level JIT cache)
+- `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` (FA4 kernel-level cache — avoids recompiling kernel variants across runs, reducing startup from minutes to seconds)
+- Allocator settings appropriate for the training configuration
+
+If running without an env script, set these manually:
+```bash
+export CUTE_DSL_CACHE_DIR="${CUTE_DSL_CACHE_DIR:-$HOME/.cache/cute_dsl}"
+export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
+mkdir -p "${CUTE_DSL_CACHE_DIR}" 2>/dev/null || true
+```
 
 ## How To Enable CuTE
 
@@ -97,8 +115,17 @@ See: `docs/MASKED_LOSS_TRAINING_GUIDE.md`
 - `ImportError: CuTE not available`:
   - Install CuTE deps: `pip install 'quack-kernels>=0.2.10' 'nvidia-cutlass-dsl>=4.4.0' 'apache-tvm-ffi>=0.1.5,<0.2' torch-c-dlpack-ext`
   - Confirm `from flash_attn.cute import flash_attn_func` works
+  - SM120 (RTX 5090): Ensure flash-attention is built with SM120 support (see `docs/fa4_sm120_reference.md`)
+- Slow startup (minutes of JIT compilation):
+  - Set `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — this caches compiled FA4 kernels across runs
+  - Set `CUTE_DSL_CACHE_DIR` — this caches the lower-level CuTE DSL PTX/CUBIN
+  - Both are set automatically by all DLAY env scripts
 - Performance worse than FA2:
   - CuTE tends to win at longer sequence lengths (often >= 1024)
   - Ensure dtype is bf16/fp16 and head_dim is supported (commonly 128 in these models)
+- SM120 `deterministic=True` assert failure:
+  - SM120 does not support deterministic backward in CuTE
+  - The WAN CuTE wrapper auto-detects SM120 and overrides to `deterministic=False`
+  - If you hit this on another architecture, pass `deterministic=False` explicitly
 - Want to rollback:
   - Switch to `--flash-attn` (FA2) or `--sdpa` (PyTorch)

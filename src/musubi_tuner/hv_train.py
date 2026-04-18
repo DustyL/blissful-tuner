@@ -799,10 +799,23 @@ class FineTuningTrainer:
             attn_mode = "sageattn"
         elif args.xformers:
             attn_mode = "xformers"
+        elif args.cute:
+            attn_mode = "cute"
         else:
             raise ValueError(
-                "either --sdpa, --flash-attn, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --sage-attn, --xformersのいずれかを指定してください"
+                "either --sdpa, --flash-attn, --sage-attn, --xformers or --cute must be specified / --sdpa, --flash-attn, --sage-attn, --xformers, --cuteのいずれかを指定してください"
             )
+
+        if attn_mode == "cute":
+            from musubi_tuner.modules.attention import probe_cute_runtime
+
+            ok, detail = probe_cute_runtime(accelerator.device, needs_backward=True)
+            if not ok:
+                raise ValueError(
+                    f"--cute preflight failed on this GPU: {detail}. "
+                    "Either install a CuTE build that supports your architecture, "
+                    "or use --flash_attn / --sdpa. See docs/cute_attention.md."
+                )
         transformer = load_transformer(
             args.dit, attn_mode, args.split_attn, loading_device, None, in_channels=args.dit_in_channels
         )  # load as is

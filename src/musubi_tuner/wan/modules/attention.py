@@ -48,10 +48,34 @@ __all__ = [
     "attention",
 ]
 
+# Tri-state: None = unchecked, True = SM120 detected, False = not SM120.
+# SM120 (RTX 5090) does not support deterministic backward in CuTE.
+_is_sm120: Optional[bool] = None
+
+
+def _guard_sm120_deterministic(deterministic: bool, device: torch.device) -> bool:
+    """Override deterministic=True on SM120 with a one-time warning."""
+    global _is_sm120
+    if not deterministic:
+        return False
+    if _is_sm120 is None:
+        major, _ = torch.cuda.get_device_capability(device)
+        _is_sm120 = major == 12
+        if _is_sm120:
+            warnings.warn(
+                "CuTE deterministic backward is not supported on SM120 (RTX 5090). "
+                "Overriding to deterministic=False. Training will proceed normally "
+                "but is not bit-for-bit reproducible across runs. "
+                "Datacenter Blackwell (B200/B300) and Hopper GPUs are unaffected.",
+                stacklevel=3,
+            )
+    return not _is_sm120
+
 
 @torch.compiler.disable
 def _cute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, softmax_scale, causal, window_size, deterministic):
     """CuTE fixed-length attention (graph-break wrapper for torch.compile)."""
+    deterministic = _guard_sm120_deterministic(deterministic, q.device)
     return cute_flash_attn_func(
         q,
         k,
@@ -79,6 +103,7 @@ def _cute_attention_varlen(
     deterministic,
 ):
     """CuTE variable-length attention (graph-break wrapper for torch.compile)."""
+    deterministic = _guard_sm120_deterministic(deterministic, q.device)
     return cute_flash_attn_varlen_func(
         q,
         k,
