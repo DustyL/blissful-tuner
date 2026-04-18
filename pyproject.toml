@@ -3,7 +3,7 @@ name = "blissful-tuner"
 version = "0.12.67"
 description = "Blissful Tuner by Blyss Sarania, based on Musubi Tuner by kohya_ss"
 readme = "README.md"
-requires-python = ">=3.12, <3.13"
+requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.6.0",
     "av>=14.0.1",
@@ -167,7 +167,7 @@ explicit = true
 [tool.ruff]
 line-length = 132
 indent-width = 4
-target-version = "py39"
+target-version = "py310"
 
 lint.ignore = [
   "E402",  # module-import-not-at-top-of-file

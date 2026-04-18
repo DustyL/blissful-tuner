@@ -25,7 +25,7 @@ Blissful Tuner is an extended fork of Musubi Tuner (by kohya-ss) developed by Bl
 - **Line length**: 132 characters
 - **Indentation**: 4 spaces
 - **Quote style**: Double quotes
-- **Target Python**: 3.10+ (< 3.13)
+- **Target Python**: 3.10+ (verified working on 3.13 and 3.14; Ruff `target-version = "py310"`)
 
 ```bash
 ruff check --fix
@@ -36,10 +36,11 @@ Avoid broad refactors/formatting in vendored code (`src/blissful_tuner/codeforme
 
 ## Python Environment
 
-- **Virtual environment**: `/Users/dustin/blissful-tuner/venv` (NOT `.venv`)
-- Always use this project's venv — do not use the system Python or create a new virtual environment
-- Activate: `source /Users/dustin/blissful-tuner/venv/bin/activate`
-- Run tools with: `/Users/dustin/blissful-tuner/venv/bin/python`
+- **Primary venv (daily driver)**: `/home/dustin/blissful-tuner/venv313` — Python 3.13.7
+- **Secondary venv**: `/home/dustin/blissful-tuner/venv` — Python 3.14.0 (older, kept around; prefer venv313)
+- Always use a project venv — do not use system Python or create a new virtual environment
+- Activate: `source /home/dustin/blissful-tuner/venv313/bin/activate`
+- Run tools with: `/home/dustin/blissful-tuner/venv313/bin/python`
 - **No torch/rich in shell env**: Use `python -m py_compile` for syntax checks, not import-based verification.
 
 ## Common Commands
