@@ -2054,6 +2054,10 @@ class NetworkTrainer:
 
         if args.base_weights is not None:
             # if base_weights is specified, merge the weights to DiT model
+            # With block swap enabled, the transformer was loaded on CPU and
+            # prepare_block_swap_before_forward() has not run yet. The block
+            # weights targeted by LoRA are still CPU-resident here, so the
+            # CPU merge below does not need an accelerate-style onload wrapper.
             for i, weight_path in enumerate(args.base_weights):
                 if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
                     multiplier = 1.0

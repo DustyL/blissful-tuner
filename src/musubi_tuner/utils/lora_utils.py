@@ -1,3 +1,4 @@
+import math
 import os
 import re
 from typing import Dict, Iterable, List, Optional, Union
@@ -15,6 +16,7 @@ from musubi_tuner.modules.fp8_optimization_utils import load_safetensors_with_fp
 from blissful_tuner.blissful_logger import BlissfulLogger
 
 logger = BlissfulLogger(__name__, "green")
+_LOGGED_FAST_MERGE_FLAGS: set[str] = set()
 
 
 UNKNOWN_NETWORK_FORMAT_HINT = (
@@ -25,6 +27,13 @@ UNKNOWN_NETWORK_FORMAT_HINT = (
 def format_unknown_network_type_error(lora_path: str) -> str:
     """Build a consistent error message for unsupported/unknown LoRA weight formats."""
     return f"Unrecognized weight format in {lora_path}. {UNKNOWN_NETWORK_FORMAT_HINT}"
+
+
+def _log_fast_merge_flag_once(flag_name: str) -> None:
+    if flag_name in _LOGGED_FAST_MERGE_FLAGS:
+        return
+    logger.info(f"Fast LoRA merge detected {flag_name} weights; using matching merge math.")
+    _LOGGED_FAST_MERGE_FLAGS.add(flag_name)
 
 
 _DIFFUSERS_PREFIXES = frozenset(("diffusion_model", "transformer"))
@@ -320,6 +329,7 @@ def lora_merge_weights_to_tensor(
     lora_weight_keys: set,
     multiplier: float,
     calc_device: torch.device,
+    safe_merge: bool = False,
 ) -> torch.Tensor:
     """Merge standard LoRA weights directly into a model weight tensor.
 
@@ -329,9 +339,30 @@ def lora_merge_weights_to_tensor(
     down_key = lora_name + ".lora_down.weight"
     up_key = lora_name + ".lora_up.weight"
     alpha_key = lora_name + ".alpha"
+    prefixed_rslora_key = lora_name + ".use_rslora_flag"
+    prefixed_dora_flag_key = lora_name + ".use_dora_flag"
+    dora_magnitude_key = lora_name + ".dora_layer.weight"
 
     if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
         return model_weight
+
+    def get_bool_flag(*keys: str) -> bool:
+        for key in keys:
+            if key in lora_sd:
+                value = lora_sd[key]
+                return bool(value.item()) if isinstance(value, torch.Tensor) else bool(value)
+        return False
+
+    # Current blissful-tuner checkpoints write network-level flag buffers.
+    # Accept prefixed flags too, so partial or future per-module dicts still
+    # use the same merge math.
+    has_dora_magnitude = dora_magnitude_key in lora_sd
+    use_rslora = get_bool_flag(prefixed_rslora_key, "use_rslora_flag")
+    use_dora = get_bool_flag(prefixed_dora_flag_key, "use_dora_flag")
+    if use_rslora:
+        _log_fast_merge_flag_once("rsLoRA")
+    if use_dora:
+        _log_fast_merge_flag_once("DoRA")
 
     down_weight = lora_sd[down_key].to(calc_device)
     up_weight = lora_sd[up_key].to(calc_device)
@@ -340,7 +371,7 @@ def lora_merge_weights_to_tensor(
     alpha = lora_sd.get(alpha_key, dim)
     if isinstance(alpha, torch.Tensor):
         alpha = alpha.item()
-    scale = alpha / dim
+    scale = alpha / math.sqrt(dim) if use_rslora else alpha / dim
 
     org_device = model_weight.device
     original_dtype = model_weight.dtype
@@ -354,23 +385,56 @@ def lora_merge_weights_to_tensor(
         if len(up_weight.size()) == 4:  # use linear projection mismatch
             up_weight = up_weight.squeeze(3).squeeze(2)
             down_weight = down_weight.squeeze(3).squeeze(2)
-        model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
+        delta_weight = multiplier * (up_weight @ down_weight) * scale
+        if use_dora:
+            if not has_dora_magnitude:
+                raise ValueError(
+                    f"DoRA enabled for {lora_name} but {dora_magnitude_key} is missing from weights. "
+                    "This would silently produce incorrect results (uninitialized magnitudes)."
+                )
+            from musubi_tuner.networks.dora_utils import dora_weight_norm_materialized
+
+            dora_magnitude = lora_sd[dora_magnitude_key].to(calc_device, dtype=compute_dtype)
+            weight_norm = dora_weight_norm_materialized(model_weight, delta_weight, 1.0)
+            dora_factor = dora_magnitude / weight_norm
+            merged_weight = dora_factor.view(-1, 1) * (model_weight + delta_weight)
+        else:
+            merged_weight = model_weight + delta_weight
     elif down_weight.size()[2:4] == (1, 1):
         # conv2d 1x1
-        model_weight = (
+        if use_dora and has_dora_magnitude:
+            raise NotImplementedError("DoRA fast merge is only supported for Linear weights, not Conv2d weights.")
+        merged_weight = (
             model_weight
             + multiplier * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3) * scale
         )
     else:
         # conv2d 3x3
+        if use_dora and has_dora_magnitude:
+            raise NotImplementedError("DoRA fast merge is only supported for Linear weights, not Conv2d weights.")
         conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-        model_weight = model_weight + multiplier * conved * scale
+        merged_weight = model_weight + multiplier * conved * scale
 
-    model_weight = model_weight.to(device=org_device, dtype=original_dtype)
+    if safe_merge and not torch.isfinite(merged_weight).all():
+        raise ValueError(
+            f"Merge for {lora_name} produced non-finite values (rsLoRA={use_rslora}, dora={use_dora}). Refusing to commit."
+        )
+
+    model_weight = merged_weight.to(device=org_device, dtype=original_dtype)
 
     # Remove consumed keys
-    for key in [down_key, up_key, alpha_key]:
+    for key in [
+        down_key,
+        up_key,
+        alpha_key,
+        prefixed_rslora_key,
+        prefixed_dora_flag_key,
+        "use_rslora_flag",
+        "use_dora_flag",
+    ]:
         lora_weight_keys.discard(key)
+    if use_dora:
+        lora_weight_keys.discard(dora_magnitude_key)
 
     return model_weight
 
@@ -380,6 +444,7 @@ def merge_nonlora_to_model(
     weights_sd: Dict[str, torch.Tensor],
     multiplier: float,
     device: torch.device,
+    safe_merge: bool = False,
 ) -> int:
     """Merge LoHa/LoKr/LoRA weights directly into model parameters via per-key-family dispatch.
 
@@ -403,7 +468,9 @@ def merge_nonlora_to_model(
         # Per-key-family dispatch: LoHa → LoKr → LoRA
         param.data = loha_merge(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
         param.data = lokr_merge(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
-        param.data = lora_merge_weights_to_tensor(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
+        param.data = lora_merge_weights_to_tensor(
+            param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device, safe_merge=safe_merge
+        )
 
     merged_count = initial_key_count - len(lora_weight_keys)
 

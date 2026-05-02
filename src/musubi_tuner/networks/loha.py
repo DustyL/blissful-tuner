@@ -8,8 +8,7 @@ import ast
 import math
 import os
 import re
-from typing import Dict, List, Optional, Type, Union
-from transformers import CLIPTextModel
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
 from musubi_tuner.networks.network_arch import get_arch_config
+
+if TYPE_CHECKING:
+    from transformers import CLIPTextModel
+else:
+    CLIPTextModel = Any
 
 
 class LoHaModule(torch.nn.Module):

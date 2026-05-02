@@ -7,12 +7,17 @@ import ast
 import math
 import os
 import re
-from typing import Any, Dict, List, Optional, Type, Union
-from transformers import CLIPTextModel
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 import torch
 import torch.nn as nn
 
 from blissful_tuner.blissful_logger import BlissfulLogger
+from musubi_tuner.networks.dora_utils import dora_weight_norm_materialized as _dora_weight_norm_materialized
+
+if TYPE_CHECKING:
+    from transformers import CLIPTextModel
+else:
+    CLIPTextModel = Any
 
 logger = BlissfulLogger(__name__, "green")
 
@@ -59,9 +64,7 @@ class DoRALayer(nn.Module):
 
         For [out, in] weight matrix, computes ||row_i||_2 for each output row.
         """
-        combined = weight + scaling * lora_weight
-        weight_norm = torch.linalg.norm(combined, dim=1).clamp_min(eps)
-        return weight_norm.to(weight.dtype)
+        return _dora_weight_norm_materialized(weight, lora_weight, scaling, eps)
 
     def get_weight_norm_efficient(
         self, W: torch.Tensor, A: torch.Tensor, B: torch.Tensor, s: float, eps: float = 1e-6
