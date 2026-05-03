@@ -275,6 +275,29 @@ def parse_args() -> argparse.Namespace:
 
     validate_lycoris_arg(args)
 
+    # Phase 1 hotswap rejections (see docs/plans/2026-05-02-peft-tier1-hotswap.md):
+    # --prepare_for_hotswap is incompatible with --prefer_lycoris (LyCORIS uses its
+    # own merge bridge) and with --fp8_scaled (FP8 registers per-layer scale_weight
+    # buffers that hotswap would not refresh). Reject at parse time, not at run time.
+    if getattr(args, "prepare_for_hotswap", False):
+        if args.prefer_lycoris:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --prefer_lycoris in Phase 1. "
+                "LyCORIS uses its own merge path; standard non-hotswap merge is required."
+            )
+        if args.fp8_scaled:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --fp8_scaled in Phase 1. "
+                "FP8 optimization registers per-layer scale_weight buffers that the hotswap "
+                "path would not refresh, producing silently wrong outputs. "
+                "See docs/plans/2026-05-02-peft-tier1-hotswap.md 'FP8 hotswap unsupported in Phase 1'."
+            )
+        if args.save_merged_model:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --save_merged_model. "
+                "Hotswap is for live inference sweeps; saving the merged model is a one-shot operation."
+            )
+
     return args
 
 
@@ -647,7 +670,12 @@ def load_dit_model(
         loading_device = device
 
     # load LoRA weights
-    if not args.prefer_lycoris and lora_weights is not None and len(lora_weights) > 0:
+    # Hotswap path: suppress the in-load merge so the DiT loads as a permanent base.
+    # The initial active LoRA set is applied AFTER prepare_for_hotswap captures the
+    # cache (see post-load block below). This is the load-bearing ordering invariant
+    # for the no-accumulation contract — see docs/plans/2026-05-02-peft-tier1-hotswap.md.
+    suppress_lora_preload = getattr(args, "prepare_for_hotswap", False)
+    if not args.prefer_lycoris and not suppress_lora_preload and lora_weights is not None and len(lora_weights) > 0:
         lora_weights_list = []
         for i, lora_weight in enumerate(lora_weights):
             logger.info(f"Loading LoRA weight from: {lora_weight}")
@@ -753,6 +781,55 @@ def load_dit_model(
         # make sure the model is on the right device
         model.to(device)
 
+    # ===== HOTSWAP: Phase 1 wiring (WAN vertical slice) =====
+    # The DiT was loaded WITHOUT the initial LoRA preload (see suppression in
+    # the lora_weights_list block above). Now: snapshot the un-merged base into
+    # the HotswapState, then apply the initial active LoRA set via the post-load
+    # merge path. This preserves the no-accumulation invariant — the cached
+    # base reflects the permanent base only, never any LoRA delta.
+    # See docs/plans/2026-05-02-peft-tier1-hotswap.md.
+    model.hotswap_state = None
+    if getattr(args, "prepare_for_hotswap", False):
+        from musubi_tuner.utils.lora_utils import prepare_for_hotswap as _prepare_for_hotswap
+
+        # WAN2.2 high/low expert: each load_dit_model call has its own dit_path,
+        # so each model carries an INDEPENDENT HotswapState. Sweep callers need
+        # to hotswap each expert's model separately.
+        model.hotswap_state = _prepare_for_hotswap(
+            model,
+            dit_paths=[dit_path],
+            base_weights_paths=None,  # WAN generation does not have --base_weights
+            base_weights_multipliers=None,
+            cache_in_ram=args.cache_unmerged_base,
+            strict_base_hash=args.hotswap_strict_base_hash,
+        )
+
+        # Apply the initial active LoRA set via the standard post-load merge.
+        # This is the same code path the LyCORIS branch uses (merge_lora_weights
+        # with lycoris=False here). After this, the model is in the same observable
+        # state as the non-hotswap path would have produced — but the cached base
+        # is preserved for future hotswap calls.
+        if lora_weights is not None and len(lora_weights) > 0:
+            merge_lora_weights(
+                lora_wan,
+                model,
+                lora_weights,
+                lora_multipliers,
+                args.include_patterns,
+                args.exclude_patterns,
+                device,
+                lycoris=False,
+                save_merged_model=None,
+                standard_lora_only=True,
+            )
+            mults = list(lora_multipliers) if lora_multipliers else [1.0] * len(lora_weights)
+            # Pad/truncate multipliers to match LoRA count (matches existing convention)
+            if len(mults) < len(lora_weights):
+                mults = mults + [1.0] * (len(lora_weights) - len(mults))
+            mults = mults[: len(lora_weights)]
+            model.hotswap_state.active_lora_paths = list(lora_weights)
+            model.hotswap_state.active_lora_multipliers = mults
+
     if args.compile_args is not None:
         logger.warning(
             "--compile_args is deprecated; use --compile_backend/--compile_mode/--compile_dynamic/--compile_fullgraph instead."
@@ -786,6 +863,7 @@ def merge_lora_weights(
     save_merged_model: Optional[str] = None,
     converter: Optional[callable] = None,
     extra_unet_targets: Optional[List[str]] = None,
+    standard_lora_only: bool = False,
 ) -> None:
     """merge LoRA weights to the model
 
@@ -816,6 +894,12 @@ def merge_lora_weights(
             weights_sd = converter(weights_sd)
         else:  # Kohya still hasn't implemented conversion for Wan/Hunyuan so this else handles that
             weights_sd = convert_diffusers_if_needed(weights_sd)
+
+        if standard_lora_only:
+            from musubi_tuner.utils.lora_utils import _assert_standard_lora_only
+
+            _assert_standard_lora_only(weights_sd, lora_weight)
+
         # apply include/exclude patterns
         original_key_count = len(weights_sd.keys())
         if include_patterns is not None and len(include_patterns) > i:

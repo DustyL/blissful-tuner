@@ -428,6 +428,13 @@ def setup_parser_compile(parser: argparse.ArgumentParser):
         help="Disable compiling linear layers of the model. Will use more VRAM but can work around compile issues with block swap",
     )
 
+    # Hotswap flags piggyback on setup_parser_compile so every script that already
+    # uses --compile inherits them. Per-script validation rejects unsupported combos
+    # (e.g. WAN rejects --prepare_for_hotswap + --prefer_lycoris / --fp8_scaled).
+    from musubi_tuner.utils.lora_utils import setup_parser_hotswap
+
+    setup_parser_hotswap(parser)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanVideo inference script", formatter_class=RichHelpFormatter)

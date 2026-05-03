@@ -1,6 +1,9 @@
+import argparse
+import hashlib
 import math
 import os
 import re
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Union
 import torch
 from tqdm import tqdm
@@ -480,3 +483,346 @@ def merge_nonlora_to_model(
         logger.warning(f"{len(remaining)} LoHa/LoKr/LoRA keys were not matched to model parameters")
 
     return merged_count
+
+
+# =====================================================================
+# Hotswap: compile-friendly LoRA replacement
+#
+# Approach A (copy merged weights into compiled params). The empirical
+# foundation: param.data.copy_() on a torch.compile'd module's parameter
+# does not trigger Dynamo recompile, and the compiled graph correctly
+# reflects the new values on next forward. Verified 2026-05-02.
+#
+# Phase 1 contract:
+#   - Standard LoRA only (detect_network_type == "lora")
+#   - --prefer_lycoris and --fp8_scaled rejected at arg-parse time
+#   - WAN-only wiring (other architectures deferred to Phase 2)
+#
+# Critical correctness invariant: every hotswap must start from the
+# un-merged base, never from the model's current parameters. See
+# docs/plans/2026-05-02-peft-tier1-hotswap.md for the full design.
+# =====================================================================
+
+
+@dataclass
+class HotswapState:
+    """Per-model state for compile-friendly LoRA hotswap.
+
+    One instance per loaded DiT (so WAN2.2's high+low expert path
+    carries two states, one per model). Stored as `model.hotswap_state`.
+    """
+
+    base_dit_paths: List[str]
+    base_weights_paths: Optional[List[str]] = None
+    base_weights_multipliers: Optional[List[float]] = None
+    cached_base_sd: Optional[Dict[str, torch.Tensor]] = None
+    base_sha256: Optional[str] = None
+    cache_in_ram: bool = False
+    strict_base_hash: bool = True
+    active_lora_paths: List[str] = field(default_factory=list)
+    active_lora_multipliers: List[float] = field(default_factory=list)
+
+
+def setup_parser_hotswap(parser: argparse.ArgumentParser) -> None:
+    """Add --prepare_for_hotswap, --cache_unmerged_base, --hotswap_strict_base_hash flags.
+
+    Called from `hv_generate_video.setup_parser_compile()` so every
+    generation script that already wires compile flags inherits hotswap
+    flags too.
+    """
+    parser.add_argument(
+        "--prepare_for_hotswap",
+        action="store_true",
+        help=(
+            "Enable compile-friendly LoRA hotswap. Lets sweep scripts swap LoRAs without recompiling. "
+            "Phase 1: WAN only, standard LoRA only, incompatible with --prefer_lycoris and --fp8_scaled. "
+            "Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--cache_unmerged_base",
+        action="store_true",
+        help=(
+            "Cache the un-merged DiT base in CPU RAM (~14-30 GB depending on architecture). "
+            "Without this, hotswap re-loads base from disk on each swap (~3-5s on NVMe). "
+            "Tighter RAM systems should leave this off."
+        ),
+    )
+    parser.add_argument(
+        "--hotswap_strict_base_hash",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Refuse to hotswap onto a base whose ss_base_sha256 metadata does not match. "
+            "Default: ON. Pass --no-hotswap_strict_base_hash to downgrade mismatch to a warning. "
+            "LoRAs lacking the metadata always warn-only (back-compat for older checkpoints)."
+        ),
+    )
+
+
+def compute_base_hash(dit_paths: List[str]) -> str:
+    """SHA256 of the on-disk DiT file(s), in path-list order.
+
+    Phase 1 uses a file-content hash (not a parameter-tensor hash) so it
+    can be computed at training time without loading the model into RAM.
+    Multi-file DiTs (e.g. WAN2.2's high+low) are hashed by concatenating
+    each file's bytes into the same hasher in the order given.
+    """
+    h = hashlib.sha256()
+    chunk_size = 8 * 1024 * 1024
+    for path in _expand_weight_paths(dit_paths):
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def _expand_weight_paths(paths: List[str]) -> List[str]:
+    """Expand split safetensors paths to the concrete shard list."""
+    expanded: List[str] = []
+    for path in paths:
+        split_paths = get_split_weight_filenames(path)
+        if split_paths is None:
+            expanded.append(path)
+        else:
+            expanded.extend(split_paths)
+    return expanded
+
+
+def _assert_standard_lora_only(lora_sd: Dict[str, torch.Tensor], lora_path: str) -> None:
+    """Phase 1 contract: hotswap accepts only standard LoRA networks.
+
+    Raises ValueError with actionable message for loha / lokr / hybrid /
+    unknown. The caller is expected to supply the LoRA path string for
+    the error message.
+    """
+    net_type = detect_network_type(lora_sd)
+    if net_type != "lora":
+        raise ValueError(
+            f"Hotswap rejected {lora_path}: detected network type {net_type!r}, "
+            "but Phase 1 supports standard LoRA only (detect_network_type == 'lora'). "
+            "Use the standard non-hotswap merge path (omit --prepare_for_hotswap) for "
+            f"{net_type} adapters, or convert to standard LoRA first."
+        )
+
+
+def _check_lora_base_hash(
+    lora_sd_metadata: Optional[Dict[str, str]],
+    lora_path: str,
+    expected_sha256: str,
+    strict: bool,
+) -> None:
+    """Validate the LoRA's ss_base_sha256 metadata against expected.
+
+    Missing on the LoRA side: warn-only (back-compat for old checkpoints).
+    Mismatched + strict: raise.
+    Mismatched + not strict: warn.
+    """
+    if not lora_sd_metadata:
+        logger.warning(
+            f"Hotswap: {lora_path} has no safetensors metadata; cannot validate base hash. "
+            "Older blissful-tuner LoRAs predate ss_base_sha256 — proceeding."
+        )
+        return
+    lora_base = lora_sd_metadata.get("ss_base_sha256")
+    if lora_base is None:
+        logger.warning(f"Hotswap: {lora_path} metadata lacks ss_base_sha256; cannot validate base hash. Proceeding.")
+        return
+    if lora_base == expected_sha256:
+        return
+    short_lora = lora_base[:12]
+    short_expected = expected_sha256[:12]
+    msg = (
+        f"Hotswap base-hash mismatch for {lora_path}: "
+        f"LoRA was trained against base {short_lora}..., but the loaded base is {short_expected}.... "
+    )
+    if strict:
+        raise ValueError(
+            msg + "Pass --no-hotswap_strict_base_hash to downgrade this to a warning, " + "or load the matching base DiT."
+        )
+    logger.warning(msg + "Proceeding because --no-hotswap_strict_base_hash is set.")
+
+
+def _read_safetensors_metadata(path: str) -> Optional[Dict[str, str]]:
+    """Read just the metadata header of a safetensors file, without loading tensors."""
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt") as f:
+            return f.metadata() or {}
+    except Exception as e:
+        logger.warning(f"Failed to read metadata from {path}: {e}")
+        return None
+
+
+def _copy_state_dict_to_model_parameters(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor], source: str) -> int:
+    """Copy matching state-dict tensors into model parameters.
+
+    WAN base checkpoints may include a model-level prefix that is stripped
+    during the normal load path. Accept those prefixed keys here too so
+    hotswap re-load mode resets to the same base the model was built from.
+    """
+    copied = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            tensor = state_dict.get(name)
+            if tensor is None:
+                for prefix in _MODEL_KEY_PREFIXES:
+                    tensor = state_dict.get(prefix + name)
+                    if tensor is not None:
+                        break
+            if tensor is None:
+                continue
+            param.data.copy_(tensor.to(param.device, param.dtype))
+            copied += 1
+    if copied == 0:
+        sample_keys = ", ".join(list(state_dict.keys())[:5])
+        raise ValueError(
+            f"Hotswap reset loaded {source} but matched 0 model parameters. "
+            f"Check checkpoint architecture/key prefixes. Sample keys: {sample_keys}"
+        )
+    return copied
+
+
+def prepare_for_hotswap(
+    model: torch.nn.Module,
+    dit_paths: List[str],
+    base_weights_paths: Optional[List[str]] = None,
+    base_weights_multipliers: Optional[List[float]] = None,
+    cache_in_ram: bool = False,
+    strict_base_hash: bool = True,
+) -> HotswapState:
+    """One-time setup. Snapshot the un-merged base for future hotswap calls.
+
+    MUST be called AFTER the DiT is loaded WITHOUT initial LoRAs (the
+    caller is responsible for suppressing the standard LoRA preload),
+    and AFTER any --base_weights merge, but BEFORE the initial active
+    LoRA merge.
+
+    cache_in_ram=True snapshots the model's parameters into CPU RAM
+    right now. The snapshot is FROZEN — never mutated by subsequent
+    hotswaps (hotswap_lora always copies it before merging).
+
+    cache_in_ram=False stores only the paths. Each hotswap re-reads
+    dit_paths from disk and re-applies base_weights.
+    """
+    base_sha256 = compute_base_hash(dit_paths)
+    cached_sd: Optional[Dict[str, torch.Tensor]] = None
+    if cache_in_ram:
+        cached_sd = {name: p.detach().to("cpu", copy=True) for name, p in model.named_parameters()}
+        total_bytes = sum(t.element_size() * t.numel() for t in cached_sd.values())
+        logger.info(f"Hotswap: cached un-merged base in CPU RAM ({len(cached_sd)} parameters, ~{total_bytes / (1024**3):.1f} GB)")
+    state = HotswapState(
+        base_dit_paths=list(dit_paths),
+        base_weights_paths=list(base_weights_paths) if base_weights_paths else None,
+        base_weights_multipliers=list(base_weights_multipliers) if base_weights_multipliers else None,
+        cached_base_sd=cached_sd,
+        base_sha256=base_sha256,
+        cache_in_ram=cache_in_ram,
+        strict_base_hash=strict_base_hash,
+    )
+    logger.info(f"Hotswap prepared: cache_in_ram={cache_in_ram}, strict_hash={strict_base_hash}, base_sha256={base_sha256[:12]}...")
+    return state
+
+
+def _reset_model_to_unmerged_base(
+    model: torch.nn.Module,
+    state: HotswapState,
+    calc_device: torch.device,
+) -> None:
+    """Step 1 of hotswap: restore model parameters to the un-merged base.
+
+    Cache mode: copy from frozen snapshot (snapshot is never mutated).
+    Re-load mode: load from disk + re-apply base_weights.
+
+    Uses param.data.copy_() throughout so the compiled graph is unaffected.
+    """
+    if state.cache_in_ram:
+        if state.cached_base_sd is None:
+            raise RuntimeError("HotswapState in cache mode but cached_base_sd is None — bug")
+        # COPY into model parameters; never mutate the snapshot in place
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if name in state.cached_base_sd:
+                    src = state.cached_base_sd[name]
+                    p.data.copy_(src.to(p.device, p.dtype))
+    else:
+        from safetensors.torch import load_file
+
+        # Re-load DiT files from disk
+        total_copied = 0
+        for path in _expand_weight_paths(state.base_dit_paths):
+            fresh_sd = load_file(path)
+            total_copied += _copy_state_dict_to_model_parameters(model, fresh_sd, path)
+            del fresh_sd
+        logger.info(f"Hotswap: reset model from disk base ({total_copied} parameters copied)")
+
+        # Re-apply --base_weights (permanent merge by design — see plan)
+        if state.base_weights_paths:
+            for i, bw_path in enumerate(state.base_weights_paths):
+                bw_mult = (
+                    state.base_weights_multipliers[i]
+                    if state.base_weights_multipliers and i < len(state.base_weights_multipliers)
+                    else 1.0
+                )
+                bw_sd = load_file(bw_path)
+                _assert_standard_lora_only(bw_sd, bw_path)
+                merge_nonlora_to_model(model, bw_sd, bw_mult, calc_device)
+                del bw_sd
+
+
+def hotswap_lora(
+    model: torch.nn.Module,
+    state: HotswapState,
+    new_lora_paths: List[str],
+    new_multipliers: Optional[List[float]] = None,
+    calc_device: Optional[torch.device] = None,
+) -> None:
+    """Replace the currently-merged LoRAs with new ones, in place.
+
+    Lifecycle (see plan for invariants):
+      1. RESET    — fresh un-merged base into model.parameters()
+      2. GUARD    — _assert_standard_lora_only on each new LoRA
+      3. VALIDATE — ss_base_sha256 check vs state.base_sha256
+      4. MERGE    — merge each new LoRA into model via merge_nonlora_to_model
+      5. UPDATE   — bookkeeping in state.active_lora_*
+
+    The compiled graph is unaffected because every write to model is
+    via param.data.copy_() (directly in step 1, transitively in step 4
+    through merge_nonlora_to_model's existing pattern).
+    """
+    from safetensors.torch import load_file
+
+    if new_multipliers is None:
+        new_multipliers = [1.0] * len(new_lora_paths)
+    if len(new_multipliers) != len(new_lora_paths):
+        raise ValueError(f"hotswap_lora: got {len(new_lora_paths)} LoRA paths but {len(new_multipliers)} multipliers")
+    if calc_device is None:
+        # Pick the device of the first parameter as a sensible default
+        calc_device = next(model.parameters()).device
+
+    # Step 2 (GUARD) and Step 3 (VALIDATE) — pre-load and check before mutating model
+    new_sds: List[Dict[str, torch.Tensor]] = []
+    for path in new_lora_paths:
+        sd = load_file(path)
+        _assert_standard_lora_only(sd, path)
+        if state.base_sha256 is not None:
+            metadata = _read_safetensors_metadata(path)
+            _check_lora_base_hash(metadata, path, state.base_sha256, state.strict_base_hash)
+        new_sds.append(sd)
+
+    # Step 1 (RESET) — only proceed once all guards pass
+    _reset_model_to_unmerged_base(model, state, calc_device)
+
+    # Step 4 (MERGE) — apply new LoRAs in order
+    for path, mult, sd in zip(new_lora_paths, new_multipliers, new_sds):
+        logger.info(f"Hotswap: applying {path} with multiplier {mult}")
+        if mult == 0:
+            logger.info(f"Hotswap: skipping {path} because multiplier is 0")
+            continue
+        merge_nonlora_to_model(model, sd, mult, calc_device)
+
+    # Step 5 (UPDATE) — bookkeeping
+    state.active_lora_paths = list(new_lora_paths)
+    state.active_lora_multipliers = list(new_multipliers)
+    logger.info(f"Hotswap complete: {len(new_lora_paths)} LoRA(s) merged")
