@@ -88,6 +88,16 @@ def parse_args():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for merging"
     )
+    parser.add_argument(
+        "--safe_merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Check merged tensors for NaN/Inf before saving. Default: ON. "
+            "Pass --no-safe_merge to restore the old unchecked behavior."
+        ),
+    )
+    parser.add_argument("--no_safe_merge", dest="safe_merge", action="store_false", help=argparse.SUPPRESS)
 
     # Qwen-Image variant flags (only used when --architecture qwen_image)
     from musubi_tuner.qwen_image import qwen_image_utils
@@ -102,6 +112,7 @@ def main():
 
     device = torch.device(args.device)
     logger.info(f"Using device: {device}")
+    logger.info(f"safe_merge finite checks: {'enabled' if args.safe_merge else 'disabled'}")
 
     architecture = _resolve_architecture(args.architecture, args.lora_weight)
     logger.info(f"Architecture: {architecture}")
@@ -148,7 +159,7 @@ def main():
             weights_sd = convert_diffusers_if_needed(weights_sd)
             if net_type in ("loha", "lokr", "hybrid"):
                 logger.info(f"Detected {net_type} weights, using per-key-family merge")
-                merged_count = merge_nonlora_to_model(transformer, weights_sd, lora_multiplier, device)
+                merged_count = merge_nonlora_to_model(transformer, weights_sd, lora_multiplier, device, safe_merge=args.safe_merge)
                 if merged_count == 0:
                     raise ValueError(
                         f"No weights were merged from {lora_weight}. This usually means the LoRA architecture "
@@ -172,7 +183,7 @@ def main():
                         f"Try passing --architecture explicitly."
                     )
                 logger.info("Merging LoRA weights to DiT model")
-                network.merge_to(None, transformer, weights_sd, device=device, non_blocking=True)
+                network.merge_to(None, transformer, weights_sd, device=device, non_blocking=True, safe_merge=args.safe_merge)
 
             logger.info("LoRA weights merged")
 

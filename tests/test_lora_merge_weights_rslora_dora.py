@@ -6,7 +6,7 @@ import unittest
 import torch
 
 from musubi_tuner.networks.lora import LoRAInfModule
-from musubi_tuner.utils.lora_utils import lora_merge_weights_to_tensor
+from musubi_tuner.utils.lora_utils import lora_merge_weights_to_tensor, merge_nonlora_to_model
 
 
 def _build_lora_sd(
@@ -178,6 +178,34 @@ class TestSafeMerge(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "non-finite"):
             lora_merge_weights_to_tensor(torch.zeros(4, 8), "test", sd, set(sd.keys()), 1.0, torch.device("cpu"), safe_merge=True)
+
+    def test_merge_nonlora_safe_merge_does_not_commit_nonfinite_result(self) -> None:
+        model = torch.nn.Module()
+        model.to_q = torch.nn.Linear(8, 4, bias=False)
+        original = model.to_q.weight.detach().clone()
+        sd = _build_lora_sd("lora_unet_to_q", 8, 4, 4, 4.0)
+        sd["lora_unet_to_q.lora_up.weight"][0, 0] = float("nan")
+
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            merge_nonlora_to_model(model, sd, 1.0, torch.device("cpu"), safe_merge=True)
+
+        self.assertTrue(torch.allclose(model.to_q.weight, original))
+
+    def test_lora_inf_merge_to_safe_merge_does_not_commit_nonfinite_result(self) -> None:
+        base = torch.nn.Linear(8, 4, bias=False)
+        original = base.weight.detach().clone()
+        module = LoRAInfModule("test", base, multiplier=1.0, lora_dim=4, alpha=4.0)
+        sd = {
+            "lora_down.weight": torch.randn(4, 8),
+            "lora_up.weight": torch.randn(4, 4),
+            "alpha": torch.tensor(4.0),
+        }
+        sd["lora_up.weight"][0, 0] = float("nan")
+
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            module.merge_to(sd, dtype=None, device=torch.device("cpu"), safe_merge=True)
+
+        self.assertTrue(torch.allclose(base.weight, original))
 
 
 if __name__ == "__main__":

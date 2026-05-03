@@ -468,12 +468,17 @@ def merge_nonlora_to_model(
 
         lora_name = "lora_unet_" + param_name.rsplit(".", 1)[0].replace(".", "_")
 
-        # Per-key-family dispatch: LoHa → LoKr → LoRA
-        param.data = loha_merge(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
-        param.data = lokr_merge(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
-        param.data = lora_merge_weights_to_tensor(
-            param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device, safe_merge=safe_merge
+        # Per-key-family dispatch: LoHa → LoKr → LoRA. Keep the merged tensor
+        # local until safe_merge passes so a non-finite result is never committed
+        # to the model parameter.
+        merged_param = loha_merge(param.data, lora_name, weights_sd, lora_weight_keys, multiplier, device)
+        merged_param = lokr_merge(merged_param, lora_name, weights_sd, lora_weight_keys, multiplier, device)
+        merged_param = lora_merge_weights_to_tensor(
+            merged_param, lora_name, weights_sd, lora_weight_keys, multiplier, device, safe_merge=safe_merge
         )
+        if safe_merge and not torch.isfinite(merged_param).all():
+            raise ValueError(f"safe_merge detected non-finite merged weight for {lora_name}")
+        param.data = merged_param
 
     merged_count = initial_key_count - len(lora_weight_keys)
 

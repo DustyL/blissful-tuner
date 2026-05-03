@@ -466,7 +466,7 @@ class LoRAInfModule(LoRAModule):
     #     else:
     #         self._merge_to(sd, dtype, device, non_blocking)
 
-    def merge_to(self, sd, dtype, device, non_blocking=False):
+    def merge_to(self, sd, dtype, device, non_blocking=False, safe_merge: bool = False):
         # Project convention: multiplier=0 should be a true no-op.
         if self.multiplier == 0:
             return
@@ -519,6 +519,9 @@ class LoRAInfModule(LoRAModule):
                 # logger.info(conved.size(), weight.size(), module.stride, module.padding)
                 weight = weight + self.multiplier * conved * self.scale
 
+            if safe_merge and not torch.isfinite(weight).all():
+                raise ValueError(f"safe_merge detected non-finite merged weight for {self.lora_name}")
+
             # set weight to org_module
             org_sd["weight"] = weight.to(org_device, dtype=dtype)  # back to CPU without non_blocking
             self.org_module.load_state_dict(org_sd)
@@ -536,6 +539,9 @@ class LoRAInfModule(LoRAModule):
 
                 # merge weight
                 weight = weight + self.multiplier * (up_weight @ down_weight) * self.scale
+
+            if safe_merge and not torch.isfinite(weight).all():
+                raise ValueError(f"safe_merge detected non-finite merged weight for {self.lora_name}")
 
             # set weight to org_module
             org_sd["weight"] = weight.to(org_device, dtype)  # back to CPU without non_blocking
@@ -1177,7 +1183,7 @@ class LoRANetwork(torch.nn.Module):
         return True
 
     # TODO refactor to common function with apply_to
-    def merge_to(self, text_encoders, unet, weights_sd, dtype=None, device=None, non_blocking=False):
+    def merge_to(self, text_encoders, unet, weights_sd, dtype=None, device=None, non_blocking=False, safe_merge: bool = False):
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=2) as executor:  # 2 workers is enough
@@ -1192,7 +1198,7 @@ class LoRANetwork(torch.nn.Module):
                     continue
 
                 # lora.merge_to(sd_for_lora, dtype, device)
-                futures.append(executor.submit(lora.merge_to, sd_for_lora, dtype, device, non_blocking))
+                futures.append(executor.submit(lora.merge_to, sd_for_lora, dtype, device, non_blocking, safe_merge))
 
         for future in futures:
             future.result()
