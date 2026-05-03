@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from musubi_tuner.utils.lora_utils import (
     HotswapState,
@@ -538,6 +538,113 @@ class TestParserHotswap(unittest.TestCase):
     def test_wan_parse_rejects_save_merged_model_hotswap(self) -> None:
         with self.assertRaisesRegex(ValueError, "prepare_for_hotswap.*save_merged_model"):
             self._parse_wan(["--prepare_for_hotswap", "--save_merged_model", "merged.safetensors"])
+
+
+class TestWanDualExpertHotswapPlumbing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tdpath = Path(self.tmpdir.name)
+        self.in_dim = 16
+        self.out_dim = 8
+        self.low_base = torch.zeros(self.out_dim, self.in_dim)
+        self.high_base = torch.ones(self.out_dim, self.in_dim)
+        self.low_path = _save_sd({"to_q.weight": self.low_base.clone()}, self.tdpath, "low.safetensors")
+        self.high_path = _save_sd({"to_q.weight": self.high_base.clone()}, self.tdpath, "high.safetensors")
+        self.low_lora = _save_sd(
+            _make_lora_sd_for_module("to_q", self.in_dim, self.out_dim, seed=111),
+            self.tdpath,
+            "low_lora.safetensors",
+        )
+        self.high_lora = _save_sd(
+            _make_lora_sd_for_module("to_q", self.in_dim, self.out_dim, seed=222),
+            self.tdpath,
+            "high_lora.safetensors",
+        )
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def _args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            attn_mode="torch",
+            blocks_to_swap=0,
+            cache_unmerged_base=True,
+            compile=False,
+            compile_args=None,
+            disable_linear_for_compile=False,
+            disable_numpy_memmap=False,
+            dit=self.low_path,
+            dit_high_noise=self.high_path,
+            exclude_patterns=None,
+            fp8_fast=False,
+            fp8_scaled=False,
+            hotswap_strict_base_hash=False,
+            include_patterns=None,
+            lazy_loading=False,
+            lora_multiplier=[0.5],
+            lora_multiplier_high_noise=[0.75],
+            lora_weight=[self.low_lora],
+            lora_weight_high_noise=[self.high_lora],
+            mixed_precision_transformer=False,
+            offload_inactive_dit=False,
+            prefer_lycoris=False,
+            prepare_for_hotswap=True,
+            save_merged_model=None,
+            use_pinned_memory_for_block_swap=False,
+        )
+
+    def _fake_load_wan_model(self, _config, _device, dit_path, *_args, **kwargs) -> torch.nn.Module:
+        self.assertIsNone(
+            kwargs.get("lora_weights_list"),
+            "WAN hotswap must suppress load-time LoRA preload before capturing the base",
+        )
+        model = _make_synthetic_base_module(self.in_dim, self.out_dim)
+        with torch.no_grad():
+            model.to_q.weight.copy_(load_file(dit_path)["to_q.weight"])
+        return model
+
+    def test_dual_expert_models_get_independent_hotswap_state(self) -> None:
+        from musubi_tuner import wan_generate_video
+
+        args = self._args()
+        with (
+            patch.object(wan_generate_video, "load_wan_model", side_effect=self._fake_load_wan_model) as load_mock,
+            patch.object(wan_generate_video, "merge_lora_weights") as merge_mock,
+        ):
+            models = wan_generate_video.load_dit_models(
+                args,
+                config=object(),
+                device=torch.device("cpu"),
+                dit_dtype=torch.float32,
+                dit_weight_dtype=torch.float32,
+            )
+
+        self.assertEqual(load_mock.call_count, 2)
+        self.assertEqual(merge_mock.call_count, 2)
+        self.assertEqual(merge_mock.call_args_list[0].args[2], [self.low_lora])
+        self.assertEqual(merge_mock.call_args_list[1].args[2], [self.high_lora])
+        self.assertTrue(merge_mock.call_args_list[0].kwargs["standard_lora_only"])
+        self.assertTrue(merge_mock.call_args_list[1].kwargs["standard_lora_only"])
+
+        self.assertEqual(len(models), 2)
+        high_model, low_model = models
+        self.assertIsNotNone(high_model.hotswap_state)
+        self.assertIsNotNone(low_model.hotswap_state)
+        self.assertEqual(high_model.hotswap_state.base_dit_paths, [self.high_path])
+        self.assertEqual(low_model.hotswap_state.base_dit_paths, [self.low_path])
+        self.assertIsNot(high_model.hotswap_state, low_model.hotswap_state)
+        self.assertIsNot(high_model.hotswap_state.cached_base_sd, low_model.hotswap_state.cached_base_sd)
+        self.assertEqual(high_model.hotswap_state.active_lora_paths, [self.high_lora])
+        self.assertEqual(high_model.hotswap_state.active_lora_multipliers, [0.75])
+        self.assertEqual(low_model.hotswap_state.active_lora_paths, [self.low_lora])
+        self.assertEqual(low_model.hotswap_state.active_lora_multipliers, [0.5])
+
+        low_before = low_model.to_q.weight.detach().clone()
+        high_before = high_model.to_q.weight.detach().clone()
+        hotswap_lora(high_model, high_model.hotswap_state, [self.high_lora], [1.0], calc_device=torch.device("cpu"))
+
+        self.assertTrue(torch.equal(low_model.to_q.weight, low_before))
+        self.assertFalse(torch.equal(high_model.to_q.weight, high_before))
 
 
 if __name__ == "__main__":
