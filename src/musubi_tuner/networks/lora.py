@@ -46,6 +46,59 @@ def parse_bool_arg(value, default: bool = False) -> bool:
     return default
 
 
+def parse_init_lora_weights_arg(value: Any = None) -> str:
+    if value is None:
+        return "kaiming"
+    if value is True:
+        return "kaiming"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return "kaiming"
+        if normalized in ("kaiming", "orthogonal"):
+            return normalized
+    raise ValueError(f"init_lora_weights must be one of 'kaiming', 'orthogonal', or 'true' (alias for kaiming), got {value!r}")
+
+
+def _init_kaiming_lora_pair(lora_down: torch.nn.Module, lora_up: torch.nn.Module) -> None:
+    torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
+    torch.nn.init.zeros_(lora_up.weight)
+
+
+def _init_orthogonal_lora_pair(
+    lora_down: torch.nn.Module,
+    lora_up: torch.nn.Module,
+    in_features: int,
+    out_features: int,
+    rank: int,
+) -> None:
+    """Orthogonal LoRA init from PEFT.
+
+    This is Linear-only QR-based init. It preserves the standard LoRA
+    zero-delta-at-init invariant because B @ A is zero, while both A and B
+    start nonzero.
+    """
+    if rank % 2 != 0:
+        raise ValueError(
+            f"Orthogonal LoRA init requires even rank, got {rank}. "
+            "Either set --network_dim to an even number or use init_lora_weights=kaiming."
+        )
+
+    dtype = lora_down.weight.dtype
+    device = lora_down.weight.device
+    with torch.no_grad():
+        x = torch.randn(rank, rank, device=device, dtype=torch.float32)
+        q, _ = torch.linalg.qr(x)
+        q_odd = q[0::2, :]
+        q_even = q[1::2, :]
+
+        new_down = (torch.randn(in_features, rank // 2, device=device, dtype=torch.float32).mm(q_odd).T / 10.0).contiguous()
+        new_up = (torch.randn(rank // 2, out_features, device=device, dtype=torch.float32).T.mm(q_even) / 10.0).contiguous()
+
+        lora_down.weight.copy_(new_down.to(dtype=dtype))
+        lora_up.weight.copy_(new_up.to(dtype=dtype))
+
+
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
@@ -128,6 +181,7 @@ class LoRAModule(torch.nn.Module):
         split_dims: Optional[List[int]] = None,
         use_rslora: bool = False,
         use_dora: bool = False,
+        init_lora_weights: str = "kaiming",
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -136,6 +190,9 @@ class LoRAModule(torch.nn.Module):
         """
         super().__init__()
         self.lora_name = lora_name
+        init_lora_weights = parse_init_lora_weights_arg(init_lora_weights)
+        self.init_lora_weights = init_lora_weights
+        self.orthogonal_init_fallback_reason = None
 
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
@@ -158,8 +215,12 @@ class LoRAModule(torch.nn.Module):
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-            torch.nn.init.zeros_(self.lora_up.weight)
+            if init_lora_weights == "orthogonal" and org_module.__class__.__name__ != "Conv2d":
+                _init_orthogonal_lora_pair(self.lora_down, self.lora_up, in_dim, out_dim, self.lora_dim)
+            else:
+                if init_lora_weights == "orthogonal":
+                    self.orthogonal_init_fallback_reason = "Conv2d"
+                _init_kaiming_lora_pair(self.lora_down, self.lora_up)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -169,10 +230,11 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-            for lora_down in self.lora_down:
-                torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
-            for lora_up in self.lora_up:
-                torch.nn.init.zeros_(lora_up.weight)
+            for lora_down, lora_up, split_dim in zip(self.lora_down, self.lora_up, split_dims):
+                if init_lora_weights == "orthogonal":
+                    _init_orthogonal_lora_pair(lora_down, lora_up, in_dim, split_dim, self.lora_dim)
+                else:
+                    _init_kaiming_lora_pair(lora_down, lora_up)
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -657,9 +719,15 @@ def create_network(
     # RS-LoRA and DoRA
     use_rslora = parse_bool_arg(kwargs.get("use_rslora", None), default=False)
     use_dora = parse_bool_arg(kwargs.get("use_dora", None), default=False)
+    init_lora_weights = parse_init_lora_weights_arg(kwargs.get("init_lora_weights", None))
 
     # Module class override (for LoKr/LoHa reuse of LoRANetwork)
     module_class = kwargs.pop("module_class", LoRAModule)
+    if init_lora_weights != "kaiming" and not issubclass(module_class, LoRAModule):
+        raise ValueError(
+            f"init_lora_weights={init_lora_weights!r} is only supported by standard LoRA modules, "
+            f"got module_class={module_class.__name__}."
+        )
     module_kwargs = kwargs.pop("module_kwargs", None)
     if isinstance(module_kwargs, str):
         module_kwargs = ast.literal_eval(module_kwargs)
@@ -688,6 +756,7 @@ def create_network(
         verbose=verbose,
         use_rslora=use_rslora,
         use_dora=use_dora,
+        init_lora_weights=init_lora_weights,
         enable_conv2d=enable_conv2d,
     )
 
@@ -729,6 +798,7 @@ class LoRANetwork(torch.nn.Module):
         verbose: Optional[bool] = False,
         use_rslora: bool = False,
         use_dora: bool = False,
+        init_lora_weights: str = "kaiming",
         enable_conv2d: bool = True,
     ) -> None:
         super().__init__()
@@ -745,6 +815,8 @@ class LoRANetwork(torch.nn.Module):
         self.prefix = prefix
         self.module_kwargs = module_kwargs or {}
         self.enable_conv2d = enable_conv2d
+        self.init_lora_weights = parse_init_lora_weights_arg(init_lora_weights)
+        self._persist_init_lora_weights_metadata = issubclass(module_class, LoRAModule) and modules_dim is None
 
         # RS-LoRA and DoRA flags with network-level buffers for auto-detection
         self.use_rslora = use_rslora
@@ -876,6 +948,7 @@ class LoRANetwork(torch.nn.Module):
                                 module_dropout=module_dropout,
                                 use_rslora=self.use_rslora,
                                 use_dora=self.use_dora,
+                                init_lora_weights=self.init_lora_weights,
                                 **self.module_kwargs,
                             )
                             loras.append(lora)
@@ -905,6 +978,17 @@ class LoRANetwork(torch.nn.Module):
 
         if hasattr(self, "_conv2d_skipped_count") and self._conv2d_skipped_count > 0:
             logger.warning(f"Skipped {self._conv2d_skipped_count} Conv2d modules (enable_conv2d=False)")
+
+        self._orthogonal_conv2d_fallback_count = sum(
+            1
+            for lora in self.text_encoder_loras + self.unet_loras
+            if getattr(lora, "orthogonal_init_fallback_reason", None) == "Conv2d"
+        )
+        if self._orthogonal_conv2d_fallback_count > 0:
+            logger.warning(
+                "Orthogonal init requested, but "
+                f"{self._orthogonal_conv2d_fallback_count} Conv2d LoRA modules fell back to kaiming init."
+            )
 
         logger.info(f"create LoRA for U-Net/DiT: {len(self.unet_loras)} modules.")
         if verbose:
@@ -1207,6 +1291,8 @@ class LoRANetwork(torch.nn.Module):
             # Precalculate model hashes to save time on indexing
             if metadata is None:
                 metadata = {}
+            if self._persist_init_lora_weights_metadata:
+                metadata.setdefault("ss_init_lora_weights", self.init_lora_weights)
             model_hash, legacy_hash = model_utils.precalculate_safetensors_hashes(state_dict, metadata)
             metadata["sshs_model_hash"] = model_hash
             metadata["sshs_legacy_hash"] = legacy_hash

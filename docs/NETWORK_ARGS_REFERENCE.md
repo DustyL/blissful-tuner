@@ -30,14 +30,15 @@ network_args = ["use_rslora=True", "use_dora=True", "loraplus_lr_ratio=8"]
 
 1. [RS-LoRA](#rs-lora-use_rslora)
 2. [DoRA](#dora-use_dora)
-3. [LoRA+](#lora-loraplus_lr_ratio)
-4. [Dropout Options](#dropout-options)
-5. [Conv-Specific Settings](#conv-specific-settings)
-6. [Module Selection Patterns](#module-selection-patterns)
-7. [Architecture-Specific Options](#architecture-specific-options)
-8. [Utility Options](#utility-options)
-9. [Quick Reference Table](#quick-reference-table)
-10. [Known-Good Combinations](#known-good-combinations)
+3. [LoRA Init](#lora-init-init_lora_weights)
+4. [LoRA+](#lora-loraplus_lr_ratio)
+5. [Dropout Options](#dropout-options)
+6. [Conv-Specific Settings](#conv-specific-settings)
+7. [Module Selection Patterns](#module-selection-patterns)
+8. [Architecture-Specific Options](#architecture-specific-options)
+9. [Utility Options](#utility-options)
+10. [Quick Reference Table](#quick-reference-table)
+11. [Known-Good Combinations](#known-good-combinations)
 
 ---
 
@@ -139,6 +140,41 @@ DoRA enabled on 45 modules, disabled on: 12 non-Linear, 3 dropout
 
 ```toml
 network_args = ["use_dora=True"]
+```
+
+---
+
+## LoRA Init (`init_lora_weights`)
+
+**Option:** `init_lora_weights=kaiming|orthogonal|true` (default: `kaiming`)
+
+### What it does
+
+Selects the initialization scheme for standard LoRA `lora_down` / `lora_up` weights:
+
+| Value | Behavior |
+|-------|----------|
+| `kaiming` | Current default: `lora_down` uses Kaiming uniform, `lora_up` starts at zero |
+| `true` | Alias for `kaiming`, matching PEFT's default-style config spelling |
+| `orthogonal` | QR-based PEFT orthogonal init: both matrices start nonzero while `lora_up @ lora_down == 0` |
+
+`orthogonal` is recommended mainly for higher ranks (`network_dim >= 16`). It is valid at any even rank, but odd ranks raise because the algorithm splits an orthogonal matrix into even/odd row groups.
+
+### Technical notes / gotchas
+
+| Topic | Detail |
+|-------|--------|
+| **Default compatibility** | Omitted `init_lora_weights` keeps the historical Kaiming+zero behavior. |
+| **Even rank required** | `orthogonal` requires even `network_dim` for Linear targets. Use an even rank or `init_lora_weights=kaiming`. |
+| **Conv2d targets** | Conv2d LoRA modules fall back to Kaiming init with a counted warning. |
+| **split_dims** | QKV split modules apply orthogonal init independently per split. |
+| **Saved weights** | Safetensors metadata records `ss_init_lora_weights=<scheme>`. No tensor flag is needed because init does not change load-time merge math. |
+| **Scope** | `orthogonal` is standard-LoRA-only. It is not applied to LoHa/LoKr/LyCORIS modules. |
+
+### Example
+
+```toml
+network_args = ["init_lora_weights=orthogonal"]
 ```
 
 ---
@@ -337,6 +373,7 @@ network_args = ["verbose=True"]
 |--------|------|---------|-------------|
 | `use_rslora` | bool | `False` | RS-LoRA scaling (`alpha/sqrt(r)`) |
 | `use_dora` | bool | `False` | DoRA magnitude decomposition (Linear only) |
+| `init_lora_weights` | str | `kaiming` | LoRA init scheme: `kaiming`, `orthogonal`, or `true` alias |
 | `loraplus_lr_ratio` | float | None | LoRA-B learning rate multiplier |
 | `rank_dropout` | float | None | Dropout on rank dimension (disables DoRA) |
 | `module_dropout` | float | None | Dropout on entire module (DoRA OK) |
@@ -374,6 +411,12 @@ Best for: Maximum expressiveness with stable scaling.
 network_args = ["use_rslora=True", "loraplus_lr_ratio=8"]
 ```
 Best for: Faster convergence with stable high-rank training.
+
+### Orthogonal init + RS-LoRA
+```toml
+network_args = ["init_lora_weights=orthogonal", "use_rslora=True"]
+```
+Best for: Higher-rank standard LoRA training where you want nonzero initial LoRA-A and LoRA-B while preserving zero initial delta.
 
 ### Full combo (RS-LoRA + DoRA + LoRA+)
 ```toml
@@ -413,10 +456,15 @@ Best for: Training only double blocks (or vice versa).
 | `DoRA flag mismatch: weights contain DoRA but network doesn't expect it` (warning) | Ignoring DoRA magnitudes | Add `use_dora=True` if you want DoRA behavior |
 | `DoRA magnitude appears uninitialized` (warning) | Called `get_weight()` before loading weights | Ensure `load_state_dict()` is called first |
 | `DoRA disabled for X modules` (info) | Conv layers, dropout, or split_dims | Expected behavior; those modules use standard LoRA |
+| `Orthogonal LoRA init requires even rank` | `init_lora_weights=orthogonal` with an odd Linear rank | Use an even `network_dim` or set `init_lora_weights=kaiming` |
+| `Conv2d LoRA modules fell back to kaiming init` | Conv2d targets cannot use the Linear-only orthogonal algorithm | Expected behavior; Linear targets still use orthogonal init |
 
 ---
 
 ## Changelog
+
+### 2026-05-03
+- Added orthogonal LoRA init (`init_lora_weights=orthogonal`) with `true` alias compatibility and metadata persistence.
 
 ### 2026-01-16
 - Added RS-LoRA (`use_rslora`) with flag mismatch handling and suspicious alpha hints
