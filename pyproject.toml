@@ -91,6 +91,7 @@ conflicts = [
 dev = [
   "ascii-magic>=2.3.0",
   "matplotlib>=3.10.0",
+  "pytest",
   "tensorboard",
   "ruff",
 ]
