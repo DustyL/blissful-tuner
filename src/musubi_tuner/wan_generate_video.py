@@ -273,8 +273,6 @@ def parse_args() -> argparse.Namespace:
         args.output_type == "images" or args.output_type == "video"
     ), "latent_path is only supported for images or video output"
 
-    validate_lycoris_arg(args)
-
     # Phase 1 hotswap rejections (see docs/plans/2026-05-02-peft-tier1-hotswap.md):
     # --prepare_for_hotswap is incompatible with --prefer_lycoris (LyCORIS uses its
     # own merge bridge) and with --fp8_scaled (FP8 registers per-layer scale_weight
@@ -297,6 +295,8 @@ def parse_args() -> argparse.Namespace:
                 "--prepare_for_hotswap is incompatible with --save_merged_model. "
                 "Hotswap is for live inference sweeps; saving the merged model is a one-shot operation."
             )
+
+    validate_lycoris_arg(args)
 
     return args
 

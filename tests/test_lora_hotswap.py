@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -479,6 +481,13 @@ class TestParserHotswap(unittest.TestCase):
         setup_parser_hotswap(p)
         return p
 
+    def _parse_wan(self, extra_args: list[str]):
+        from musubi_tuner import wan_generate_video
+
+        argv = ["prog", "--save_path", "x", "--prompt", "x", *extra_args]
+        with patch.object(sys, "argv", argv):
+            return wan_generate_video.parse_args()
+
     def test_default_off(self) -> None:
         ns = self._build_parser().parse_args([])
         self.assertFalse(ns.prepare_for_hotswap)
@@ -497,6 +506,38 @@ class TestParserHotswap(unittest.TestCase):
     def test_cache_unmerged_base(self) -> None:
         ns = self._build_parser().parse_args(["--cache_unmerged_base"])
         self.assertTrue(ns.cache_unmerged_base)
+
+    def test_setup_parser_compile_exposes_hotswap_flags(self) -> None:
+        from musubi_tuner.hv_generate_video import setup_parser_compile
+
+        p = argparse.ArgumentParser()
+        setup_parser_compile(p)
+
+        ns = p.parse_args(["--compile", "--prepare_for_hotswap", "--cache_unmerged_base", "--no-hotswap_strict_base_hash"])
+
+        self.assertTrue(ns.compile)
+        self.assertTrue(ns.prepare_for_hotswap)
+        self.assertTrue(ns.cache_unmerged_base)
+        self.assertFalse(ns.hotswap_strict_base_hash)
+
+    def test_wan_parse_accepts_hotswap_flags(self) -> None:
+        args = self._parse_wan(["--prepare_for_hotswap", "--cache_unmerged_base", "--no-hotswap_strict_base_hash"])
+
+        self.assertTrue(args.prepare_for_hotswap)
+        self.assertTrue(args.cache_unmerged_base)
+        self.assertFalse(args.hotswap_strict_base_hash)
+
+    def test_wan_parse_rejects_prefer_lycoris_hotswap(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prepare_for_hotswap.*prefer_lycoris"):
+            self._parse_wan(["--prepare_for_hotswap", "--prefer_lycoris"])
+
+    def test_wan_parse_rejects_fp8_scaled_hotswap(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prepare_for_hotswap.*fp8_scaled"):
+            self._parse_wan(["--prepare_for_hotswap", "--fp8_scaled"])
+
+    def test_wan_parse_rejects_save_merged_model_hotswap(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prepare_for_hotswap.*save_merged_model"):
+            self._parse_wan(["--prepare_for_hotswap", "--save_merged_model", "merged.safetensors"])
 
 
 if __name__ == "__main__":
