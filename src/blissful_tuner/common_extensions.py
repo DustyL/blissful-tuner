@@ -26,6 +26,12 @@ from blissful_tuner.blissful_logger import BlissfulLogger
 logger = BlissfulLogger(__name__, "#8e00ed")
 
 
+def _get_lora_multiplier(multipliers: Optional[list[float]], index: int) -> float:
+    if multipliers is not None and len(multipliers) > index:
+        return multipliers[index]
+    return 1.0
+
+
 def prepare_metadata(args: argparse.Namespace, seed_override: Optional[Any] = None) -> dict:
     seed = args.seed if seed_override is None else seed_override
     attr_list = [
@@ -84,15 +90,19 @@ def prepare_metadata(args: argparse.Namespace, seed_override: Optional[Any] = No
             if value is not None:  # No point in passing through Nonetypes
                 metadata[f"bt_{attr}"] = value
 
-    if args.lora_weight:
-        for i, lora_weight in enumerate(args.lora_weight):  # Type list even if only 1
+    lora_weights = getattr(args, "lora_weight", None)
+    if lora_weights:
+        for i, lora_weight in enumerate(lora_weights):  # Type list even if only 1
             lora_weight = os.path.basename(lora_weight)  # Weed out the path for privacy etc and just use the LoRA's name
-            metadata[f"bt_lora_{i}"] = f"{lora_weight}: {args.lora_multiplier[i]}"
+            multiplier = _get_lora_multiplier(getattr(args, "lora_multiplier", None), i)
+            metadata[f"bt_lora_{i}"] = f"{lora_weight}: {multiplier}"
 
-    if hasattr(args, "lora_weight_high_noise") and args.lora_weight_high_noise:  # Same same... but different.
-        for i, lora_weight_high_noise in enumerate(args.lora_weight_high_noise):
+    lora_weights_high_noise = getattr(args, "lora_weight_high_noise", None)
+    if lora_weights_high_noise:  # Same same... but different.
+        for i, lora_weight_high_noise in enumerate(lora_weights_high_noise):
             lora_weight_high_noise = os.path.basename(lora_weight_high_noise)
-            metadata[f"bt_lora_high_{i}"] = f"{lora_weight_high_noise}: {args.lora_multiplier_high_noise[i]}"
+            multiplier = _get_lora_multiplier(getattr(args, "lora_multiplier_high_noise", None), i)
+            metadata[f"bt_lora_high_{i}"] = f"{lora_weight_high_noise}: {multiplier}"
     return metadata
 
 
