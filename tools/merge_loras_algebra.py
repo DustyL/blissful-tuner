@@ -32,6 +32,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type
+from musubi_tuner.utils.safetensors_utils import get_split_weight_filenames
 
 
 METHODS = ("linear", "ties", "dare_linear", "dare_ties")
@@ -40,6 +41,20 @@ SPECTRUM_RANKS = (8, 16, 32, 64, 128)
 MATCH_SEMANTICS = "materialized_delta_v1"
 RECOMPRESSION_SEMANTICS = "svd_v1"
 
+
+# fp8 dtypes used by quantized base checkpoints. Detected via getattr so this stays
+# robust if a future torch version drops one of the variants. Used by _assert_no_fp8_in_base
+# to refuse fold-mode operations that would require de-quantize → add → re-quantize cycles.
+_FP8_DTYPES: frozenset[torch.dtype] = frozenset(
+    dt
+    for dt in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dt is not None
+)
 
 @dataclass(frozen=True)
 class InputSpec:
@@ -74,7 +89,11 @@ class MergeConfig:
     output: str | None
     output_rank: int | None
     output_alpha: float | None
-    output_dtype: torch.dtype
+    # output_dtype is None only when output_dtype_name == "base" (fold-mode sentinel).
+    # LoRA-output mode always carries a concrete torch.dtype here.
+    output_dtype: torch.dtype | None
+    # One of {"fp32", "bf16", "fp16", "base"}. "base" is an internal sentinel for fold mode
+    # only — preserves each base tensor's original dtype. It is NOT an argparse choice.
     output_dtype_name: str
     density: float | None
     drop_prob: float | None
@@ -83,7 +102,9 @@ class MergeConfig:
     preview_per_module: bool
     prune_threshold: float
     output_use_rslora: bool
-
+    # When set, switches from LoRA-output to fold-into-checkpoint mode. Mutually exclusive
+    # with --output_rank / --output_alpha / --output_use_rslora and preview flags.
+    fold_into: str | None
 
 @dataclass
 class MergeResult:
@@ -134,7 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="SVD recompression rank. Required when --output is set.",
     )
     parser.add_argument("--output_alpha", type=float, default=None, help="Output alpha. Defaults to --output_rank.")
-    parser.add_argument("--output_dtype", type=str, default="fp32", choices=tuple(OUTPUT_DTYPES))
+    parser.add_argument(
+        "--output_dtype",
+        type=str,
+        default=None,
+        choices=tuple(OUTPUT_DTYPES),
+        help=(
+            "Output dtype. LoRA-output mode default: fp32. Fold mode (--fold_into) default: "
+            "preserve per-tensor base dtype. Pass an explicit value to override either default."
+        ),
+    )
     parser.add_argument("--density", type=float, default=None, help="TIES trim density [0, 1]. Required for ties / dare_ties.")
     parser.add_argument("--drop_prob", type=float, default=None, help="DARE drop probability [0, 1). Required for dare_*.")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed. Required for dare_*.")
@@ -157,6 +187,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fold_into",
+        type=str,
+        default=None,
+        help=(
+            "Path to a base model safetensors checkpoint. Switches output mode from "
+            "LoRA-adapter to full-checkpoint: the merged adapter delta is folded into the "
+            "matching base tensors (full-rank, no SVD recompression) and written to --output. "
+            "Mutually exclusive with --output_rank, --output_alpha, --output_use_rslora, and "
+            "preview flags. Splits supported via the same shard-pattern rules as model loading."
+        ),
+    )
+    parser.add_argument(
         "--preview_spectrum",
         action="store_true",
         help="Print aggregate singular-value energy at common ranks; do not write output.",
@@ -168,18 +210,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> MergeConfig:
-    if not args.output and not args.preview_spectrum:
-        raise ValueError("--output is required unless --preview_spectrum is set.")
-    if args.output and args.preview_spectrum:
-        raise ValueError("--preview_spectrum is a dry-run mode; omit --output when previewing.")
-    if args.output and args.output_rank is None:
-        raise ValueError("--output_rank is required when --output is set.")
+    fold_mode = bool(args.fold_into)
+
+    # ----- Mode-specific output validation (must run before generic rules
+    # so fold-mode rejections produce the more informative message) -----
+    if fold_mode:
+        if not args.output:
+            raise ValueError("--fold_into requires --output (path for the folded checkpoint).")
+        if args.output_rank is not None:
+            raise ValueError(
+                "--output_rank is not used with --fold_into; the folded checkpoint "
+                "replaces base tensors in place at full rank (no SVD recompression)."
+            )
+        if args.output_alpha is not None:
+            raise ValueError(
+                "--output_alpha is not used with --fold_into; the folded checkpoint "
+                "replaces base tensors in place at full rank (no SVD recompression)."
+            )
+        if args.output_use_rslora:
+            raise ValueError(
+                "--output_use_rslora is not used with --fold_into; rsLoRA scaling is a "
+                "LoRA-output convention with no meaning for a folded checkpoint."
+            )
+        if args.preview_spectrum:
+            raise ValueError(
+                "--preview_spectrum is not used with --fold_into; SVD-energy previews "
+                "report rank-selection statistics for LoRA recompression, which fold mode skips."
+            )
+        if args.preview_per_module:
+            raise ValueError("--preview_per_module is not used with --fold_into.")
+    else:
+        if not args.output and not args.preview_spectrum:
+            raise ValueError("--output is required unless --preview_spectrum is set.")
+        if args.output and args.preview_spectrum:
+            raise ValueError("--preview_spectrum is a dry-run mode; omit --output when previewing.")
+        if args.output and args.output_rank is None:
+            raise ValueError("--output_rank is required when --output is set.")
+        if args.output_use_rslora and not args.output:
+            raise ValueError("--output_use_rslora requires --output (no meaning in preview mode).")
+
+    # ----- Generic numeric / dependency checks (apply to both modes;
+    # in fold mode the relevant flags are already rejected above) -----
     if args.output_rank is not None and args.output_rank <= 0:
         raise ValueError("--output_rank must be a positive integer.")
     if args.output_alpha is not None and args.output_alpha <= 0:
@@ -187,6 +263,7 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
     if args.preview_per_module and not args.preview_spectrum:
         raise ValueError("--preview_per_module requires --preview_spectrum.")
 
+    # ----- Method / DARE / TIES validation (unchanged) -----
     if args.method in {"ties", "dare_ties"} and args.density is None:
         raise ValueError(f"--density is required for --method {args.method}.")
     if args.method == "linear":
@@ -212,9 +289,6 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
     if not math.isfinite(args.prune_threshold) or args.prune_threshold < 0:
         raise ValueError("--prune_threshold must be non-negative and finite.")
 
-    if args.output_use_rslora and not args.output:
-        raise ValueError("--output_use_rslora requires --output (no meaning in preview mode).")
-
     inputs: list[InputSpec] = []
     for path, raw_weight in args.input:
         weight = float(raw_weight)
@@ -231,14 +305,25 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
     if output_alpha is None and args.output_rank is not None:
         output_alpha = float(args.output_rank)
 
+    # ----- Resolve output dtype with mode-aware defaults -----
+    # LoRA mode: --output_dtype omitted → "fp32" (preserves v1 behavior).
+    # Fold mode: --output_dtype omitted → "base" sentinel (preserve per-tensor base dtype).
+    # Either mode: explicit --output_dtype fp32/bf16/fp16 → that concrete dtype.
+    # "base" is never a user-facing argparse choice (would be accepted-but-ignored in LoRA mode).
+    if args.output_dtype is None:
+        output_dtype_name = "base" if fold_mode else "fp32"
+    else:
+        output_dtype_name = args.output_dtype
+    output_dtype = None if output_dtype_name == "base" else OUTPUT_DTYPES[output_dtype_name]
+
     return MergeConfig(
         method=args.method,
         inputs=inputs,
         output=args.output,
         output_rank=args.output_rank,
         output_alpha=output_alpha,
-        output_dtype=OUTPUT_DTYPES[args.output_dtype],
-        output_dtype_name=args.output_dtype,
+        output_dtype=output_dtype,
+        output_dtype_name=output_dtype_name,
         density=args.density,
         drop_prob=args.drop_prob,
         seed=args.seed,
@@ -246,8 +331,8 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
         preview_per_module=args.preview_per_module,
         prune_threshold=args.prune_threshold,
         output_use_rslora=args.output_use_rslora,
+        fold_into=args.fold_into,
     )
-
 
 def _file_sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -256,6 +341,99 @@ def _file_sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
+# --- Base-loading helpers for --fold_into mode (Tier 2 #5 v1.5 #3 step 3) ---
+
+def _expand_fold_base_paths(path: str) -> list[str]:
+    """Expand a base path into the concrete shard list (single file → ``[path]``).
+
+    Wraps :func:`get_split_weight_filenames` to add fold-mode error context. The wrapped
+    helper is shard-name agnostic — passing any shard of a split set (``...-00002-of-00004``)
+    rebuilds the canonical 1..N sequence from the prefix and shard count. Missing shards
+    raise :class:`FileNotFoundError` with a fold-specific hint.
+    """
+    try:
+        split_paths = get_split_weight_filenames(path)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"--fold_into base shard missing: {e}. Pass any shard of the split set; "
+            "the helper expands to all shards by index from the prefix."
+        ) from e
+    return [path] if split_paths is None else split_paths
+
+
+
+def _load_base_as_stored(path: str) -> dict[str, torch.Tensor]:
+    """Load a base safetensors checkpoint preserving on-disk dtypes.
+
+    Returns a single merged state_dict on CPU. Tensors retain their stored dtype — no
+    fp32 promotion. The fold writer is responsible for dtype handling per the
+    ``output_dtype_name`` sentinel: ``"base"`` preserves per-tensor dtype, otherwise
+    floating-point tensors are cast to the chosen concrete dtype.
+
+    Hard-rejects malformed split bases where two shards declare the same tensor key
+    (``dict.update`` would silently overwrite the earlier shard's tensor, losing the
+    evidence before any downstream fold-plan check could see it).
+    """
+    state_dict: dict[str, torch.Tensor] = {}
+    for shard in _expand_fold_base_paths(path):
+        shard_sd = load_file(shard, device="cpu")
+        overlap = set(state_dict).intersection(shard_sd)
+        if overlap:
+            sample = ", ".join(sorted(overlap)[:3])
+            more = f" (+{len(overlap) - 3} more)" if len(overlap) > 3 else ""
+            raise ValueError(
+                f"--fold_into base has duplicate tensor keys across shards: {sample}{more}. "
+                "Refusing to silently overwrite split checkpoint tensors. A well-formed split "
+                "base must have disjoint key sets across shards."
+            )
+        state_dict.update(shard_sd)
+    return state_dict
+
+
+
+def _composite_base_hash(path: str) -> str:
+    """Composite SHA-256 over base safetensors file bytes (single file or shards).
+
+    For single-file bases this returns ``_file_sha256(path)`` directly so users can
+    cross-check against ``sha256sum``. For multi-shard bases, returns
+
+        sha256(hex_sha256(shard_1) || hex_sha256(shard_2) || ...)
+
+    where ``hex_sha256(s)`` is the lowercase ASCII hex digest of shard ``s``'s file
+    bytes and ``||`` is byte concatenation, in canonical numeric shard order. File-bytes
+    semantics (not loaded tensors) means dtype/layout differences in deserialization do
+    not change the provenance string. Using ASCII hex (not raw digest bytes) keeps the
+    protocol trivially reproducible from a shell snippet.
+    """
+    shards = _expand_fold_base_paths(path)
+    if len(shards) == 1:
+        return _file_sha256(shards[0])
+    h = hashlib.sha256()
+    for shard in shards:
+        h.update(_file_sha256(shard).encode("ascii"))
+    return h.hexdigest()
+
+
+
+def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> None:
+    """Refuse fold-mode operations on fp8 base checkpoints.
+
+    fp8 fold would require de-quantize → add delta → re-quantize, including calibration
+    of new scale factors. That is out of scope for the merge CLI. The actionable
+    resolution is to fold into the unquantized base, then re-quantize downstream.
+    """
+    fp8_keys = [k for k, t in base_sd.items() if t.dtype in _FP8_DTYPES]
+    if not fp8_keys:
+        return
+    sample = ", ".join(f"{k} ({base_sd[k].dtype})" for k in fp8_keys[:3])
+    more = f" (+{len(fp8_keys) - 3} more)" if len(fp8_keys) > 3 else ""
+    raise ValueError(
+        f"--fold_into base {os.path.basename(base_path)!r} contains fp8 tensors which fold "
+        f"mode does not support: {sample}{more}. fp8 fold would require de-quantize → add → "
+        "re-quantize with scale recalibration, which is out of the merge CLI's scope. Fold "
+        "into the unquantized base, then re-quantize downstream."
+    )
 
 def _git_version() -> str:
     try:
@@ -826,6 +1004,9 @@ def print_spectrum_preview(config: MergeConfig, result: MergeResult) -> None:
 
 
 def run(config: MergeConfig) -> MergeResult:
+    if config.fold_into is not None:
+        # Parser/config/validation surface for --fold_into is present; fold execution lands later.
+        raise NotImplementedError("--fold_into execution is not yet implemented")
     result = merge_adapters(config)
     if config.preview_spectrum:
         print_spectrum_preview(config, result)
@@ -845,7 +1026,6 @@ def run(config: MergeConfig) -> MergeResult:
         f"({result.modules_written}/{result.modules_processed} modules written, dtype={config.output_dtype_name})."
     )
     return result
-
 
 def main(argv: list[str] | None = None) -> None:
     try:

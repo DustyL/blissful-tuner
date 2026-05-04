@@ -1320,5 +1320,330 @@ class TestOutputDtypeAndMaterializationShape(unittest.TestCase):
         self.assertEqual(seen, ["lora_unet_a", "lora_unet_b", "lora_unet_c"])
 
 
+class TestFoldIntoValidation(unittest.TestCase):
+    """Pins the --fold_into parser/config/validation surface from Tier 2 #5 v1.5 #3 step 2.
+
+    Step 2 installs the CLI contract (flag, MergeConfig field, sentinel dtype, validation
+    reordering, fold-mode rejections, run() guard) without any base-loading or fold execution.
+    These tests freeze that contract before step 3 expands the diff with base-loading helpers.
+    """
+
+    def test_fold_requires_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"--fold_into requires --output"):
+            _config(
+                "--method",
+                "linear",
+                "--input",
+                "a.safetensors",
+                "1.0",
+                "--fold_into",
+                "base.safetensors",
+            )
+
+    def test_fold_rejects_lora_only_flags(self) -> None:
+        # Each rejection must name both the conflicting flag and --fold_into so the user
+        # learns what to remove and why. Lock that invariant via subTest per flag.
+        cases = (
+            (("--output_rank", "32"), r"--output_rank.*--fold_into"),
+            (("--output_alpha", "16"), r"--output_alpha.*--fold_into"),
+            (("--output_use_rslora",), r"--output_use_rslora.*--fold_into"),
+            (("--preview_spectrum",), r"--preview_spectrum.*--fold_into"),
+            (("--preview_per_module",), r"--preview_per_module.*--fold_into"),
+        )
+        base_argv = (
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--fold_into",
+            "base.safetensors",
+            "--output",
+            "folded.safetensors",
+        )
+        for extra, pattern in cases:
+            with self.subTest(extra=extra):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    _config(*base_argv, *extra)
+
+    def test_fold_valid_surface_does_not_require_output_rank(self) -> None:
+        # Pins the validation reordering: in fold mode, the LoRA-mode rule
+        # "--output_rank is required when --output is set" must NOT fire.
+        config = _config(
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--fold_into",
+            "base.safetensors",
+            "--output",
+            "folded.safetensors",
+        )
+        self.assertEqual(config.fold_into, "base.safetensors")
+        self.assertEqual(config.output, "folded.safetensors")
+        self.assertIsNone(config.output_rank)
+        self.assertIsNone(config.output_alpha)
+
+    def test_fold_run_guard_raises_not_implemented(self) -> None:
+        config = _config(
+            "--method", "linear", "--input", "a.safetensors", "1.0",
+            "--fold_into", "base.safetensors", "--output", "folded.safetensors",
+        )
+        with self.assertRaisesRegex(NotImplementedError, r"--fold_into execution is not yet implemented"):
+            mla.run(config)
+
+    def test_output_dtype_defaults_by_mode(self) -> None:
+        # LoRA mode default → "fp32" / torch.float32
+        cfg_lora = _config(
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--output",
+            "out.safetensors",
+            "--output_rank",
+            "8",
+        )
+        self.assertEqual(cfg_lora.output_dtype_name, "fp32")
+        self.assertIs(cfg_lora.output_dtype, torch.float32)
+
+        # Fold mode default → "base" sentinel / None
+        cfg_fold = _config(
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--fold_into",
+            "base.safetensors",
+            "--output",
+            "folded.safetensors",
+        )
+        self.assertEqual(cfg_fold.output_dtype_name, "base")
+        self.assertIsNone(cfg_fold.output_dtype)
+
+        # Fold mode + explicit override → concrete dtype, no sentinel
+        cfg_fold_bf16 = _config(
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--fold_into",
+            "base.safetensors",
+            "--output",
+            "folded.safetensors",
+            "--output_dtype",
+            "bf16",
+        )
+        self.assertEqual(cfg_fold_bf16.output_dtype_name, "bf16")
+        self.assertIs(cfg_fold_bf16.output_dtype, torch.bfloat16)
+
+        # Invariant: output_dtype is None iff output_dtype_name == "base"
+        for cfg in (cfg_lora, cfg_fold, cfg_fold_bf16):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(cfg.output_dtype is None, cfg.output_dtype_name == "base")
+
+    def test_output_dtype_base_is_not_argparse_choice(self) -> None:
+        # "base" is an internal sentinel only — must never appear as a user-facing choice.
+        # If it did, --output_dtype base would be accepted in LoRA mode and become an
+        # accepted-but-ignored trap (the LoRA-output writer always needs a concrete dtype).
+        self.assertNotIn("base", mla.OUTPUT_DTYPES)
+
+        # Defense in depth: argparse should reject --output_dtype base via SystemExit.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                mla.parse_args(
+                    [
+                        "--method",
+                        "linear",
+                        "--input",
+                        "a.safetensors",
+                        "1.0",
+                        "--preview_spectrum",
+                        "--output_dtype",
+                        "base",
+                    ]
+                )
+
+    def test_lora_output_rank_requirement_unchanged(self) -> None:
+        # After the validate_args branch reordering, the LoRA-mode rule
+        # "--output_rank is required when --output is set" must still fire when
+        # --fold_into is absent.
+        with self.assertRaisesRegex(ValueError, r"--output_rank is required when --output is set"):
+            _config(
+                "--method",
+                "linear",
+                "--input",
+                "a.safetensors",
+                "1.0",
+                "--output",
+                "out.safetensors",
+            )
+
+
+def _write_split_shard(tmp: Path, prefix: str, idx: int, count: int, sd: dict[str, torch.Tensor]) -> str:
+    """Write one shard of a split set following the 00001-of-NNNNN naming scheme."""
+    path = tmp / f"{prefix}-{idx:05d}-of-{count:05d}.safetensors"
+    save_file(sd, str(path))
+    return str(path)
+
+
+class TestExpandFoldBasePaths(unittest.TestCase):
+    """Pins shard expansion semantics for --fold_into base paths."""
+
+    def test_single_file_returns_singleton_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            path = _save_sd(tmp, "base.safetensors", {"x": torch.zeros(2)})
+            self.assertEqual(mla._expand_fold_base_paths(path), [path])
+
+    def test_split_first_shard_returns_all_in_canonical_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 3, {"a": torch.zeros(2)})
+            shard_2 = _write_split_shard(tmp, "tiny", 2, 3, {"b": torch.zeros(2)})
+            shard_3 = _write_split_shard(tmp, "tiny", 3, 3, {"c": torch.zeros(2)})
+            self.assertEqual(mla._expand_fold_base_paths(shard_1), [shard_1, shard_2, shard_3])
+
+    def test_split_non_first_shard_still_returns_all_in_canonical_order(self) -> None:
+        # Guardrail: get_split_weight_filenames is shard-name agnostic. Passing any shard
+        # of the split set must rebuild the canonical 1..N sequence from the prefix.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 2, {"a": torch.zeros(2)})
+            shard_2 = _write_split_shard(tmp, "tiny", 2, 2, {"b": torch.zeros(2)})
+            self.assertEqual(mla._expand_fold_base_paths(shard_2), [shard_1, shard_2])
+
+    def test_missing_shard_raises_with_fold_into_hint(self) -> None:
+        # Save only the first shard of an expected 3-shard set. Expansion must raise
+        # FileNotFoundError with --fold_into context, not a bare path-not-found.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 3, {"a": torch.zeros(2)})
+            with self.assertRaisesRegex(FileNotFoundError, r"--fold_into base shard missing"):
+                mla._expand_fold_base_paths(shard_1)
+
+
+class TestLoadBaseAsStored(unittest.TestCase):
+    """Pins dtype-preserving load semantics for --fold_into base checkpoints."""
+
+    def test_single_file_loads_all_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sd = {"a": torch.zeros(2, 3), "b.c": torch.ones(4)}
+            path = _save_sd(tmp, "base.safetensors", sd)
+            loaded = mla._load_base_as_stored(path)
+            self.assertEqual(set(loaded), {"a", "b.c"})
+            self.assertTrue(torch.equal(loaded["a"], sd["a"]))
+            self.assertTrue(torch.equal(loaded["b.c"], sd["b.c"]))
+
+    def test_split_file_merges_keys_from_all_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 2, {"a": torch.zeros(2)})
+            _write_split_shard(tmp, "tiny", 2, 2, {"b": torch.ones(3)})
+            loaded = mla._load_base_as_stored(shard_1)
+            self.assertEqual(set(loaded), {"a", "b"})
+            self.assertTrue(torch.equal(loaded["a"], torch.zeros(2)))
+            self.assertTrue(torch.equal(loaded["b"], torch.ones(3)))
+
+    def test_split_file_duplicate_key_hard_rejects(self) -> None:
+        # Silent-corruption guard: two shards declaring the same key would have the
+        # second overwrite the first via dict.update, losing evidence before any
+        # downstream fold-plan check could see it. Hard-reject at load.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 2, {"shared.weight": torch.zeros(2)})
+            _write_split_shard(tmp, "tiny", 2, 2, {"shared.weight": torch.ones(2)})
+            with self.assertRaisesRegex(ValueError, r"duplicate tensor keys across shards"):
+                mla._load_base_as_stored(shard_1)
+
+    def test_mixed_dtypes_preserved_no_fp32_promotion(self) -> None:
+        # Critical: the fold writer's "base" dtype sentinel only works if the loader
+        # preserves per-tensor dtype. Any silent fp32 promotion here would produce a
+        # 2-4x larger output checkpoint and lie about the source dtypes.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sd = {
+                "fp32_tensor": torch.zeros(2, dtype=torch.float32),
+                "bf16_tensor": torch.zeros(2, dtype=torch.bfloat16),
+                "fp16_tensor": torch.zeros(2, dtype=torch.float16),
+            }
+            path = _save_sd(tmp, "base.safetensors", sd)
+            loaded = mla._load_base_as_stored(path)
+            self.assertIs(loaded["fp32_tensor"].dtype, torch.float32)
+            self.assertIs(loaded["bf16_tensor"].dtype, torch.bfloat16)
+            self.assertIs(loaded["fp16_tensor"].dtype, torch.float16)
+
+
+class TestCompositeBaseHash(unittest.TestCase):
+    """Pins file-bytes hash semantics for --fold_into base provenance."""
+
+    def test_single_file_hash_equals_file_sha256(self) -> None:
+        # Single-file invariant: composite hash matches `sha256sum` so users can verify
+        # the base provenance string against their local file with shell tools.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            path = _save_sd(tmp, "base.safetensors", {"x": torch.arange(8, dtype=torch.float32)})
+            self.assertEqual(mla._composite_base_hash(path), mla._file_sha256(path))
+
+    def test_split_file_hash_is_deterministic_and_independent_of_shard_passed(self) -> None:
+        # The composite hash must depend only on the shard contents (in canonical order),
+        # not on which shard the user happened to pass.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1 = _write_split_shard(tmp, "tiny", 1, 2, {"a": torch.zeros(2)})
+            shard_2 = _write_split_shard(tmp, "tiny", 2, 2, {"b": torch.ones(3)})
+            self.assertEqual(mla._composite_base_hash(shard_1), mla._composite_base_hash(shard_2))
+
+    def test_split_file_hash_changes_when_any_shard_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1_a = _write_split_shard(tmp, "alpha", 1, 2, {"a": torch.zeros(2)})
+            _write_split_shard(tmp, "alpha", 2, 2, {"b": torch.ones(3)})
+            hash_a = mla._composite_base_hash(shard_1_a)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shard_1_b = _write_split_shard(tmp, "beta", 1, 2, {"a": torch.zeros(2)})
+            # Differ only in shard 2 contents.
+            _write_split_shard(tmp, "beta", 2, 2, {"b": torch.full((3,), 2.0)})
+            hash_b = mla._composite_base_hash(shard_1_b)
+
+        self.assertNotEqual(hash_a, hash_b)
+
+
+class TestAssertNoFp8InBase(unittest.TestCase):
+    """Pins fold-mode rejection of fp8-quantized base checkpoints."""
+
+    def test_no_fp8_does_not_raise(self) -> None:
+        sd = {
+            "fc.weight": torch.zeros(4, 4, dtype=torch.float32),
+            "fc.bias": torch.zeros(4, dtype=torch.bfloat16),
+            "norm.weight": torch.ones(4, dtype=torch.float16),
+        }
+        # Must not raise.
+        mla._assert_no_fp8_in_base(sd, "/tmp/base.safetensors")
+
+    def test_fp8_e4m3fn_present_raises_with_fold_into_and_basename(self) -> None:
+        if not hasattr(torch, "float8_e4m3fn"):
+            self.skipTest("torch build lacks float8_e4m3fn")
+        sd = {
+            "fc.weight": torch.zeros(4, 4, dtype=torch.float8_e4m3fn),
+            "fc.bias": torch.zeros(4, dtype=torch.float32),
+        }
+        with self.assertRaisesRegex(ValueError, r"--fold_into base 'base\.safetensors'.*fp8"):
+            mla._assert_no_fp8_in_base(sd, "/tmp/some/dir/base.safetensors")
+
+    def test_fp8_e5m2_present_raises_with_actionable_resolution_text(self) -> None:
+        if not hasattr(torch, "float8_e5m2"):
+            self.skipTest("torch build lacks float8_e5m2")
+        sd = {"fc.weight": torch.zeros(4, 4, dtype=torch.float8_e5m2)}
+        with self.assertRaisesRegex(ValueError, r"re-quantize downstream"):
+            mla._assert_no_fp8_in_base(sd, "/tmp/base.safetensors")
+
 if __name__ == "__main__":
     unittest.main()
