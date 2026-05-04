@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +46,6 @@ SPECTRUM_RANKS = (8, 16, 32, 64, 128)
 MATCH_SEMANTICS = "materialized_delta_v1"
 RECOMPRESSION_SEMANTICS = "svd_v1"
 
-
 # fp8 dtypes used by quantized base checkpoints. Detected via getattr so this stays
 # robust if a future torch version drops one of the variants. Used by _assert_no_fp8_in_base
 # to refuse fold-mode operations that would require de-quantize → add → re-quantize cycles.
@@ -59,6 +59,7 @@ _FP8_DTYPES: frozenset[torch.dtype] = frozenset(
     )
     if dt is not None
 )
+
 
 @dataclass(frozen=True)
 class InputSpec:
@@ -110,6 +111,7 @@ class MergeConfig:
     # with --output_rank / --output_alpha / --output_use_rslora and preview flags.
     fold_into: str | None
 
+
 @dataclass
 class MergeResult:
     state_dict: dict[str, torch.Tensor]
@@ -118,6 +120,7 @@ class MergeResult:
     modules_written: int
     spectrum_energy: dict[int, list[float]]
     per_module_energy: dict[str, dict[int, float]]
+
 
 @dataclass
 class MergedModuleDelta:
@@ -132,6 +135,7 @@ class MergedModuleDelta:
     module_name: str
     merged_delta: torch.Tensor
     was_pruned: bool = False
+
 
 @dataclass(frozen=True)
 class FoldTarget:
@@ -148,6 +152,65 @@ class FoldTarget:
     base_key: str
     base_shape: tuple[int, ...]
     base_dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class FoldStats:
+    """Counts produced by the fold pipeline, fed into fold metadata at write time.
+
+    Decoupled from the pipeline so :func:`build_fold_metadata` can be exercised by
+    unit tests without spinning up the full fold loop. Invariants are enforced in
+    ``__post_init__`` so a fold-loop accounting bug fails at the metadata boundary
+    rather than silently producing nonsensical metadata strings:
+
+    * ``modules_resolved == modules_folded + modules_pruned`` (every resolved module
+      is either folded or pruned; nothing else)
+    * ``base_tensors_modified == modules_folded`` (one base tensor per folded module)
+    * ``base_tensors_modified <= base_tensors_total``
+    """
+
+    modules_resolved: int
+    modules_folded: int
+    modules_pruned: int
+    base_tensors_total: int
+    base_tensors_modified: int
+
+    def __post_init__(self) -> None:
+        if self.modules_resolved != self.modules_folded + self.modules_pruned:
+            raise ValueError(
+                f"FoldStats invariant: modules_resolved ({self.modules_resolved}) must equal "
+                f"modules_folded ({self.modules_folded}) + modules_pruned ({self.modules_pruned})."
+            )
+        if self.base_tensors_modified != self.modules_folded:
+            raise ValueError(
+                f"FoldStats invariant: base_tensors_modified ({self.base_tensors_modified}) must equal "
+                f"modules_folded ({self.modules_folded}); fold mode writes exactly one base tensor per folded module."
+            )
+        if self.base_tensors_modified > self.base_tensors_total:
+            raise ValueError(
+                f"FoldStats invariant: base_tensors_modified ({self.base_tensors_modified}) must not exceed "
+                f"base_tensors_total ({self.base_tensors_total})."
+            )
+
+
+@dataclass(frozen=True)
+class FoldResult:
+    """Return value from :func:`fold_adapters_into_base`. Deliberately omits ``state_dict``.
+
+    Unlike :class:`MergeResult` (LoRA-output mode), fold mode's ``state_dict`` would be the
+    full folded checkpoint — potentially tens of GB. Returning it from ``run()`` would keep
+    the entire checkpoint resident in memory after :func:`save_atomic` has flushed it to
+    disk, just because the caller's frame holds the result reference. This dataclass carries
+    only post-write provenance: where the file went, what's in its metadata, what the fold
+    did, and what base it was applied to. The caller can inspect the written file via
+    ``load_file(result.output_path)`` if needed.
+    """
+
+    output_path: str
+    metadata: dict[str, str]
+    stats: FoldStats
+    base_path: str
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -229,6 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --preview_spectrum, print per-module spectrum rows.",
     )
     return parser
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
@@ -354,6 +418,7 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
         fold_into=args.fold_into,
     )
 
+
 def _file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -363,6 +428,8 @@ def _file_sha256(path: str) -> str:
 
 
 # --- Base-loading helpers for --fold_into mode (Tier 2 #5 v1.5 #3 step 3) ---
+# These read-only I/O helpers prepare a base checkpoint for fold preflight and execution.
+
 
 def _expand_fold_base_paths(path: str) -> list[str]:
     """Expand a base path into the concrete shard list (single file → ``[path]``).
@@ -380,7 +447,6 @@ def _expand_fold_base_paths(path: str) -> list[str]:
             "the helper expands to all shards by index from the prefix."
         ) from e
     return [path] if split_paths is None else split_paths
-
 
 
 def _load_base_as_stored(path: str) -> dict[str, torch.Tensor]:
@@ -411,7 +477,6 @@ def _load_base_as_stored(path: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
-
 def _composite_base_hash(path: str) -> str:
     """Composite SHA-256 over base safetensors file bytes (single file or shards).
 
@@ -435,7 +500,6 @@ def _composite_base_hash(path: str) -> str:
     return h.hexdigest()
 
 
-
 def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> None:
     """Refuse fold-mode operations on fp8 base checkpoints.
 
@@ -455,6 +519,7 @@ def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> 
         "into the unquantized base, then re-quantize downstream."
     )
 
+
 def build_base_lora_index(base_sd: dict[str, torch.Tensor]) -> dict[str, list[str]]:
     """Forward map: LoRA module name → list of base keys whose forward mapping yields it.
 
@@ -473,7 +538,6 @@ def build_base_lora_index(base_sd: dict[str, torch.Tensor]) -> dict[str, list[st
         lora_name = _make_lora_name_from_model_key(key)
         index.setdefault(lora_name, []).append(key)
     return index
-
 
 
 def _delta_shape_from_module_info(info: ModuleInfo) -> tuple[int, ...]:
@@ -499,7 +563,6 @@ def _delta_shape_from_module_info(info: ModuleInfo) -> tuple[int, ...]:
             )
         return (info.up_shape[0], info.down_shape[1], info.down_shape[2], info.down_shape[3])
     raise ValueError(f"{info.name} mixes Linear and Conv2d LoRA tensor shapes, which fold mode cannot resolve.")
-
 
 
 def resolve_fold_plan(
@@ -575,6 +638,7 @@ def resolve_fold_plan(
         )
 
     return plan
+
 
 def _git_version() -> str:
     try:
@@ -965,6 +1029,117 @@ def build_metadata(config: MergeConfig, adapters: list[AdapterInfo]) -> dict[str
     }
 
 
+def build_fold_metadata(
+    config: MergeConfig,
+    adapters: list[AdapterInfo],
+    base_path: str,
+    stats: FoldStats,
+) -> dict[str, str]:
+    """Build metadata for the output of ``--fold_into`` mode.
+
+    Differs from :func:`build_metadata` in three ways:
+
+    * ``ss_merge_output_format == "checkpoint"`` (not ``"lora"``)
+    * Omits LoRA-only keys (``ss_merge_output_rank``, ``ss_merge_output_alpha``,
+      ``ss_merge_output_use_rslora``, ``ss_merge_recompression``) — they have no
+      meaning for a folded checkpoint.
+    * Adds fold-specific provenance: base basename + composite hash, and
+      :class:`FoldStats` counts.
+
+    Privacy: only ``os.path.basename(base_path)`` is recorded — never the absolute
+    path. The composite hash is computed via :func:`_composite_base_hash` so split
+    bases yield a single deterministic provenance string regardless of which shard
+    path the user passed.
+    """
+    return {
+        "ss_merge_tool": "blissful-tuner",
+        "ss_merge_tool_version": _git_version(),
+        "ss_merge_method": config.method,
+        "ss_merge_output_format": "checkpoint",
+        "ss_merge_output_dtype": config.output_dtype_name,
+        "ss_merge_density": "" if config.density is None else str(config.density),
+        "ss_merge_drop_prob": "" if config.drop_prob is None else str(config.drop_prob),
+        "ss_merge_seed": "" if config.seed is None else str(config.seed),
+        "ss_merge_prune_threshold": str(config.prune_threshold),
+        "ss_merge_inputs": _merge_inputs_metadata(adapters),
+        "ss_merge_input_count": str(len(adapters)),
+        "ss_merge_match_semantics": MATCH_SEMANTICS,
+        "ss_merge_rejects_dora": "true",
+        "ss_merge_base_basename": os.path.basename(base_path),
+        "ss_merge_base_sha256": _composite_base_hash(base_path),
+        "ss_merge_modules_resolved": str(stats.modules_resolved),
+        "ss_merge_modules_folded": str(stats.modules_folded),
+        "ss_merge_modules_pruned": str(stats.modules_pruned),
+        "ss_merge_base_tensors_total": str(stats.base_tensors_total),
+        "ss_merge_base_tensors_modified": str(stats.base_tensors_modified),
+    }
+
+
+def _cast_untouched_floating_tensors(
+    base_sd: dict[str, torch.Tensor],
+    modified_keys: set[str],
+    target_dtype: torch.dtype,
+) -> int:
+    """Cast every floating-point base tensor not in ``modified_keys`` to ``target_dtype``.
+
+    Used by :func:`fold_adapters_into_base` when ``--output_dtype`` is explicit (not the
+    "base" sentinel): touched tensors get cast inside the fold loop; untouched floating
+    tensors get cast here. Non-floating tensors (int / bool buffers like ``step_count``)
+    are left at their stored dtype — casting them would either lossy-convert metadata or
+    fail outright.
+
+    Returns the count of tensors actually cast (useful for tests / debug), and re-raises
+    with an actionable message if the cast itself produces non-finite values (e.g. fp32 →
+    fp16 overflow on a tensor wider than fp16's representable range).
+    """
+    tensors_cast = 0
+    for key, tensor in list(base_sd.items()):
+        if key in modified_keys or not tensor.is_floating_point():
+            continue
+        converted = tensor.to(dtype=target_dtype).contiguous()
+        if not torch.isfinite(converted).all():
+            raise ValueError(
+                f"--fold_into produced non-finite values when casting untouched base tensor "
+                f"{key!r} to {target_dtype}. Use a wider --output_dtype or omit it to preserve "
+                "per-tensor base dtype."
+            )
+        base_sd[key] = converted
+        tensors_cast += 1
+    return tensors_cast
+
+
+def save_atomic(state_dict: dict[str, torch.Tensor], output_path: str, metadata: dict[str, str]) -> None:
+    """Crash-safe write: serialize to a sibling temp file, then ``os.replace`` in place.
+
+    The temp file is created in the same directory as ``output_path`` so ``os.replace``
+    is atomic (POSIX guarantees atomic rename within a single filesystem). On any
+    save_file failure the temp file is removed before re-raising, so a failed fold does
+    not leave a half-written file behind.
+
+    Used by --fold_into mode where the output can be 10s of GB and a partial write
+    would be hard to distinguish from a successful one without the atomic boundary.
+    """
+    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=os.path.basename(output_path) + ".tmp.",
+        suffix=".safetensors",
+    )
+    # mkstemp opens the file; close it so safetensors can write to the path itself.
+    os.close(fd)
+    try:
+        save_file(state_dict, tmp_path, metadata=metadata)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        # Best-effort cleanup; never let cleanup mask the original exception.
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _module_union(adapters: list[AdapterInfo]) -> list[str]:
     return sorted({name for adapter in adapters for name in adapter.modules})
 
@@ -1041,6 +1216,7 @@ def iter_merged_module_deltas(
         # next loop step releases it. See test_weakref_probe_confirms_previous_module_deltas_are_released.
         del deltas, delta, merged_delta
 
+
 def merge_adapters(
     config: MergeConfig,
     adapters: list[AdapterInfo] | None = None,
@@ -1096,6 +1272,131 @@ def merge_adapters(
         per_module_energy=per_module_energy,
     )
 
+
+def fold_adapters_into_base(
+    config: MergeConfig,
+    adapters: list[AdapterInfo] | None = None,
+) -> FoldResult:
+    """The actual ``--fold_into`` pipeline. Second consumer of :func:`iter_merged_module_deltas`.
+
+    Order of operations (each step's failure leaves no output file behind):
+
+    1. Cross-adapter shape validation via :func:`_validate_module_shapes_and_output_rank`
+       (runs first because :func:`resolve_fold_plan` uses the first contributing adapter's
+       :class:`ModuleInfo` for delta shape).
+    2. Load base via :func:`_load_base_as_stored` (preserves on-disk dtype; rejects
+       duplicate keys across shards).
+    3. :func:`_assert_no_fp8_in_base`.
+    4. :func:`resolve_fold_plan` — preflight orphan / ambiguity / non-floating /
+       shape-mismatch hard rejects.
+    5. Print ``fold plan: ...`` line (preflight stdout, after resolve, before any
+       tensor-heavy materialization).
+    6. Iterate :func:`iter_merged_module_deltas` with explicit per-iteration
+       ``del`` to keep the "one module at a time" memory promise. Per non-pruned
+       target: copy base to fp32, in-place add merged_delta, finite-check, cast to
+       output dtype per the sentinel, second finite-check, write back.
+    7. If ``output_dtype_name != "base"``: cast untouched floating tensors via
+       :func:`_cast_untouched_floating_tensors`.
+    8. Print ``fold summary: ...`` line.
+    9. :func:`save_atomic` writes the full folded checkpoint atomically.
+    10. Return :class:`FoldResult` (provenance + stats only — no state_dict, see the
+        FoldResult docstring for the memory rationale).
+    """
+    adapters = load_adapters(config.inputs) if adapters is None else adapters
+    _validate_module_shapes_and_output_rank(config, adapters)
+
+    assert config.fold_into is not None
+    assert config.output is not None
+
+    base_sd = _load_base_as_stored(config.fold_into)
+    _assert_no_fp8_in_base(base_sd, config.fold_into)
+
+    plan = resolve_fold_plan(adapters, base_sd)
+    base_tensors_total = len(base_sd)
+    print(f"fold plan: {len(plan)} modules resolved to {len(plan)} base tensors", flush=True)
+
+    modules_folded = 0
+    modules_pruned = 0
+    modified_keys: set[str] = set()
+
+    for item in iter_merged_module_deltas(config, adapters):
+        # Initialize per-iteration locals to None so the unconditional `del` in finally
+        # works whether or not the non-pruned path assigned them. This is the per-iteration
+        # version of FoldResult's "no retained state_dict" — we drop the fp32 working
+        # tensors at the iteration boundary, not at the end of the function.
+        base_tensor: torch.Tensor | None = None
+        folded: torch.Tensor | None = None
+        converted: torch.Tensor | None = None
+        try:
+            if item.was_pruned:
+                modules_pruned += 1
+                continue
+
+            target = plan[item.module_name]
+            base_tensor = base_sd[target.base_key]
+            # Copy-then-in-place-add: one fp32 alloc instead of three (avoids the
+            # extra temporary that `base.float() + delta.float()` produces). Original
+            # base_tensor stays alive until the finite check passes.
+            folded = base_tensor.to(dtype=torch.float32, copy=True)
+            folded.add_(item.merged_delta)
+
+            if not torch.isfinite(folded).all():
+                raise ValueError(
+                    f"--fold_into produced non-finite folded tensor for module {item.module_name!r} "
+                    "(base + merged_delta overflows in float32). Check input LoRA weights and --prune_threshold."
+                )
+
+            if config.output_dtype_name == "base":
+                out_dtype = target.base_dtype
+            else:
+                assert config.output_dtype is not None
+                out_dtype = config.output_dtype
+
+            converted = folded.to(out_dtype).contiguous()
+            if not torch.isfinite(converted).all():
+                raise ValueError(
+                    f"--fold_into produced non-finite folded tensor after cast to {out_dtype} for module "
+                    f"{item.module_name!r}. Use a wider --output_dtype or omit it to preserve base dtype."
+                )
+
+            base_sd[target.base_key] = converted
+            modified_keys.add(target.base_key)
+            modules_folded += 1
+        finally:
+            del item, base_tensor, folded, converted
+
+    if config.output_dtype_name != "base":
+        assert config.output_dtype is not None
+        _cast_untouched_floating_tensors(base_sd, modified_keys, config.output_dtype)
+
+    # "not delta-modified" rather than "unchanged" because in explicit --output_dtype
+    # mode, untouched floating tensors may be dtype-cast even though the values are
+    # arithmetically the same. Metadata records ss_merge_output_dtype so the user can
+    # tell which mode was active.
+    print(
+        f"fold summary: {modules_folded} modules folded; {modules_pruned} modules pruned; "
+        f"{base_tensors_total - modules_folded} base tensors not delta-modified",
+        flush=True,
+    )
+
+    stats = FoldStats(
+        modules_resolved=len(plan),
+        modules_folded=modules_folded,
+        modules_pruned=modules_pruned,
+        base_tensors_total=base_tensors_total,
+        base_tensors_modified=modules_folded,
+    )
+    metadata = build_fold_metadata(config, adapters, config.fold_into, stats)
+    save_atomic(base_sd, config.output, metadata)
+
+    return FoldResult(
+        output_path=config.output,
+        metadata=metadata,
+        stats=stats,
+        base_path=config.fold_into,
+    )
+
+
 def _format_percent(value: float) -> str:
     return f"{100.0 * value:5.1f}%"
 
@@ -1144,10 +1445,9 @@ def print_spectrum_preview(config: MergeConfig, result: MergeResult) -> None:
     print("Run again with --output_rank N --output PATH to write a LoRA at the chosen rank.")
 
 
-def run(config: MergeConfig) -> MergeResult:
+def run(config: MergeConfig) -> MergeResult | FoldResult:
     if config.fold_into is not None:
-        # Parser/config/validation surface for --fold_into is present; fold execution lands later.
-        raise NotImplementedError("--fold_into execution is not yet implemented")
+        return fold_adapters_into_base(config)
     result = merge_adapters(config)
     if config.preview_spectrum:
         print_spectrum_preview(config, result)
@@ -1167,6 +1467,7 @@ def run(config: MergeConfig) -> MergeResult:
         f"({result.modules_written}/{result.modules_processed} modules written, dtype={config.output_dtype_name})."
     )
     return result
+
 
 def main(argv: list[str] | None = None) -> None:
     try:

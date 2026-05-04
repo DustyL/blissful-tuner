@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import math
+import os
 import tempfile
 import unittest
 import warnings
@@ -1385,14 +1387,6 @@ class TestFoldIntoValidation(unittest.TestCase):
         self.assertIsNone(config.output_rank)
         self.assertIsNone(config.output_alpha)
 
-    def test_fold_run_guard_raises_not_implemented(self) -> None:
-        config = _config(
-            "--method", "linear", "--input", "a.safetensors", "1.0",
-            "--fold_into", "base.safetensors", "--output", "folded.safetensors",
-        )
-        with self.assertRaisesRegex(NotImplementedError, r"--fold_into execution is not yet implemented"):
-            mla.run(config)
-
     def test_output_dtype_defaults_by_mode(self) -> None:
         # LoRA mode default → "fp32" / torch.float32
         cfg_lora = _config(
@@ -1645,6 +1639,7 @@ class TestAssertNoFp8InBase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"re-quantize downstream"):
             mla._assert_no_fp8_in_base(sd, "/tmp/base.safetensors")
 
+
 class TestBuildBaseLoraIndex(unittest.TestCase):
     """Pins the forward-mapping base-key index used by --fold_into resolution."""
 
@@ -1821,6 +1816,555 @@ class TestResolveFoldPlan(unittest.TestCase):
             base_sd = {"conv.weight": torch.zeros(out_dim, in_dim, 1, 1)}
             plan = mla.resolve_fold_plan([adapter], base_sd)
             self.assertEqual(plan["lora_unet_conv"].base_shape, (2, 3, 1, 1))
+
+
+class TestSaveAtomic(unittest.TestCase):
+    """Pins crash-safe write semantics for fold-mode output."""
+
+    def test_save_atomic_writes_temp_then_replace(self) -> None:
+        # Happy-path + ordering evidence in one test:
+        #   * save_file is invoked with a path != output_path (must be the temp file)
+        #   * after save_atomic returns, output_path exists with the right content
+        #   * the temp path no longer exists (it was renamed away by os.replace)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = str(Path(tmpdir) / "out.safetensors")
+            seen_paths: list[str] = []
+            real_save = mla.save_file
+
+            def recording_save(state_dict, path, metadata=None):
+                seen_paths.append(path)
+                real_save(state_dict, path, metadata=metadata)
+
+            with patch.object(mla, "save_file", side_effect=recording_save):
+                mla.save_atomic(
+                    {"x": torch.arange(4, dtype=torch.float32)},
+                    out_path,
+                    {"ss_merge_tool": "test"},
+                )
+
+            self.assertEqual(len(seen_paths), 1)
+            temp_path = seen_paths[0]
+            self.assertNotEqual(temp_path, out_path)
+            self.assertTrue(os.path.exists(out_path))
+            self.assertFalse(os.path.exists(temp_path))
+            loaded = load_file(out_path)
+            self.assertTrue(torch.equal(loaded["x"], torch.arange(4, dtype=torch.float32)))
+            with safe_open(out_path, framework="pt") as f:
+                self.assertEqual(f.metadata().get("ss_merge_tool"), "test")
+
+    def test_save_atomic_temp_file_in_same_directory_as_output(self) -> None:
+        # Atomicity guarantee: os.replace is only atomic across the same filesystem.
+        # The temp file must live in the SAME directory as the destination, not /tmp.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = str(Path(tmpdir) / "subdir_target.safetensors")
+            seen_paths: list[str] = []
+            real_save = mla.save_file
+
+            def recording_save(state_dict, path, metadata=None):
+                seen_paths.append(path)
+                real_save(state_dict, path, metadata=metadata)
+
+            with patch.object(mla, "save_file", side_effect=recording_save):
+                mla.save_atomic({"x": torch.zeros(2)}, out_path, {})
+
+            self.assertEqual(os.path.dirname(seen_paths[0]), os.path.dirname(os.path.abspath(out_path)))
+
+    def test_save_atomic_cleans_temp_on_save_failure(self) -> None:
+        # If save_file raises, the temp file must be removed before the exception
+        # propagates — otherwise a failed fold leaves a half-written file behind that
+        # could be confused with a successful one on a retry.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = str(Path(tmpdir) / "out.safetensors")
+            with patch.object(mla, "save_file", side_effect=RuntimeError("simulated disk full")):
+                with self.assertRaisesRegex(RuntimeError, "simulated disk full"):
+                    mla.save_atomic({"x": torch.zeros(2)}, out_path, {})
+            # Output file was never created and no temp residue remains.
+            self.assertFalse(os.path.exists(out_path))
+            self.assertEqual(list(Path(tmpdir).iterdir()), [])
+
+
+class TestBuildFoldMetadata(unittest.TestCase):
+    """Pins the fold-mode metadata contract: format, provenance, privacy, count serialization."""
+
+    def _setup_fold_config(self, tmp: Path) -> tuple[mla.MergeConfig, list[mla.AdapterInfo], str]:
+        adapter_path = _save_sd(tmp, "adapter.safetensors", _lora_sd())
+        adapter = mla.load_adapter(adapter_path, 1.0)
+        base_path = _save_sd(tmp, "base.safetensors", {"x": torch.zeros(4, dtype=torch.float32)})
+        config = _config(
+            "--method",
+            "linear",
+            "--input",
+            adapter_path,
+            "1.0",
+            "--fold_into",
+            base_path,
+            "--output",
+            str(tmp / "folded.safetensors"),
+        )
+        return config, [adapter], base_path
+
+    def test_fold_metadata_records_checkpoint_format_and_base_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config, adapters, base_path = self._setup_fold_config(tmp)
+            stats = mla.FoldStats(
+                modules_resolved=3, modules_folded=2, modules_pruned=1,
+                base_tensors_total=10, base_tensors_modified=2,
+            )
+            meta = mla.build_fold_metadata(config, adapters, base_path, stats)
+
+            self.assertEqual(meta["ss_merge_output_format"], "checkpoint")
+            self.assertEqual(meta["ss_merge_base_basename"], "base.safetensors")
+            self.assertEqual(meta["ss_merge_base_sha256"], mla._file_sha256(base_path))
+            # Common metadata still present.
+            self.assertEqual(meta["ss_merge_tool"], "blissful-tuner")
+            self.assertEqual(meta["ss_merge_method"], "linear")
+            self.assertEqual(meta["ss_merge_rejects_dora"], "true")
+
+    def test_fold_metadata_does_not_include_absolute_paths(self) -> None:
+        # Privacy: tmpdir absolute path must not leak into any metadata value.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config, adapters, base_path = self._setup_fold_config(tmp)
+            stats = mla.FoldStats(0, 0, 0, 0, 0)
+            meta = mla.build_fold_metadata(config, adapters, base_path, stats)
+            for key, value in meta.items():
+                with self.subTest(key=key):
+                    self.assertNotIn(tmpdir, value, f"absolute path leaked into metadata[{key!r}] = {value!r}")
+
+    def test_fold_metadata_omits_lora_recompression_keys(self) -> None:
+        # LoRA-only metadata keys have no meaning for a folded checkpoint.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config, adapters, base_path = self._setup_fold_config(tmp)
+            stats = mla.FoldStats(0, 0, 0, 0, 0)
+            meta = mla.build_fold_metadata(config, adapters, base_path, stats)
+            for forbidden in (
+                "ss_merge_output_rank",
+                "ss_merge_output_alpha",
+                "ss_merge_output_use_rslora",
+                "ss_merge_recompression",
+            ):
+                with self.subTest(forbidden=forbidden):
+                    self.assertNotIn(forbidden, meta)
+
+    def test_fold_metadata_records_counts_from_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config, adapters, base_path = self._setup_fold_config(tmp)
+            stats = mla.FoldStats(
+                modules_resolved=42, modules_folded=30, modules_pruned=12,
+                base_tensors_total=100, base_tensors_modified=30,
+            )
+            meta = mla.build_fold_metadata(config, adapters, base_path, stats)
+            self.assertEqual(meta["ss_merge_modules_resolved"], "42")
+            self.assertEqual(meta["ss_merge_modules_folded"], "30")
+            self.assertEqual(meta["ss_merge_modules_pruned"], "12")
+            self.assertEqual(meta["ss_merge_base_tensors_total"], "100")
+            self.assertEqual(meta["ss_merge_base_tensors_modified"], "30")
+
+    def test_fold_stats_enforces_invariants_at_construction(self) -> None:
+        # Invariants documented on the dataclass MUST be enforced; otherwise a fold-loop
+        # accounting bug ships nonsensical metadata strings instead of failing loudly.
+        with self.subTest("modules_resolved != modules_folded + modules_pruned"):
+            with self.assertRaisesRegex(ValueError, r"modules_resolved.*must equal"):
+                mla.FoldStats(
+                    modules_resolved=5, modules_folded=2, modules_pruned=2,
+                    base_tensors_total=10, base_tensors_modified=2,
+                )
+        with self.subTest("base_tensors_modified != modules_folded"):
+            with self.assertRaisesRegex(ValueError, r"base_tensors_modified.*must equal"):
+                mla.FoldStats(
+                    modules_resolved=4, modules_folded=2, modules_pruned=2,
+                    base_tensors_total=10, base_tensors_modified=3,
+                )
+        with self.subTest("base_tensors_modified > base_tensors_total"):
+            with self.assertRaisesRegex(ValueError, r"must not exceed"):
+                mla.FoldStats(
+                    modules_resolved=4, modules_folded=4, modules_pruned=0,
+                    base_tensors_total=3, base_tensors_modified=4,
+                )
+
+    def test_fold_stats_accepts_valid_boundary_cases(self) -> None:
+        # All zero (no modules processed at all).
+        mla.FoldStats(0, 0, 0, 0, 0)
+        # All folded, none pruned, modified == total.
+        mla.FoldStats(modules_resolved=5, modules_folded=5, modules_pruned=0,
+                      base_tensors_total=5, base_tensors_modified=5)
+        # All pruned, none folded; modified == 0 < total.
+        mla.FoldStats(modules_resolved=5, modules_folded=0, modules_pruned=5,
+                      base_tensors_total=10, base_tensors_modified=0)
+        # Asymmetric: more total tensors than modules (the realistic case).
+        mla.FoldStats(modules_resolved=42, modules_folded=30, modules_pruned=12,
+                      base_tensors_total=100, base_tensors_modified=30)
+
+    def test_fold_metadata_records_composite_base_hash_for_split_input(self) -> None:
+        # Split base: the recorded hash must be the composite-of-shards, not the
+        # bare file SHA of whichever shard was passed via --fold_into.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter_path = _save_sd(tmp, "adapter.safetensors", _lora_sd())
+            adapter = mla.load_adapter(adapter_path, 1.0)
+            shard_1 = _write_split_shard(tmp, "base", 1, 2, {"a": torch.zeros(2)})
+            _write_split_shard(tmp, "base", 2, 2, {"b": torch.zeros(2)})
+            config = _config(
+                "--method",
+                "linear",
+                "--input",
+                adapter_path,
+                "1.0",
+                "--fold_into",
+                shard_1,
+                "--output",
+                str(tmp / "folded.safetensors"),
+            )
+            stats = mla.FoldStats(0, 0, 0, 0, 0)
+            meta = mla.build_fold_metadata(config, [adapter], shard_1, stats)
+
+            self.assertEqual(meta["ss_merge_base_sha256"], mla._composite_base_hash(shard_1))
+            # Composite hash differs from any single-shard SHA in the multi-shard case.
+            self.assertNotEqual(meta["ss_merge_base_sha256"], mla._file_sha256(shard_1))
+
+
+class TestCastUntouchedFloatingTensors(unittest.TestCase):
+    """Pins the helper that handles untouched floating tensors in explicit --output_dtype mode."""
+
+    def test_casts_untouched_floating_tensors_only(self) -> None:
+        # Three classes of tensor:
+        #   * modified (in modified_keys) → preserved untouched (the fold loop already cast it)
+        #   * untouched + floating → cast to target_dtype
+        #   * untouched + non-floating → preserved untouched (would be lossy or fail)
+        sd = {
+            "modified.weight": torch.zeros(2, dtype=torch.float32),
+            "untouched_floating.weight": torch.ones(2, dtype=torch.float16),
+            "untouched_int.weight": torch.tensor([1, 2], dtype=torch.int32),
+            "untouched_bool": torch.tensor([True, False]),
+        }
+        modified = {"modified.weight"}
+        count = mla._cast_untouched_floating_tensors(sd, modified, torch.bfloat16)
+
+        self.assertIs(sd["modified.weight"].dtype, torch.float32, "modified key should not be re-cast")
+        self.assertIs(sd["untouched_floating.weight"].dtype, torch.bfloat16, "untouched fp should be cast")
+        self.assertIs(sd["untouched_int.weight"].dtype, torch.int32, "untouched int must stay int")
+        self.assertIs(sd["untouched_bool"].dtype, torch.bool, "untouched bool must stay bool")
+        self.assertEqual(count, 1)
+
+    def test_raises_on_non_finite_after_cast(self) -> None:
+        # 1e5 is finite in fp32 but exceeds fp16 max (~65504), so the cast produces inf.
+        # The helper must raise rather than silently writing a non-finite tensor.
+        sd = {"big.weight": torch.full((2,), 1e5, dtype=torch.float32)}
+        with self.assertRaisesRegex(ValueError, r"non-finite values when casting untouched"):
+            mla._cast_untouched_floating_tensors(sd, set(), torch.float16)
+
+
+class TestFoldPipeline(unittest.TestCase):
+    """End-to-end tests for fold_adapters_into_base and run() dispatch.
+
+    Each test runs a real fold operation against synthetic adapters and a synthetic base,
+    then inspects the written checkpoint via load_file. All tests redirect stdout to keep
+    the test runner output clean (the pipeline emits 'fold plan' and 'fold summary' lines).
+    """
+
+    def _run_fold(self, *, lora_sd: dict, base_sd: dict, tmp: Path, extra_args: tuple = ()) -> mla.FoldResult:
+        lora_path = _save_sd(tmp, "lora.safetensors", lora_sd)
+        base_path = _save_sd(tmp, "base.safetensors", base_sd)
+        out_path = str(tmp / "folded.safetensors")
+        config = _config(
+            "--method",
+            "linear",
+            "--input",
+            lora_path,
+            "1.0",
+            "--fold_into",
+            base_path,
+            "--output",
+            out_path,
+            *extra_args,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            return mla.fold_adapters_into_base(config)
+
+    def test_fold_happy_path_applies_delta_and_saves_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_sd = _lora_sd(name="lora_unet_block")
+            expected_delta = _explicit_delta(lora_sd, "lora_unet_block")
+            base_block = torch.full_like(expected_delta, 0.5)
+            other = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+            result = self._run_fold(
+                lora_sd=lora_sd,
+                base_sd={"block.weight": base_block.clone(), "other.weight": other.clone()},
+                tmp=tmp,
+            )
+
+            loaded = load_file(result.output_path)
+            self.assertTrue(torch.allclose(loaded["block.weight"], base_block + expected_delta, atol=1e-5))
+            self.assertTrue(torch.equal(loaded["other.weight"], other))
+            self.assertIsInstance(result, mla.FoldResult)
+            self.assertEqual(result.stats.modules_folded, 1)
+            self.assertEqual(result.stats.modules_pruned, 0)
+            self.assertEqual(result.stats.base_tensors_total, 2)
+            self.assertEqual(result.stats.base_tensors_modified, 1)
+
+    def test_fold_default_dtype_preserves_base_dtype_for_touched_and_untouched(self) -> None:
+        # Sentinel "base" mode (no --output_dtype): each tensor keeps its stored dtype.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            base_sd = {
+                "block.weight": torch.zeros(2, 3, dtype=torch.bfloat16),       # touched
+                "norm.weight": torch.ones(2, dtype=torch.float16),             # untouched, floating
+                "step_count": torch.zeros(1, dtype=torch.int64),               # untouched, non-floating
+            }
+            result = self._run_fold(lora_sd=_lora_sd(name="lora_unet_block"), base_sd=base_sd, tmp=tmp)
+
+            loaded = load_file(result.output_path)
+            self.assertIs(loaded["block.weight"].dtype, torch.bfloat16)
+            self.assertIs(loaded["norm.weight"].dtype, torch.float16)
+            self.assertIs(loaded["step_count"].dtype, torch.int64)
+
+    def test_fold_output_dtype_override_casts_floating_tensors_only(self) -> None:
+        # Explicit --output_dtype fp32: touched + untouched-floating cast; non-floating preserved.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            base_sd = {
+                "block.weight": torch.zeros(2, 3, dtype=torch.bfloat16),
+                "norm.weight": torch.ones(2, dtype=torch.float16),
+                "step_count": torch.zeros(1, dtype=torch.int64),
+            }
+            result = self._run_fold(
+                lora_sd=_lora_sd(name="lora_unet_block"),
+                base_sd=base_sd,
+                tmp=tmp,
+                extra_args=("--output_dtype", "fp32"),
+            )
+
+            loaded = load_file(result.output_path)
+            self.assertIs(loaded["block.weight"].dtype, torch.float32, "touched tensor cast to override dtype")
+            self.assertIs(loaded["norm.weight"].dtype, torch.float32, "untouched floating cast to override dtype")
+            self.assertIs(loaded["step_count"].dtype, torch.int64, "non-floating preserved across cast")
+
+    def test_fold_pruned_module_leaves_base_unchanged(self) -> None:
+        # All-zero up tensor → merged delta is exactly 0 → pruned at default threshold (0.0).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_sd = _lora_sd(name="lora_unet_block", up=torch.zeros(2, 2))
+            original_block = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
+            result = self._run_fold(
+                lora_sd=lora_sd,
+                base_sd={"block.weight": original_block.clone()},
+                tmp=tmp,
+            )
+
+            loaded = load_file(result.output_path)
+            self.assertTrue(torch.equal(loaded["block.weight"], original_block))
+            self.assertEqual(result.stats.modules_folded, 0)
+            self.assertEqual(result.stats.modules_pruned, 1)
+            self.assertEqual(result.stats.base_tensors_modified, 0)
+
+    def test_fold_rejects_non_finite_folded_tensor(self) -> None:
+        # base + delta overflows fp32 (both ~2e38, sum ~4e38 = inf). The first
+        # finite check inside the fold loop must fire; no output file should be written.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # rank=1, in_dim=2, out_dim=2 → delta[i,j] = up[i,0] * down[0,j] * (alpha/rank)
+            # alpha defaults to rank, so scale = 1. With up=2e38, down=1.0 → delta = 2e38.
+            lora_sd = _lora_sd(
+                name="lora_unet_block",
+                rank=1, in_dim=2, out_dim=2,
+                up=torch.full((2, 1), 2e38, dtype=torch.float32),
+                down=torch.full((1, 2), 1.0, dtype=torch.float32),
+            )
+            base_sd = {"block.weight": torch.full((2, 2), 2e38, dtype=torch.float32)}
+            lora_path = _save_sd(tmp, "lora.safetensors", lora_sd)
+            base_path = _save_sd(tmp, "base.safetensors", base_sd)
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, r"non-finite folded tensor for module"):
+                    mla.fold_adapters_into_base(config)
+            # Atomic write contract: failed fold leaves no output file behind.
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_fold_output_dtype_override_rejects_non_finite_after_cast(self) -> None:
+        # Fold result is finite in fp32 (~1e5) but exceeds fp16 max (~65504), so the cast
+        # to fp16 produces inf. The SECOND finite check (post-cast) must fire — distinct
+        # failure mode from the first finite check (which guards fp32 overflow during add).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_sd = _lora_sd(name="lora_unet_block")  # tiny default delta (max ~33)
+            base_sd = {"block.weight": torch.full((2, 3), 1e5, dtype=torch.float32)}
+            lora_path = _save_sd(tmp, "lora.safetensors", lora_sd)
+            base_path = _save_sd(tmp, "base.safetensors", base_sd)
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+                "--output_dtype", "fp16",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, r"non-finite folded tensor after cast to torch\.float16"):
+                    mla.fold_adapters_into_base(config)
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_fold_output_file_contains_full_checkpoint_not_sparse_delta(self) -> None:
+        # Catches a potential "fold mode wrote only modified tensors" regression. The
+        # output is a full checkpoint, NOT a sparse adapter — every base key must be present.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            base_sd = {
+                "block.weight": torch.zeros(2, 3),         # touched
+                "untouched_a.weight": torch.ones(4),       # untouched, weight-suffixed
+                "untouched_b": torch.tensor([42.0]),       # untouched, no .weight suffix
+                "untouched_int": torch.tensor([1, 2], dtype=torch.int32),
+            }
+            result = self._run_fold(
+                lora_sd=_lora_sd(name="lora_unet_block"),
+                base_sd=base_sd,
+                tmp=tmp,
+            )
+
+            loaded = load_file(result.output_path)
+            self.assertEqual(set(loaded.keys()), set(base_sd.keys()))
+
+    def test_fold_prints_plan_before_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_sd = _lora_sd(name="lora_unet_block")
+            base_sd = {"block.weight": torch.zeros(2, 3), "other.weight": torch.zeros(4)}
+            lora_path = _save_sd(tmp, "lora.safetensors", lora_sd)
+            base_path = _save_sd(tmp, "base.safetensors", base_sd)
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+            )
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                mla.fold_adapters_into_base(config)
+            output = captured.getvalue()
+
+            plan_pos = output.find("fold plan")
+            summary_pos = output.find("fold summary")
+            self.assertGreaterEqual(plan_pos, 0, f"missing 'fold plan' in stdout: {output!r}")
+            self.assertGreaterEqual(summary_pos, 0, f"missing 'fold summary' in stdout: {output!r}")
+            self.assertLess(plan_pos, summary_pos, "plan must precede summary")
+            # "not delta-modified" wording (honest in both sentinel and explicit dtype mode).
+            self.assertIn("not delta-modified", output)
+            # Plan reports module + base-tensor count; summary reports folded/pruned/untouched.
+            self.assertIn("modules resolved", output)
+            self.assertIn("modules folded", output)
+
+    def test_fold_plan_and_summary_prints_flush_for_long_running_cli(self) -> None:
+        # Real fold smokes can spend minutes between preflight and atomic write. In
+        # non-interactive subprocesses stdout is buffered, so the plan/summary lines must
+        # flush explicitly or users won't see the preflight line until process exit.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_path = _save_sd(tmp, "lora.safetensors", _lora_sd(name="lora_unet_block"))
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+            )
+
+            with patch("builtins.print") as mock_print:
+                mla.fold_adapters_into_base(config)
+
+            fold_calls = [
+                call
+                for call in mock_print.call_args_list
+                if call.args and str(call.args[0]).startswith(("fold plan", "fold summary"))
+            ]
+            self.assertEqual(len(fold_calls), 2)
+            for call in fold_calls:
+                with self.subTest(message=call.args[0]):
+                    self.assertIs(call.kwargs.get("flush"), True)
+
+    def test_fold_writes_checkpoint_metadata_through_to_safetensors_file(self) -> None:
+        # Integration seam test: FoldStats → build_fold_metadata → save_atomic → file metadata.
+        # Helper-level tests can all pass while the WIRING between them silently drifts (e.g.
+        # stats not threaded into the metadata call, or save_atomic dropping the metadata kwarg).
+        # This test asserts the actual on-disk metadata matches what FoldResult reports.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_sd = _lora_sd(name="lora_unet_block")
+            base_sd = {"block.weight": torch.zeros(2, 3), "other.weight": torch.zeros(4)}
+            lora_path = _save_sd(tmp, "lora.safetensors", lora_sd)
+            base_path = _save_sd(tmp, "base.safetensors", base_sd)
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = mla.fold_adapters_into_base(config)
+
+            with safe_open(out_path, framework="pt") as f:
+                file_metadata = f.metadata()
+
+            # Spot-check the fold-specific fields landed correctly through the pipeline.
+            self.assertEqual(file_metadata["ss_merge_output_format"], "checkpoint")
+            self.assertEqual(file_metadata["ss_merge_modules_folded"], "1")
+            self.assertEqual(file_metadata["ss_merge_modules_pruned"], "0")
+            self.assertEqual(file_metadata["ss_merge_modules_resolved"], "1")
+            self.assertEqual(file_metadata["ss_merge_base_basename"], "base.safetensors")
+            self.assertEqual(file_metadata["ss_merge_base_sha256"], mla._file_sha256(base_path))
+            self.assertEqual(file_metadata["ss_merge_base_tensors_total"], "2")
+            self.assertEqual(file_metadata["ss_merge_base_tensors_modified"], "1")
+            # Full-dict equality: catches drift in either direction (extra keys in file or lost keys in result).
+            self.assertEqual(file_metadata, result.metadata)
+
+    def test_run_dispatches_fold_mode_to_fold_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lora_path = _save_sd(tmp, "lora.safetensors", _lora_sd(name="lora_unet_block"))
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
+            out_path = str(tmp / "folded.safetensors")
+            config = _config(
+                "--method", "linear", "--input", lora_path, "1.0",
+                "--fold_into", base_path, "--output", out_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = mla.run(config)
+
+            self.assertIsInstance(result, mla.FoldResult)
+            self.assertNotIsInstance(result, mla.MergeResult)
+            self.assertTrue(os.path.exists(out_path))
+            self.assertEqual(result.output_path, out_path)
+            self.assertEqual(result.base_path, base_path)
+
+
+class TestFoldResultShape(unittest.TestCase):
+    """Pins the FoldResult dataclass shape — load-bearing memory-footprint design."""
+
+    def test_fold_result_does_not_carry_state_dict(self) -> None:
+        # Critical memory-footprint invariant: FoldResult must NOT retain the full base
+        # checkpoint after save_atomic completes. A field named state_dict (or any other
+        # full-tensor-dict shape) would keep the checkpoint alive in the run() caller's
+        # frame just because the result is returned. The whole point of separating
+        # FoldResult from MergeResult.
+        fields = {f.name for f in dataclasses.fields(mla.FoldResult)}
+        for forbidden in ("state_dict", "base_sd", "tensors", "checkpoint"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, fields)
+
+    def test_fold_result_carries_output_path_metadata_stats_base_path(self) -> None:
+        stats = mla.FoldStats(0, 0, 0, 0, 0)
+        result = mla.FoldResult(
+            output_path="/some/path/folded.safetensors",
+            metadata={"ss_merge_tool": "test"},
+            stats=stats,
+            base_path="/some/path/base.safetensors",
+        )
+        self.assertEqual(result.output_path, "/some/path/folded.safetensors")
+        self.assertEqual(result.metadata, {"ss_merge_tool": "test"})
+        self.assertIs(result.stats, stats)
+        self.assertEqual(result.base_path, "/some/path/base.safetensors")
+
 
 if __name__ == "__main__":
     unittest.main()
