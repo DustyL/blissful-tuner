@@ -71,7 +71,7 @@ Use `--preview_spectrum` to inspect aggregate singular-value energy before choos
     --output merged_pruned.safetensors
 ```
 
-`--output_use_rslora` writes the output safetensors with rsLoRA scaling (`alpha / sqrt(rank)`) and a global `use_rslora_flag=True` boolean tensor. Use this for downstream loaders that honor `use_rslora_flag` and expect rsLoRA-shaped scaling. Input format is auto-detected (the materialized delta absorbs whatever input scale convention was used), so this flag controls only output format. Default off — output is standard LoRA scaling. Recorded in metadata as `ss_merge_output_use_rslora` (always, as `"true"` or `"false"`). The flag is rejected if `--output` is not present (no meaning in `--preview_spectrum` mode).
+`--output_use_rslora` writes the output safetensors with rsLoRA scaling (`alpha / sqrt(rank)`) and a global `use_rslora_flag=True` boolean tensor. Use this for downstream loaders that honor `use_rslora_flag` and expect rsLoRA-shaped scaling. Input format is auto-detected (the materialized delta absorbs whatever input scale convention was used), so this flag controls only output format. Default off — output is standard LoRA scaling. Recorded in metadata as `ss_merge_output_use_rslora` (always, as `"true"` or `"false"`). The flag is rejected if `--output` is not present (no meaning in `--preview_spectrum` mode). One artifact-hygiene exception: when all modules are pruned, the metadata still records `"true"` but the output safetensors does NOT contain a lone `use_rslora_flag` tensor (a file containing only the flag and no module data would be technically valid but misleading to inspect).
 
 ```bash
 ./venv314/bin/python tools/merge_loras_algebra.py \
