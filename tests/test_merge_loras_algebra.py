@@ -569,6 +569,239 @@ class TestNonFiniteMergedDelta(unittest.TestCase):
         self.assertNotIn("Traceback", message)
 
 
+class TestPruneThreshold(unittest.TestCase):
+    """v1.5 #1: --prune_threshold for fuzzy-zero module skip.
+
+    See `docs/plans/2026-05-04-peft-tier2-merge-algebra.md` "v1.5 #1" section
+    for the locked decision contract.
+    """
+
+    def _tiny_sd(self, name: str, magnitude: float) -> dict[str, torch.Tensor]:
+        # Construct a LoRA whose merged delta has abs().max() == magnitude.
+        # With down = magnitude * eye and up = eye and alpha == rank (scale=1),
+        # delta = up @ down = magnitude * eye, so abs().max() = magnitude.
+        down = torch.eye(2) * magnitude
+        up = torch.eye(2)
+        return _lora_sd(name=name, down=down, up=up)
+
+    def test_default_preserves_exact_zero_behavior(self) -> None:
+        # At default 0.0, exact-zero modules skipped, near-zero kept (v1 behavior)
+        zero_sd = _lora_sd(name="lora_unet_zero", down=torch.zeros(2, 3), up=torch.zeros(2, 2))
+        tiny_sd = _lora_sd(name="lora_unet_tiny", down=torch.full((2, 3), 1e-10), up=torch.eye(2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            config = _config(
+                "--method",
+                "linear",
+                "--input",
+                _save_sd(tmp, "src.safetensors", zero_sd | tiny_sd),
+                "1.0",
+                "--output",
+                str(out),
+                "--output_rank",
+                "2",
+            )
+            mla.run(config)
+            merged = load_file(str(out))
+
+        self.assertNotIn("lora_unet_zero.lora_down.weight", merged)
+        self.assertIn("lora_unet_tiny.lora_down.weight", merged)
+        self.assertEqual(config.prune_threshold, 0.0)
+
+    def test_skips_below_magnitude(self) -> None:
+        # Module with abs().max() == 1e-5 skipped when threshold = 1e-4
+        below_sd = self._tiny_sd("lora_unet_below", 1e-5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", below_sd),
+                    "1.0",
+                    "--prune_threshold",
+                    "1e-4",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertNotIn("lora_unet_below.lora_down.weight", merged)
+
+    def test_keeps_above_magnitude(self) -> None:
+        # Module with abs().max() == 1e-3 kept when threshold = 1e-4
+        above_sd = self._tiny_sd("lora_unet_above", 1e-3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", above_sd),
+                    "1.0",
+                    "--prune_threshold",
+                    "1e-4",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertIn("lora_unet_above.lora_down.weight", merged)
+
+    def test_negative_rejects(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative and finite"):
+            _config("--method", "linear", "--input", "a.safetensors", "1.0", "--prune_threshold", "-0.1", "--preview_spectrum")
+
+    def test_nan_rejects(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative and finite"):
+            _config("--method", "linear", "--input", "a.safetensors", "1.0", "--prune_threshold", "nan", "--preview_spectrum")
+
+    def test_inf_rejects(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative and finite"):
+            _config("--method", "linear", "--input", "a.safetensors", "1.0", "--prune_threshold", "inf", "--preview_spectrum")
+
+    def test_excludes_pruned_from_spectrum(self) -> None:
+        # Pruned module must not contribute to spectrum_energy aggregate or per_module_energy
+        below_sd = self._tiny_sd("lora_unet_pruned", 1e-5)
+        kept_sd = self._tiny_sd("lora_unet_kept", 1e-3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            config = _config(
+                "--method",
+                "linear",
+                "--input",
+                _save_sd(tmp, "src.safetensors", below_sd | kept_sd),
+                "1.0",
+                "--prune_threshold",
+                "1e-4",
+                "--preview_spectrum",
+            )
+            result = mla.merge_adapters(config)
+
+        # Both modules counted in modules_processed (incremented before the prune check).
+        # Spectrum stats receive only the kept module — pruned module excluded from
+        # spectrum_energy aggregate AND per_module_energy, mirroring the v1
+        # zero-delta-preview-stat fix.
+        self.assertEqual(result.modules_processed, 2)
+        self.assertEqual(len(result.spectrum_energy[mla.SPECTRUM_RANKS[0]]), 1)
+        self.assertNotIn("lora_unet_pruned", result.per_module_energy)
+        self.assertIn("lora_unet_kept", result.per_module_energy)
+
+    def test_metadata_recorded_at_default(self) -> None:
+        # ss_merge_prune_threshold persisted as "0.0" even when flag not passed
+        sd = self._tiny_sd("lora_unet_x", 1e-3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            with safe_open(str(out), framework="pt") as f:
+                metadata = f.metadata()
+
+        self.assertIn("ss_merge_prune_threshold", metadata)
+        self.assertEqual(metadata["ss_merge_prune_threshold"], "0.0")
+
+    def test_metadata_recorded_at_user_value(self) -> None:
+        # ss_merge_prune_threshold reflects user-supplied value
+        sd = self._tiny_sd("lora_unet_x", 1e-3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--prune_threshold",
+                    "0.001",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            with safe_open(str(out), framework="pt") as f:
+                metadata = f.metadata()
+
+        self.assertEqual(metadata["ss_merge_prune_threshold"], "0.001")
+
+    def test_all_pruned_warning_includes_threshold_value(self) -> None:
+        # When all modules are pruned, warning message names the threshold value
+        below_sd = self._tiny_sd("lora_unet_x", 1e-5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            config = _config(
+                "--method",
+                "linear",
+                "--input",
+                _save_sd(tmp, "src.safetensors", below_sd),
+                "1.0",
+                "--prune_threshold",
+                "1e-4",
+                "--output",
+                str(out),
+                "--output_rank",
+                "2",
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                mla.run(config)
+
+        text = buf.getvalue()
+        self.assertIn("exact-zero or below --prune_threshold", text)
+        self.assertIn("0.0001", text)  # threshold value rendered
+
+    def test_all_pruned_warning_default_zero_omits_threshold_phrase(self) -> None:
+        # At default 0.0, original "exact-zero" wording preserved (no threshold mention)
+        zero_sd = _lora_sd(name="lora_unet_x", down=torch.zeros(2, 3), up=torch.zeros(2, 2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            config = _config(
+                "--method",
+                "linear",
+                "--input",
+                _save_sd(tmp, "src.safetensors", zero_sd),
+                "1.0",
+                "--output",
+                str(out),
+                "--output_rank",
+                "2",
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                mla.run(config)
+
+        text = buf.getvalue()
+        self.assertIn("all merged modules were exact-zero", text)
+        self.assertNotIn("--prune_threshold", text)
+
+
 class TestRsLoRAInputStandardOutput(unittest.TestCase):
     def test_rslora_input_scale_absorbed_and_output_standard(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

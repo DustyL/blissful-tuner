@@ -59,6 +59,18 @@ Use `--preview_spectrum` to inspect aggregate singular-value energy before choos
     --preview_spectrum
 ```
 
+`--prune_threshold T` (default 0.0) skips merged modules where `merged_delta.abs().max() <= T`. Useful for sparse or canceling merges where some modules end up near-zero. The default 0.0 preserves the v1 exact-zero-only skip behavior. The flag prunes merged materialized deltas — not individual LoRA factors — and the threshold value is recorded in metadata as `ss_merge_prune_threshold`. When all merged modules are pruned, the warning message names the threshold value:
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method linear \
+    --input lora_a.safetensors 0.5 \
+    --input lora_b.safetensors -0.5 \
+    --prune_threshold 1e-4 \
+    --output_rank 64 \
+    --output merged_pruned.safetensors
+```
+
 ## LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ
 
 The LoRA Post-Hoc EMA (Exponential Moving Average) merging is a technique to combine multiple LoRA checkpoint files into a single, potentially more stable model. This method applies exponential moving average across multiple checkpoints sorted by modification time, with configurable decay rates.

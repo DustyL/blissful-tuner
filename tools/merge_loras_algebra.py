@@ -80,6 +80,7 @@ class MergeConfig:
     seed: int | None
     preview_spectrum: bool
     preview_per_module: bool
+    prune_threshold: float
 
 
 @dataclass
@@ -122,6 +123,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--density", type=float, default=None, help="TIES trim density [0, 1]. Required for ties / dare_ties.")
     parser.add_argument("--drop_prob", type=float, default=None, help="DARE drop probability [0, 1). Required for dare_*.")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed. Required for dare_*.")
+    parser.add_argument(
+        "--prune_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Skip a merged module from the output when merged_delta.abs().max() <= prune_threshold. "
+            "Default 0.0 preserves v1 exact-zero-only behavior. Prunes merged materialized deltas, "
+            "not individual LoRA factors. Must be non-negative and finite."
+        ),
+    )
     parser.add_argument(
         "--preview_spectrum",
         action="store_true",
@@ -175,6 +186,9 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
     if args.drop_prob is not None and not (0.0 <= args.drop_prob < 1.0):
         raise ValueError("--drop_prob must be in [0, 1).")
 
+    if not math.isfinite(args.prune_threshold) or args.prune_threshold < 0:
+        raise ValueError("--prune_threshold must be non-negative and finite.")
+
     inputs: list[InputSpec] = []
     for path, raw_weight in args.input:
         weight = float(raw_weight)
@@ -204,6 +218,7 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
         seed=args.seed,
         preview_spectrum=args.preview_spectrum,
         preview_per_module=args.preview_per_module,
+        prune_threshold=args.prune_threshold,
     )
 
 
@@ -589,6 +604,7 @@ def build_metadata(config: MergeConfig, adapters: list[AdapterInfo]) -> dict[str
         "ss_merge_density": "" if config.density is None else str(config.density),
         "ss_merge_drop_prob": "" if config.drop_prob is None else str(config.drop_prob),
         "ss_merge_seed": "" if config.seed is None else str(config.seed),
+        "ss_merge_prune_threshold": str(config.prune_threshold),
         "ss_merge_inputs": _merge_inputs_metadata(adapters),
         "ss_merge_input_count": str(len(adapters)),
         "ss_merge_match_semantics": MATCH_SEMANTICS,
@@ -658,7 +674,10 @@ def merge_adapters(
         if not torch.isfinite(merged_delta).all():
             del deltas, merged_delta, delta
             raise ValueError(f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args.")
-        if torch.count_nonzero(merged_delta).item() == 0:
+        # At default --prune_threshold 0.0, this is byte-equivalent to the v1
+        # exact-zero check (since |x| <= 0 requires x == 0). Larger thresholds
+        # skip near-zero modules — see Tier 2 #5 v1.5 #1 in the plan doc.
+        if merged_delta.abs().max().item() <= config.prune_threshold:
             del deltas, merged_delta, delta
             continue
         energy = _singular_energy(merged_delta)
@@ -742,7 +761,13 @@ def run(config: MergeConfig) -> MergeResult:
     assert config.output is not None
     save_file(result.state_dict, config.output, metadata=result.metadata)
     if result.modules_processed > 0 and result.modules_written == 0:
-        print("Warning: all merged modules were exact-zero; output safetensors contains only metadata.")
+        if config.prune_threshold > 0:
+            print(
+                f"Warning: all merged modules were exact-zero or below --prune_threshold {config.prune_threshold}; "
+                "output safetensors contains only metadata."
+            )
+        else:
+            print("Warning: all merged modules were exact-zero; output safetensors contains only metadata.")
     print(
         f"Saved merged LoRA to {config.output} "
         f"({result.modules_written}/{result.modules_processed} modules written, dtype={config.output_dtype_name})."
