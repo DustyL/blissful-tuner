@@ -71,6 +71,19 @@ Use `--preview_spectrum` to inspect aggregate singular-value energy before choos
     --output merged_pruned.safetensors
 ```
 
+`--output_use_rslora` writes the output safetensors with rsLoRA scaling (`alpha / sqrt(rank)`) and a global `use_rslora_flag=True` boolean tensor. Use this for downstream loaders that honor `use_rslora_flag` and expect rsLoRA-shaped scaling. Input format is auto-detected (the materialized delta absorbs whatever input scale convention was used), so this flag controls only output format. Default off — output is standard LoRA scaling. Recorded in metadata as `ss_merge_output_use_rslora` (always, as `"true"` or `"false"`). The flag is rejected if `--output` is not present (no meaning in `--preview_spectrum` mode).
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method ties \
+    --input lora_a.safetensors 0.6 \
+    --input lora_b.safetensors 0.4 \
+    --density 0.2 \
+    --output_use_rslora \
+    --output_rank 64 \
+    --output merged_rslora.safetensors
+```
+
 ## LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ
 
 The LoRA Post-Hoc EMA (Exponential Moving Average) merging is a technique to combine multiple LoRA checkpoint files into a single, potentially more stable model. This method applies exponential moving average across multiple checkpoints sorted by modification time, with configurable decay rates.

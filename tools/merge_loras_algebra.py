@@ -81,6 +81,7 @@ class MergeConfig:
     preview_spectrum: bool
     preview_per_module: bool
     prune_threshold: float
+    output_use_rslora: bool
 
 
 @dataclass
@@ -131,6 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip a merged module from the output when merged_delta.abs().max() <= prune_threshold. "
             "Default 0.0 preserves v1 exact-zero-only behavior. Prunes merged materialized deltas, "
             "not individual LoRA factors. Must be non-negative and finite."
+        ),
+    )
+    parser.add_argument(
+        "--output_use_rslora",
+        action="store_true",
+        help=(
+            "Write output with rsLoRA scaling (alpha / sqrt(rank)) and use_rslora_flag=True. "
+            "Use for downstream loaders that honor use_rslora_flag."
         ),
     )
     parser.add_argument(
@@ -189,6 +198,9 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
     if not math.isfinite(args.prune_threshold) or args.prune_threshold < 0:
         raise ValueError("--prune_threshold must be non-negative and finite.")
 
+    if args.output_use_rslora and not args.output:
+        raise ValueError("--output_use_rslora requires --output (no meaning in preview mode).")
+
     inputs: list[InputSpec] = []
     for path, raw_weight in args.input:
         weight = float(raw_weight)
@@ -219,6 +231,7 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
         preview_spectrum=args.preview_spectrum,
         preview_per_module=args.preview_per_module,
         prune_threshold=args.prune_threshold,
+        output_use_rslora=args.output_use_rslora,
     )
 
 
@@ -491,6 +504,7 @@ def svd_recompress_delta(
     output_rank: int,
     output_alpha: float,
     output_dtype: torch.dtype,
+    output_use_rslora: bool = False,
 ) -> dict[str, torch.Tensor]:
     matrix, conv_shape = _flatten_delta_for_svd(delta.to(dtype=torch.float32, device="cpu"))
     if output_rank > min(matrix.shape):
@@ -499,7 +513,11 @@ def svd_recompress_delta(
             f"{tuple(delta.shape)} (max useful rank {min(matrix.shape)})."
         )
 
-    scale = output_alpha / output_rank
+    # rsLoRA convention: scale = alpha / sqrt(rank). Standard convention: scale = alpha / rank.
+    # Either way, exact merged-delta reconstruction is preserved because the SVD factors
+    # are reconstructed using the selected scale (root = sqrt(s / scale)).
+    denom = math.sqrt(output_rank) if output_use_rslora else float(output_rank)
+    scale = output_alpha / denom
     if scale <= 0:
         raise ValueError("Output LoRA scale must be positive.")
 
@@ -605,6 +623,7 @@ def build_metadata(config: MergeConfig, adapters: list[AdapterInfo]) -> dict[str
         "ss_merge_drop_prob": "" if config.drop_prob is None else str(config.drop_prob),
         "ss_merge_seed": "" if config.seed is None else str(config.seed),
         "ss_merge_prune_threshold": str(config.prune_threshold),
+        "ss_merge_output_use_rslora": str(config.output_use_rslora).lower(),
         "ss_merge_inputs": _merge_inputs_metadata(adapters),
         "ss_merge_input_count": str(len(adapters)),
         "ss_merge_match_semantics": MATCH_SEMANTICS,
@@ -695,10 +714,18 @@ def merge_adapters(
                     config.output_rank,
                     config.output_alpha,
                     config.output_dtype,
+                    output_use_rslora=config.output_use_rslora,
                 )
             )
             modules_written += 1
         del deltas, merged_delta, delta
+
+    # rsLoRA output: write the global use_rslora_flag tensor only when at least one module
+    # was actually written. Empty/all-pruned outputs would otherwise contain just a lone
+    # flag tensor with no module data, which is technically valid but misleading to inspect.
+    # See Tier 2 #5 v1.5 #2 plan, locked decision #5.
+    if config.output_use_rslora and modules_written > 0:
+        output_sd["use_rslora_flag"] = torch.tensor(True, dtype=torch.bool)
 
     return MergeResult(
         state_dict=output_sd,

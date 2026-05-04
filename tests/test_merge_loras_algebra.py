@@ -860,6 +860,207 @@ class TestRsLoRAInputStandardOutput(unittest.TestCase):
         self.assertEqual(float(merged["lora_unet_block.alpha"].item()), 2.0)
 
 
+def _rslora_output_delta(sd: dict[str, torch.Tensor], name: str = "lora_unet_block") -> torch.Tensor:
+    """Reconstruct delta from rsLoRA-shaped output (alpha / sqrt(rank) scale).
+
+    Counterpart to _output_delta() which assumes standard alpha/rank scaling.
+    """
+    down = sd[f"{name}.lora_down.weight"].float()
+    up = sd[f"{name}.lora_up.weight"].float()
+    alpha = float(sd[f"{name}.alpha"].item())
+    return (up @ down) * (alpha / math.sqrt(down.shape[0]))
+
+
+class TestOutputUseRsLoRA(unittest.TestCase):
+    """v1.5 #2: --output_use_rslora for rsLoRA-shaped output.
+
+    See `docs/plans/2026-05-04-peft-tier2-merge-algebra.md` "v1.5 #2" section
+    for the locked decision contract (12 forks).
+    """
+
+    def test_rejects_without_output(self) -> None:
+        # Self-application of the "accepted-but-ignored" lens: --output_use_rslora is
+        # output-only, so passing it under --preview_spectrum has no meaning.
+        with self.assertRaisesRegex(ValueError, r"--output_use_rslora requires --output"):
+            _config(
+                "--method",
+                "linear",
+                "--input",
+                "a.safetensors",
+                "1.0",
+                "--output_use_rslora",
+                "--preview_spectrum",
+            )
+
+    def test_standard_input_to_rslora_output_writes_flag(self) -> None:
+        # Output safetensors gains a global use_rslora_flag=True boolean tensor
+        sd = _lora_sd()  # standard input (no use_rslora_flag)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                    "--output_use_rslora",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertIn("use_rslora_flag", merged)
+        self.assertTrue(bool(merged["use_rslora_flag"].item()))
+        self.assertEqual(merged["use_rslora_flag"].dtype, torch.bool)
+
+    def test_standard_input_to_rslora_output_reconstructs_delta(self) -> None:
+        # Reading the rsLoRA-shaped output with alpha/sqrt(rank) scale must recover
+        # the same materialized delta the standard input encoded with alpha/rank scale.
+        sd = _lora_sd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                    "--output_use_rslora",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertTrue(torch.allclose(_rslora_output_delta(merged), _explicit_delta(sd), atol=1e-5))
+
+    def test_rslora_input_to_rslora_output_round_trip(self) -> None:
+        # rsLoRA input → rsLoRA output produces equivalent materialized delta
+        sd = _lora_sd(use_rslora=True, alpha=math.sqrt(2.0))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "rslora.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                    "--output_use_rslora",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertIn("use_rslora_flag", merged)
+        self.assertTrue(torch.allclose(_rslora_output_delta(merged), _explicit_delta(sd), atol=1e-5))
+
+    def test_output_alpha_override_in_rslora_preserves_delta(self) -> None:
+        # User-supplied --output_alpha in rsLoRA mode still reconstructs the target
+        # delta correctly (factors absorb whatever scale the user picked).
+        sd = _lora_sd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                    "--output_alpha",
+                    "1.0",  # explicit override
+                    "--output_use_rslora",
+                )
+            )
+            merged = load_file(str(out))
+
+        self.assertEqual(float(merged["lora_unet_block.alpha"].item()), 1.0)
+        self.assertTrue(torch.allclose(_rslora_output_delta(merged), _explicit_delta(sd), atol=1e-5))
+
+    def test_standard_output_records_false_metadata_and_omits_flag(self) -> None:
+        # Default off: metadata records "false", output safetensors has no use_rslora_flag
+        sd = _lora_sd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            merged = load_file(str(out))
+            with safe_open(str(out), framework="pt") as f:
+                metadata = f.metadata()
+
+        self.assertNotIn("use_rslora_flag", merged)
+        self.assertEqual(metadata["ss_merge_output_use_rslora"], "false")
+
+    def test_all_pruned_with_rslora_records_metadata_but_no_lone_flag(self) -> None:
+        # When all modules pruned, metadata says "true" but output doesn't write
+        # a lone use_rslora_flag tensor — artifact hygiene per locked decision #5.
+        zero_sd = _lora_sd(name="lora_unet_zero", down=torch.zeros(2, 3), up=torch.zeros(2, 2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "zero.safetensors", zero_sd),
+                    "1.0",
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                    "--output_use_rslora",
+                )
+            )
+            merged = load_file(str(out))
+            with safe_open(str(out), framework="pt") as f:
+                metadata = f.metadata()
+
+        # Metadata reflects the user's intent
+        self.assertEqual(metadata["ss_merge_output_use_rslora"], "true")
+        # But no lone flag tensor in an otherwise-empty safetensors
+        self.assertEqual(merged, {})
+
+    def test_parser_help_includes_rslora_flag(self) -> None:
+        # Help string mentions both the math (alpha / sqrt(rank)) and the loader requirement
+        parser = mla.build_parser()
+        help_text = parser.format_help()
+        self.assertIn("--output_use_rslora", help_text)
+        self.assertIn("alpha / sqrt(rank)", help_text)
+        self.assertIn("downstream loaders", help_text)
+
+
 class TestMetadata(unittest.TestCase):
     def test_metadata_includes_required_provenance_keys_and_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
