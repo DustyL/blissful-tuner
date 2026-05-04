@@ -84,6 +84,45 @@ Use `--preview_spectrum` to inspect aggregate singular-value energy before choos
     --output merged_rslora.safetensors
 ```
 
+`--fold_into <base.safetensors>` switches the tool from LoRA-output to checkpoint-output mode: the merged adapter delta is folded into the matching base tensors at full rank (no SVD recompression) and the result is written as a full base-shaped checkpoint to `--output`. Use this when downstream consumers want a single fused checkpoint instead of a runtime-loadable adapter.
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method linear \
+    --input lora_a.safetensors 0.6 \
+    --input lora_b.safetensors 0.4 \
+    --fold_into base_model.safetensors \
+    --output base_with_loras.safetensors
+```
+
+Fold mode runs a preflight that hard-rejects:
+
+- **Orphan**: a LoRA module name has no matching base key (forward map is `_make_lora_name_from_model_key`; never an inverse string parse — base keys with embedded underscores like `double_blocks.0.img_attn.qkv.weight` resolve correctly)
+- **Ambiguous**: two base keys forward-map to the same LoRA name (refuses to guess; rename or remove duplicates)
+- **Non-floating target**: a matched base tensor has integer/bool dtype (fold requires floating-point base for delta addition)
+- **Shape mismatch**: the materialized delta shape does not match the base tensor shape
+- **fp8 base**: any base tensor with `float8_*` dtype (fold would require de-quantize → add → re-quantize with scale recalibration, out of scope; fold into the unquantized base, then re-quantize downstream)
+
+Architectures with fused-QKV base tensors, such as Z-Image checkpoints that store `layers.N.attention.qkv.weight`, will reject LoRAs trained against split projections like `lora_unet_layers_N_attention_to_{q,k,v}` until explicit packing logic is added. Use those LoRAs through the runtime hotswap path rather than folding them.
+
+`--fold_into` is mutually exclusive with `--output_rank`, `--output_alpha`, `--output_use_rslora`, `--preview_spectrum`, and `--preview_per_module`. Each rejection names both flags and the reason — these flags only have meaning for LoRA-output mode.
+
+Output dtype handling differs from LoRA-output mode:
+
+- **`--output_dtype` omitted (default in fold mode)**: per-tensor base dtype is preserved. A bf16 base tensor stays bf16, fp16 stays fp16, int64 buffers stay int64. Internally tagged as the `base` sentinel (not user-facing).
+- **`--output_dtype {fp32,bf16,fp16}` (explicit)**: every floating-point tensor is cast to the requested dtype — both touched (folded) tensors and untouched ones. Non-floating buffers (int / bool) are preserved at their stored dtype.
+
+Split safetensors bases are supported transparently. Pass any shard of the split set (`base-00001-of-00004.safetensors`, `base-00003-of-00004.safetensors`, etc.) and all shards are loaded into one merged state dict. Duplicate keys across shards are hard-rejected to prevent silent overwriting. The metadata field `ss_merge_base_sha256` is the composite hash `sha256(hex_sha256(shard_1) || hex_sha256(shard_2) || ...)` for split bases, and equals `sha256sum base.safetensors` for single-file bases.
+
+Stdout reports two lines per fold:
+
+```text
+fold plan: 112 modules resolved to 112 base tensors
+fold summary: 108 modules folded; 4 modules pruned; 940 base tensors not delta-modified
+```
+
+The output is written atomically via a sibling temp file + `os.replace`, so a failed fold leaves no partial output behind. The output checkpoint metadata includes `ss_merge_output_format=checkpoint`, `ss_merge_base_basename` (basename only — never the absolute path), `ss_merge_base_sha256`, and `ss_merge_modules_resolved` / `ss_merge_modules_folded` / `ss_merge_modules_pruned` / `ss_merge_base_tensors_total` / `ss_merge_base_tensors_modified` counts. LoRA-only metadata fields (`ss_merge_output_rank`, `ss_merge_output_alpha`, `ss_merge_output_use_rslora`, `ss_merge_recompression`) are omitted.
+
 ## LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ
 
 The LoRA Post-Hoc EMA (Exponential Moving Average) merging is a technique to combine multiple LoRA checkpoint files into a single, potentially more stable model. This method applies exponential moving average across multiple checkpoints sorted by modification time, with configurable decay rates.

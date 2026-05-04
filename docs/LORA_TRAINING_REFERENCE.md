@@ -61,7 +61,7 @@ After training, standard LoRA checkpoints can be combined with `tools/merge_lora
   --output merged_ties_rank64.safetensors
 ```
 
-The tool supports `linear`, `ties`, `dare_linear`, and `dare_ties`. It writes standard LoRA safetensors by SVD recompression, so `--output_rank` is required when writing an output file. Use `--preview_spectrum` to inspect singular-value energy before choosing a rank.
+The tool supports `linear`, `ties`, `dare_linear`, and `dare_ties`. By default it writes standard LoRA safetensors by SVD recompression, so `--output_rank` is required when writing a LoRA output file. Use `--preview_spectrum` to inspect singular-value energy before choosing a rank. For downstream consumers that need a full checkpoint instead of an adapter, `--fold_into <base.safetensors>` folds the merged delta into matching base tensors and writes a checkpoint-shaped safetensors file to `--output`.
 
 In v1, the tool intentionally rejects DoRA, LoHa, LoKr, hybrid, and unknown adapter formats during preflight. DoRA merge algebra requires base-model weights and is deferred to a future base-loaded mode.
 
