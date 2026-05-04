@@ -6,8 +6,58 @@ This document provides documentation for utility tools available in this project
 
 ## Table of Contents
 
+- [LoRA merge algebra (TIES / DARE / linear)](#lora-merge-algebra-ties--dare--linear)
 - [LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ](#lora-post-hoc-ema-merging--loraのpost-hoc-emaマージ)
 - [Image Captioning with Qwen2.5-VL / Qwen2.5-VLによる画像キャプション生成](#image-captioning-with-qwen25-vl--qwen25-vlによる画像キャプション生成)
+
+## LoRA merge algebra (TIES / DARE / linear)
+
+`tools/merge_loras_algebra.py` combines multiple standard LoRA safetensors files offline. It materializes each adapter into full weight-delta tensors one module at a time, applies the selected merge algebra, then writes a new standard LoRA safetensors file by SVD recompression.
+
+Supported methods:
+
+- `linear`: weighted sum of materialized deltas
+- `ties`: TIES trim/sign-election/disjoint merge
+- `dare_linear`: DARE random drop/rescale, then linear merge
+- `dare_ties`: DARE random drop/rescale, then TIES
+
+The tool intentionally supports standard LoRA only in v1. DoRA, LoHa, LoKr, hybrid, and unknown adapter formats are rejected during preflight with an actionable error. DoRA support requires base-model weights and is deferred.
+
+Example:
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method ties \
+    --input lora_a.safetensors 0.6 \
+    --input lora_b.safetensors 0.4 \
+    --density 0.2 \
+    --output_rank 64 \
+    --output merged_ties_rank64.safetensors
+```
+
+DARE methods require an explicit seed for reproducible output:
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method dare_ties \
+    --input lora_a.safetensors 1.0 \
+    --input lora_b.safetensors 1.0 \
+    --density 0.2 \
+    --drop_prob 0.5 \
+    --seed 1234 \
+    --output_rank 64 \
+    --output merged_dare_ties_rank64.safetensors
+```
+
+Use `--preview_spectrum` to inspect aggregate singular-value energy before choosing `--output_rank`:
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method linear \
+    --input lora_a.safetensors 1.0 \
+    --input lora_b.safetensors 1.0 \
+    --preview_spectrum
+```
 
 ## LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ
 

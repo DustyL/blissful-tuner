@@ -47,6 +47,24 @@ This document serves as a reference for configuring LoRA training in blissful-tu
 - **Dataset configuration**: Images, masks, bucketing
 - **Performance optimizations**: torch.compile, CuTE attention, FP8
 
+### Offline LoRA merge algebra
+
+After training, standard LoRA checkpoints can be combined with `tools/merge_loras_algebra.py` using materialized-delta merge algebra:
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+  --method ties \
+  --input lora_a.safetensors 0.6 \
+  --input lora_b.safetensors 0.4 \
+  --density 0.2 \
+  --output_rank 64 \
+  --output merged_ties_rank64.safetensors
+```
+
+The tool supports `linear`, `ties`, `dare_linear`, and `dare_ties`. It writes standard LoRA safetensors by SVD recompression, so `--output_rank` is required when writing an output file. Use `--preview_spectrum` to inspect singular-value energy before choosing a rank.
+
+In v1, the tool intentionally rejects DoRA, LoHa, LoKr, hybrid, and unknown adapter formats during preflight. DoRA merge algebra requires base-model weights and is deferred to a future base-loaded mode.
+
 ### Supported Architectures
 
 | Architecture | Training Script | Network Module |

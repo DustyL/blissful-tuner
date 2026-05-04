@@ -338,28 +338,26 @@ this list and are kept here as anchor points for grep searches.
 
 5. **Adapter merge algebra** (TIES, DARE, SVD, magnitude pruning) for
    `lora_post_hoc_ema.py` family.
-   _Status: only EMA averaging exists. Demoted from Tier 1 because the
-   design surface is wider than initially scoped — see "design questions"._
+   _Status: implemented locally in `tools/merge_loras_algebra.py`, pending
+   review/commit. EMA averaging still exists separately._
    - **PEFT reference**: `/home/dustin/peft/src/peft/utils/merge_utils.py:185`
      (`ties`/`dare`/`task_arithmetic`) — pure tensor algebra, **no PEFT
-     runtime dependency**, can be copied into
-     `src/blissful_tuner/lora_merge_utils.py` essentially verbatim.
-   - **Design questions to resolve before coding**:
-     1. **What to operate on**:
-        (a) raw LoRA `A`/`B` tensors (only when shapes match across inputs);
-        (b) materialized deltas `B @ A` per target module;
-        (c) materialized deltas → SVD → re-factor back into LoRA format.
-        Option (c) is the most user-friendly (output is a normal LoRA file)
-        but adds an SVD per layer per merge.
-     2. **Flag preservation**: when merging two adapters where one is
-        rsLoRA and the other isn't, what scale flag does the output carry?
-        Likely answer: emit non-rsLoRA with pre-baked scale, but document
-        explicitly.
-     3. **DoRA**: probably refuse-with-error on first cut. Magnitude vectors
-        don't compose linearly.
-   - **Recommended PoC shape**: offline CLI `tools/merge_loras_ties.py`
-     that takes N input LoRA paths + weights + a method, emits a normal
-     blissful-tuner/Kohya-format `.safetensors` with the merged adapter.
+     runtime dependency**, transcribed into a standalone offline CLI.
+   - **Locked v1 shape**:
+     1. Operate on materialized deltas in fp32 CPU, one module at a time.
+     2. Support `linear`, `ties`, `dare_linear`, and `dare_ties`.
+     3. Recompress output to standard LoRA safetensors via SVD at explicit
+        `--output_rank`; no `--method svd` peer method.
+     4. Accept rsLoRA inputs by baking their scale into the materialized
+        delta; output standard LoRA (`alpha / rank`) without
+        `use_rslora_flag`.
+     5. Reject DoRA, LoHa, LoKr, hybrid, split-dims, and unknown inputs
+        during preflight with actionable errors. DoRA support is deferred
+        because correct delta materialization needs base weights.
+   - **Implemented CLI shape**: `tools/merge_loras_algebra.py` takes repeated
+     `--input PATH WEIGHT` pairs plus `--method`, method-specific args, and
+     `--output_rank`, then emits a normal blissful-tuner/Kohya-format
+     `.safetensors` with provenance metadata.
 
 6. **PiSSA / OLoRA initialization (deferred from Tier 1).**
    _Status: not implemented; gated on metadata + safety-check infrastructure
