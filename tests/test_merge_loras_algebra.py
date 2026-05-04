@@ -659,6 +659,38 @@ class TestPruneThreshold(unittest.TestCase):
 
         self.assertIn("lora_unet_above.lora_down.weight", merged)
 
+    def test_skips_equal_magnitude(self) -> None:
+        """Pin the `<=` boundary semantics: skip when abs().max() exactly equals threshold.
+
+        A future refactor that swapped `<=` for `<` would silently change behavior;
+        without this test, both directions would still pass test_skips_below_magnitude
+        and test_keeps_above_magnitude. This test fails loudly if `<=` becomes `<`.
+        """
+        threshold = 1e-4
+        equal_sd = self._tiny_sd("lora_unet_equal", threshold)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "out.safetensors"
+            mla.run(
+                _config(
+                    "--method",
+                    "linear",
+                    "--input",
+                    _save_sd(tmp, "src.safetensors", equal_sd),
+                    "1.0",
+                    "--prune_threshold",
+                    str(threshold),
+                    "--output",
+                    str(out),
+                    "--output_rank",
+                    "2",
+                )
+            )
+            merged = load_file(str(out))
+
+        # |delta|.max() == threshold → contract says skip (`<=` boundary)
+        self.assertNotIn("lora_unet_equal.lora_down.weight", merged)
+
     def test_negative_rejects(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-negative and finite"):
             _config("--method", "linear", "--input", "a.safetensors", "1.0", "--prune_threshold", "-0.1", "--preview_spectrum")
@@ -973,6 +1005,40 @@ class TestPreviewSpectrum(unittest.TestCase):
                 mla.run(config)
 
         self.assertIn("lora_unet_block:", buf.getvalue())
+
+    def test_preview_header_echoes_prune_threshold_when_set(self) -> None:
+        """Provenance: pruning happens before the spectrum is computed, so a pasted
+        preview transcript must record the threshold value that shaped the stats.
+        Header echoes prune_threshold=N alongside density/drop_prob/seed when > 0;
+        omits it at default 0.0 to keep header noise low."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = _save_sd(Path(tmpdir), "a.safetensors", _lora_sd())
+            # Run 1: with --prune_threshold 1e-4 → header includes the value
+            config_with = _config(
+                "--method",
+                "linear",
+                "--input",
+                source,
+                "1.0",
+                "--prune_threshold",
+                "1e-4",
+                "--preview_spectrum",
+            )
+            buf_with = io.StringIO()
+            with contextlib.redirect_stdout(buf_with):
+                mla.run(config_with)
+            text_with = buf_with.getvalue()
+
+            # Run 2: at default 0.0 → header does NOT mention prune_threshold
+            config_default = _config("--method", "linear", "--input", source, "1.0", "--preview_spectrum")
+            buf_default = io.StringIO()
+            with contextlib.redirect_stdout(buf_default):
+                mla.run(config_default)
+            text_default = buf_default.getvalue()
+
+        self.assertIn("prune_threshold=", text_with)
+        self.assertIn("0.0001", text_with)  # %g formatting of 1e-4
+        self.assertNotIn("prune_threshold=", text_default)
 
 
 class TestOutputDtypeAndMaterializationShape(unittest.TestCase):

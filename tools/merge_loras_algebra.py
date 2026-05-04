@@ -723,6 +723,11 @@ def print_spectrum_preview(config: MergeConfig, result: MergeResult) -> None:
         method_args.append(f"drop_prob={config.drop_prob:g}")
     if config.seed is not None:
         method_args.append(f"seed={config.seed}")
+    # Pruning happens before the spectrum is computed, so the threshold shapes
+    # the rank-selection stats. Echo it in the preview header so a pasted
+    # transcript records the knob that produced the numbers.
+    if config.prune_threshold > 0:
+        method_args.append(f"prune_threshold={config.prune_threshold:g}")
     method_suffix = f" ({', '.join(method_args)})" if method_args else ""
 
     print("Tier 2 #5 spectrum preview")
