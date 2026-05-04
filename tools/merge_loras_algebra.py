@@ -31,7 +31,11 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, detect_network_type
+from musubi_tuner.utils.lora_utils import (
+    _make_lora_name_from_model_key,
+    convert_diffusers_if_needed,
+    detect_network_type,
+)
 from musubi_tuner.utils.safetensors_utils import get_split_weight_filenames
 
 
@@ -128,6 +132,22 @@ class MergedModuleDelta:
     module_name: str
     merged_delta: torch.Tensor
     was_pruned: bool = False
+
+@dataclass(frozen=True)
+class FoldTarget:
+    """Resolved fold target: one LoRA module → one base tensor.
+
+    Produced by :func:`resolve_fold_plan` after orphan / ambiguity / non-floating /
+    shape checks pass. The fold pipeline reads ``base_key`` to look up the tensor in
+    the loaded base state_dict, and uses ``base_dtype`` to decide whether to preserve
+    per-tensor dtype (``output_dtype_name == "base"`` sentinel) or cast to a concrete
+    output dtype.
+    """
+
+    lora_name: str
+    base_key: str
+    base_shape: tuple[int, ...]
+    base_dtype: torch.dtype
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -434,6 +454,127 @@ def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> 
         "re-quantize with scale recalibration, which is out of the merge CLI's scope. Fold "
         "into the unquantized base, then re-quantize downstream."
     )
+
+def build_base_lora_index(base_sd: dict[str, torch.Tensor]) -> dict[str, list[str]]:
+    """Forward map: LoRA module name → list of base keys whose forward mapping yields it.
+
+    Iterates only ``.weight`` keys (LoRA adapters target weight matrices). Uses the
+    production helper :func:`_make_lora_name_from_model_key` for the forward mapping —
+    NEVER inverts the underscore-separated LoRA name to guess a base key, because
+    underscores can be either real characters in a base key or dot-replacements, and
+    the inverse is genuinely ambiguous. The forward mapping is many-to-one, so values
+    are ``list[str]`` (not ``str``) to preserve ambiguity evidence for
+    :func:`resolve_fold_plan`.
+    """
+    index: dict[str, list[str]] = {}
+    for key in base_sd:
+        if not key.endswith(".weight"):
+            continue
+        lora_name = _make_lora_name_from_model_key(key)
+        index.setdefault(lora_name, []).append(key)
+    return index
+
+
+
+def _delta_shape_from_module_info(info: ModuleInfo) -> tuple[int, ...]:
+    """Compute the materialized merged-delta shape for a LoRA module from its factor shapes.
+
+    Linear (down=2D, up=2D): ``(up.shape[0], down.shape[1])`` — i.e. ``(out_dim, in_dim)``.
+    Conv2d (down=4D, up=4D): ``(up.shape[0], down.shape[1], down.shape[2], down.shape[3])``
+    — i.e. ``(out_dim, in_dim, kernel_h, kernel_w)``. Requires ``up.shape[2:] == (1, 1)``,
+    mirroring the production materializer's constraint (see :func:`materialize_module_delta`).
+
+    Used by :func:`resolve_fold_plan` for preflight shape validation against the base
+    tensor — before any tensor-heavy materialization runs.
+    """
+    if len(info.down_shape) == 2 and len(info.up_shape) == 2:
+        return (info.up_shape[0], info.down_shape[1])
+    if len(info.down_shape) == 4 and len(info.up_shape) == 4:
+        if info.up_shape[2:] != (1, 1):
+            # Mirror the materializer guard so preflight catches unsupported geometry rather
+            # than letting it through to fail mid-pipeline. Same error wording as
+            # materialize_module_delta for consistency.
+            raise ValueError(
+                f"{info.name} has unsupported Conv2d LoRA up kernel {tuple(info.up_shape[2:])}; expected 1x1."
+            )
+        return (info.up_shape[0], info.down_shape[1], info.down_shape[2], info.down_shape[3])
+    raise ValueError(f"{info.name} mixes Linear and Conv2d LoRA tensor shapes, which fold mode cannot resolve.")
+
+
+
+def resolve_fold_plan(
+    adapters: list[AdapterInfo],
+    base_sd: dict[str, torch.Tensor],
+) -> dict[str, FoldTarget]:
+    """Preflight: resolve every LoRA module in the adapter union to a unique base tensor.
+
+    Hard-rejects (any one fires before any tensor-heavy materialization runs):
+
+    * **Orphan** — LoRA module has no matching base key under the forward index.
+    * **Ambiguous** — multiple base keys forward-map to the same LoRA name.
+    * **Non-floating** — matched base tensor has integer / bool / quantized dtype.
+    * **Shape mismatch** — would-be merged delta shape ≠ base tensor shape.
+
+    Returns a dict keyed by LoRA module name in :func:`_module_union` order
+    (deterministic). Cross-adapter shape consistency is the responsibility of
+    :func:`_validate_module_shapes_and_output_rank`; this function uses the first
+    contributing adapter's :class:`ModuleInfo` to derive the would-be delta shape.
+    """
+    index = build_base_lora_index(base_sd)
+    plan: dict[str, FoldTarget] = {}
+
+    for module_name in _module_union(adapters):
+        candidates = index.get(module_name, [])
+        if not candidates:
+            raise ValueError(
+                f"--fold_into orphan: LoRA module {module_name!r} has no matching base tensor. "
+                "Verify the base checkpoint matches the architecture the adapter was trained against, "
+                "or remove the unmatched module from the adapter."
+            )
+        if len(candidates) > 1:
+            sample = ", ".join(sorted(candidates)[:3])
+            more = f" (+{len(candidates) - 3} more)" if len(candidates) > 3 else ""
+            raise ValueError(
+                f"--fold_into ambiguity: LoRA module {module_name!r} forward-maps to multiple base "
+                f"keys: {sample}{more}. Refusing to guess. Rename or remove the duplicate base keys "
+                "before folding."
+            )
+
+        base_key = candidates[0]
+        base_tensor = base_sd[base_key]
+
+        if not base_tensor.is_floating_point():
+            raise ValueError(
+                f"--fold_into non-floating target: LoRA module {module_name!r} matched base tensor "
+                f"{base_key!r} with non-floating dtype {base_tensor.dtype}. Fold mode requires a "
+                "floating-point base for delta addition."
+            )
+
+        delta_shape: tuple[int, ...] | None = None
+        for adapter in adapters:
+            info = adapter.modules.get(module_name)
+            if info is not None:
+                delta_shape = _delta_shape_from_module_info(info)
+                break
+        # _module_union only emits names that have at least one contributor, so this assertion
+        # is structurally guaranteed; documented here to make the invariant explicit.
+        assert delta_shape is not None, "_module_union returned a name with no contributing adapter"
+
+        if tuple(base_tensor.shape) != delta_shape:
+            raise ValueError(
+                f"--fold_into shape mismatch: LoRA module {module_name!r} would produce a delta of "
+                f"shape {delta_shape}, but base tensor {base_key!r} has shape {tuple(base_tensor.shape)}. "
+                "The adapter was trained against a different layer geometry than this base provides."
+            )
+
+        plan[module_name] = FoldTarget(
+            lora_name=module_name,
+            base_key=base_key,
+            base_shape=tuple(base_tensor.shape),
+            base_dtype=base_tensor.dtype,
+        )
+
+    return plan
 
 def _git_version() -> str:
     try:

@@ -1645,5 +1645,182 @@ class TestAssertNoFp8InBase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"re-quantize downstream"):
             mla._assert_no_fp8_in_base(sd, "/tmp/base.safetensors")
 
+class TestBuildBaseLoraIndex(unittest.TestCase):
+    """Pins the forward-mapping base-key index used by --fold_into resolution."""
+
+    def test_index_only_includes_weight_keys(self) -> None:
+        # Biases, scales, alphas, and any non-".weight" tensor must be skipped — LoRA
+        # adapters target weight matrices only.
+        base_sd = {
+            "block.weight": torch.zeros(2, 3),
+            "block.bias": torch.zeros(2),
+            "block.scale": torch.tensor(1.0),
+            "norm.running_mean": torch.zeros(2),
+        }
+        index = mla.build_base_lora_index(base_sd)
+        self.assertEqual(set(index), {"lora_unet_block"})
+        self.assertEqual(index["lora_unet_block"], ["block.weight"])
+
+    def test_index_uses_forward_mapping_with_underscored_base_keys(self) -> None:
+        # Critical correctness: base keys with REAL underscores (not dot-replacements)
+        # must forward-map correctly. A naive inverse parser would invent the wrong key.
+        base_sd = {"double_blocks.0.img_attn.qkv.weight": torch.zeros(2, 3)}
+        index = mla.build_base_lora_index(base_sd)
+        self.assertEqual(
+            index,
+            {"lora_unet_double_blocks_0_img_attn_qkv": ["double_blocks.0.img_attn.qkv.weight"]},
+        )
+
+    def test_index_returns_lists_to_preserve_ambiguity_evidence(self) -> None:
+        # When two distinct base keys forward-map to the same LoRA name, BOTH must be
+        # preserved in the list. A dict[str, str] would silently keep only the last one.
+        base_sd = {
+            "double_blocks.0.img_attn.qkv.weight": torch.zeros(2, 3),
+            "double.blocks.0.img.attn.qkv.weight": torch.zeros(2, 3),
+        }
+        index = mla.build_base_lora_index(base_sd)
+        candidates = index["lora_unet_double_blocks_0_img_attn_qkv"]
+        self.assertEqual(set(candidates), {"double_blocks.0.img_attn.qkv.weight", "double.blocks.0.img.attn.qkv.weight"})
+        self.assertEqual(len(candidates), 2)
+
+    def test_index_strips_model_diffusion_model_prefix(self) -> None:
+        # WAN-style checkpoints prepend "model.diffusion_model." which the production
+        # helper strips before mapping. The index must inherit that behavior.
+        base_sd = {"model.diffusion_model.blocks.0.attn.q.weight": torch.zeros(2, 3)}
+        index = mla.build_base_lora_index(base_sd)
+        self.assertEqual(set(index), {"lora_unet_blocks_0_attn_q"})
+
+
+class TestResolveFoldPlan(unittest.TestCase):
+    """Pins preflight orphan / ambiguity / non-floating / shape-mismatch rejections."""
+
+    def _make_adapter(self, tmp: Path, *, name: str, **lora_kwargs: object) -> mla.AdapterInfo:
+        sd = _lora_sd(name=name, **lora_kwargs)  # type: ignore[arg-type]
+        path = _save_sd(tmp, f"{name}.safetensors", sd)
+        return mla.load_adapter(path, 1.0)
+
+    def test_resolve_returns_deterministic_plan_in_module_union_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # Two adapters covering modules {a, b} and {b, c}; union should be a, b, c sorted.
+            sd_ab = _lora_sd(name="lora_unet_a") | _lora_sd(name="lora_unet_b")
+            sd_bc = _lora_sd(name="lora_unet_b") | _lora_sd(name="lora_unet_c")
+            adapter_ab = mla.load_adapter(_save_sd(tmp, "ab.safetensors", sd_ab), 1.0)
+            adapter_bc = mla.load_adapter(_save_sd(tmp, "bc.safetensors", sd_bc), 1.0)
+            base_sd = {
+                "a.weight": torch.zeros(2, 3),
+                "b.weight": torch.zeros(2, 3),
+                "c.weight": torch.zeros(2, 3),
+            }
+            plan = mla.resolve_fold_plan([adapter_ab, adapter_bc], base_sd)
+            self.assertEqual(list(plan), ["lora_unet_a", "lora_unet_b", "lora_unet_c"])
+
+    def test_resolve_orphan_lora_module_hard_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_nonexistent")
+            base_sd = {"some_other.weight": torch.zeros(2, 3)}
+            with self.assertRaisesRegex(ValueError, r"--fold_into orphan.*lora_unet_nonexistent"):
+                mla.resolve_fold_plan([adapter], base_sd)
+
+    def test_resolve_ambiguous_base_key_hard_rejects(self) -> None:
+        # Both base keys forward-map to lora_unet_double_blocks_0_img_attn_qkv.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_double_blocks_0_img_attn_qkv")
+            base_sd = {
+                "double_blocks.0.img_attn.qkv.weight": torch.zeros(2, 3),
+                "double.blocks.0.img.attn.qkv.weight": torch.zeros(2, 3),
+            }
+            with self.assertRaisesRegex(ValueError, r"--fold_into ambiguity.*forward-maps to multiple base keys"):
+                mla.resolve_fold_plan([adapter], base_sd)
+
+    def test_resolve_non_floating_base_target_hard_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_block")
+            base_sd = {"block.weight": torch.zeros(2, 3, dtype=torch.int32)}
+            with self.assertRaisesRegex(ValueError, r"non-floating target.*torch\.int32"):
+                mla.resolve_fold_plan([adapter], base_sd)
+
+    def test_resolve_shape_mismatch_hard_rejects(self) -> None:
+        # User-specified shape: LoRA delta (2, 3), base tensor (2, 4). Differs in in_dim
+        # at the materialized-delta level, not just at the LoRA factor level.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_block", in_dim=3, out_dim=2)
+            base_sd = {"block.weight": torch.zeros(2, 4)}
+            with self.assertRaisesRegex(ValueError, r"shape mismatch.*\(2, 3\).*\(2, 4\)"):
+                mla.resolve_fold_plan([adapter], base_sd)
+
+    def test_resolve_uses_base_key_forward_index_not_underscore_inverse(self) -> None:
+        # THE load-bearing test for the forward-mapping decision (locked plan, decision #11).
+        # A naive inverse parser would map "lora_unet_double_blocks_0_img_attn_qkv" to a
+        # nonexistent "double.blocks.0.img.attn.qkv.weight" and reject as orphan. The forward
+        # mapping correctly picks the actually-present "double_blocks.0.img_attn.qkv.weight".
+        # No decoy in base_sd here — that case is covered separately as ambiguity.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_double_blocks_0_img_attn_qkv")
+            base_sd = {"double_blocks.0.img_attn.qkv.weight": torch.zeros(2, 3)}
+            plan = mla.resolve_fold_plan([adapter], base_sd)
+            self.assertEqual(
+                plan["lora_unet_double_blocks_0_img_attn_qkv"].base_key,
+                "double_blocks.0.img_attn.qkv.weight",
+            )
+
+    def test_fold_target_carries_base_shape_and_dtype(self) -> None:
+        # FoldTarget must record what the writer will need: base_shape (for re-validation
+        # against the materialized delta) and base_dtype (for the "base" sentinel path).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            adapter = self._make_adapter(tmp, name="lora_unet_block")
+            base_sd = {"block.weight": torch.zeros(2, 3, dtype=torch.bfloat16)}
+            plan = mla.resolve_fold_plan([adapter], base_sd)
+            target = plan["lora_unet_block"]
+            self.assertEqual(target.lora_name, "lora_unet_block")
+            self.assertEqual(target.base_key, "block.weight")
+            self.assertEqual(target.base_shape, (2, 3))
+            self.assertIs(target.base_dtype, torch.bfloat16)
+
+    def test_resolve_rejects_unsupported_conv2d_up_kernel(self) -> None:
+        # Mirrors materialize_module_delta's contract: Conv2d LoRA must have a 1x1 up kernel.
+        # Without preflight enforcement, an unsupported geometry would slip through resolution
+        # and only fail mid-pipeline during materialization. Catch it at the preflight boundary.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rank, in_dim, out_dim = 2, 3, 2
+            sd = _lora_sd(
+                name="lora_unet_conv",
+                rank=rank,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                down=torch.zeros(rank, in_dim, 1, 1),
+                up=torch.zeros(out_dim, rank, 3, 3),  # 3x3 up kernel — unsupported
+            )
+            adapter = mla.load_adapter(_save_sd(tmp, "conv.safetensors", sd), 1.0)
+            base_sd = {"conv.weight": torch.zeros(out_dim, in_dim, 1, 1)}
+            with self.assertRaisesRegex(ValueError, r"unsupported Conv2d LoRA up kernel"):
+                mla.resolve_fold_plan([adapter], base_sd)
+
+    def test_resolve_accepts_conv2d_with_matching_4d_base(self) -> None:
+        # 1x1 Conv2d LoRA: down=(rank, in_dim, 1, 1), up=(out_dim, rank, 1, 1) →
+        # delta=(out_dim, in_dim, 1, 1). Base tensor of matching 4D shape must resolve.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rank, in_dim, out_dim = 2, 3, 2
+            sd = _lora_sd(
+                name="lora_unet_conv",
+                rank=rank,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                down=torch.zeros(rank, in_dim, 1, 1),
+                up=torch.zeros(out_dim, rank, 1, 1),
+            )
+            adapter = mla.load_adapter(_save_sd(tmp, "conv.safetensors", sd), 1.0)
+            base_sd = {"conv.weight": torch.zeros(out_dim, in_dim, 1, 1)}
+            plan = mla.resolve_fold_plan([adapter], base_sd)
+            self.assertEqual(plan["lora_unet_conv"].base_shape, (2, 3, 1, 1))
+
 if __name__ == "__main__":
     unittest.main()
