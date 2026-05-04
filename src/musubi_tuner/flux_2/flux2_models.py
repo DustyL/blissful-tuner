@@ -773,7 +773,8 @@ class Modulation(nn.Module):
     def forward(self, vec: torch.Tensor):
         org_dtype = vec.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        out = self.lin(nn.functional.silu(vec))
+        # cast back to weight dtype so the matmul has matching dtypes (bf16 weight + fp32 input fails)
+        out = self.lin(nn.functional.silu(vec).to(self.lin.weight.dtype))
         if out.ndim == 2:
             out = out[:, None, :]
         out = out.to(org_dtype)
@@ -791,14 +792,17 @@ class LastLayer(nn.Module):
     def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
         org_dtype = x.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        mod = self.adaLN_modulation(vec)
+        # adaLN_modulation = Sequential(SiLU, Linear); cast to the Linear's weight dtype before the matmul
+        adaln_linear = self.adaLN_modulation[1]
+        mod = self.adaLN_modulation[0](vec).to(adaln_linear.weight.dtype)
+        mod = adaln_linear(mod)
         shift, scale = mod.chunk(2, dim=-1)
         if shift.ndim == 2:
             shift = shift[:, None, :]
             scale = scale[:, None, :]
         x = x.to(torch.float32)  # for numerical stability
         x = (1 + scale) * self.norm_final(x) + shift
-        x = self.linear(x)
+        x = self.linear(x.to(self.linear.weight.dtype))
         return x.to(org_dtype)
 
 
