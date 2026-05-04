@@ -255,6 +255,45 @@ def parse_args() -> argparse.Namespace:
 
     validate_lycoris_arg(args)
 
+    # Phase 1 hotswap rejections (see docs/plans/2026-05-04-peft-tier1c-zimage-qwenimage-hotswap.md):
+    # --prepare_for_hotswap is incompatible with --prefer_lycoris (separate merge bridge),
+    # with --fp8_scaled (registers per-layer scale_weight buffers that hotswap would not refresh),
+    # with raw --fp8 (standard Qwen-Image path merges in bf16 BEFORE casting; a later hotswap into
+    # already-fp8 params would discard precision and not be parity-shaped),
+    # with --save_merged_model (one-shot offline workflow, not live sweep),
+    # and with --latent_path (decode-only mode does not load the DiT).
+    if getattr(args, "prepare_for_hotswap", False):
+        if args.prefer_lycoris:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --prefer_lycoris in Qwen-Image Phase 1. "
+                "LyCORIS uses its own merge path; omit --prepare_for_hotswap to use the standard merge."
+            )
+        if args.fp8_scaled:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --fp8_scaled in Qwen-Image Phase 1. "
+                "FP8-scaled optimization registers per-layer scale_weight buffers that the hotswap "
+                "path would not refresh, producing silently wrong outputs. "
+                "Omit --prepare_for_hotswap to use the standard merge path with FP8."
+            )
+        if args.fp8:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --fp8 in Qwen-Image Phase 1. "
+                "The standard Qwen-Image path merges LoRA in bf16 then casts to fp8; hotswap into "
+                "already-fp8 params would not be bit-equivalent and would discard base precision before merge. "
+                "Omit --prepare_for_hotswap to use the standard merge path with FP8."
+            )
+        if args.save_merged_model:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --save_merged_model. "
+                "Hotswap is for live inference sweeps; saving the merged model is a one-shot operation."
+            )
+        if args.latent_path is not None and len(args.latent_path) > 0:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --latent_path. "
+                "Latent-only decode mode does not load the DiT, so hotswap state cannot be prepared. "
+                "Omit --prepare_for_hotswap when decoding pre-computed latents."
+            )
+
     return args
 
 
@@ -426,6 +465,56 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
 # region DiT model
 
 
+def prepare_qwen_image_hotswap_state(
+    model: "qwen_image_model.QwenImageTransformer2DModel", args: argparse.Namespace
+) -> Optional[Any]:
+    """Capture un-merged base for compile-friendly LoRA hotswap.
+
+    MUST be called immediately after the Qwen-Image model load returns and BEFORE
+    the initial LoRA merge, so the cached base never contains a LoRA delta.
+
+    Always sets `model.hotswap_state` (None when off, state when on) so
+    downstream code can rely on `getattr(model, "hotswap_state", None)`.
+    """
+    model.hotswap_state = None
+    if not getattr(args, "prepare_for_hotswap", False):
+        return None
+
+    from musubi_tuner.utils.lora_utils import prepare_for_hotswap as _prepare_for_hotswap
+
+    state = _prepare_for_hotswap(
+        model,
+        dit_paths=[args.dit],
+        base_weights_paths=None,
+        base_weights_multipliers=None,
+        cache_in_ram=args.cache_unmerged_base,
+        strict_base_hash=args.hotswap_strict_base_hash,
+    )
+    model.hotswap_state = state
+    return state
+
+
+def note_qwen_image_initial_loras(model: "qwen_image_model.QwenImageTransformer2DModel", args: argparse.Namespace) -> None:
+    """Record the initial active LoRA set on the hotswap state.
+
+    No-op when hotswap is off. When on, records the LoRAs just merged via the
+    standard post-load path so a later hotswap_lora() knows what's currently
+    applied. Mirrors WAN convention of padding multipliers to 1.0.
+    """
+    if not getattr(args, "prepare_for_hotswap", False):
+        return
+    state = getattr(model, "hotswap_state", None)
+    if state is None:
+        raise RuntimeError("Qwen-Image hotswap_state missing after prepare; call prepare_qwen_image_hotswap_state first")
+    lora_paths = list(args.lora_weight or [])
+    multipliers = list(args.lora_multiplier or [])
+    if len(multipliers) < len(lora_paths):
+        multipliers = multipliers + [1.0] * (len(lora_paths) - len(multipliers))
+    multipliers = multipliers[: len(lora_paths)]
+    state.active_lora_paths = lora_paths
+    state.active_lora_multipliers = multipliers
+
+
 def load_dit_model(
     args: argparse.Namespace, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None
 ) -> qwen_image_model.QwenImageTransformer2DModel:
@@ -441,12 +530,19 @@ def load_dit_model(
     """
     # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
 
+    prepare_for_hotswap = getattr(args, "prepare_for_hotswap", False)
+
     loading_device = "cpu"
     if args.blocks_to_swap == 0 and not args.prefer_lycoris:
         loading_device = device
 
-    # load LoRA weights
-    if not args.prefer_lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
+    # Hotswap suppresses LoRA preload; we apply the initial LoRA via the post-load merge path
+    # AFTER the un-merged base is captured. Same pattern as WAN/FLUX.2/Z-Image hotswap.
+    # See docs/plans/2026-05-04-peft-tier1c-zimage-qwenimage-hotswap.md.
+    if prepare_for_hotswap:
+        lora_weights_list = None
+    elif not args.prefer_lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
+        # load LoRA weights
         lora_weights_list = []
         for i, lora_weight in enumerate(args.lora_weight):
             logger.info(f"Loading LoRA weight from: {lora_weight}")
@@ -484,6 +580,31 @@ def load_dit_model(
         num_layers=args.num_layers,
         disable_numpy_memmap=args.disable_numpy_memmap,
     )
+
+    # ===== HOTSWAP: capture un-merged base BEFORE the initial LoRA merge =====
+    # Always sets model.hotswap_state (None or state). When hotswap is on, the LoRA
+    # preload above was suppressed; we now apply the initial active LoRA set via the
+    # standard post-load merge path with standard_lora_only=True. This preserves the
+    # no-accumulation invariant — the cached base reflects the permanent base only.
+    # Single insertion point covers all 5 Qwen-Image variants (original / edit /
+    # edit-2509 / edit-2511 / layered) since they share QwenImageTransformerBlock.
+    prepare_qwen_image_hotswap_state(model, args)
+
+    if prepare_for_hotswap and args.lora_weight is not None and len(args.lora_weight) > 0:
+        merge_lora_weights(
+            lora_qwen_image,
+            model,
+            args.lora_weight,
+            args.lora_multiplier,
+            args.include_patterns,
+            args.exclude_patterns,
+            device,
+            lycoris=False,
+            save_merged_model=None,
+            standard_lora_only=True,
+        )
+        note_qwen_image_initial_loras(model, args)
+    # ===== END HOTSWAP =====
 
     # merge LoRA weights
     if args.prefer_lycoris:
