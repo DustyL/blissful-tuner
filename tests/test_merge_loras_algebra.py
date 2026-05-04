@@ -162,6 +162,56 @@ class TestMethodValidation(unittest.TestCase):
 
         self.assertEqual(config.method, "linear")
 
+    def test_linear_rejects_irrelevant_method_args(self) -> None:
+        for flag, value in (("--density", "2.0"), ("--drop_prob", "0.5"), ("--seed", "123")):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, f"{flag} is not used"):
+                _config("--method", "linear", "--input", "a.safetensors", "1.0", flag, value, "--preview_spectrum")
+
+    def test_ties_rejects_irrelevant_dare_args(self) -> None:
+        for flag, value in (("--drop_prob", "0.5"), ("--seed", "123")):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, f"{flag} is not used"):
+                _config(
+                    "--method", "ties", "--input", "a.safetensors", "1.0", "--density", "0.5", flag, value, "--preview_spectrum"
+                )
+
+    def test_dare_linear_rejects_irrelevant_density(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--density is not used"):
+            _config(
+                "--method",
+                "dare_linear",
+                "--input",
+                "a.safetensors",
+                "1.0",
+                "--density",
+                "2.0",
+                "--drop_prob",
+                "0.5",
+                "--seed",
+                "123",
+                "--preview_spectrum",
+            )
+
+    def test_dare_ties_accepts_all_method_args(self) -> None:
+        config = _config(
+            "--method",
+            "dare_ties",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--density",
+            "0.5",
+            "--drop_prob",
+            "0.5",
+            "--seed",
+            "123",
+            "--preview_spectrum",
+        )
+
+        self.assertEqual(config.method, "dare_ties")
+        self.assertEqual(config.density, 0.5)
+        self.assertEqual(config.drop_prob, 0.5)
+        self.assertEqual(config.seed, 123)
+
     def test_output_requires_output_rank_but_preview_does_not(self) -> None:
         with self.assertRaisesRegex(ValueError, "--output_rank"):
             _config("--method", "linear", "--input", "a.safetensors", "1.0", "--output", "out.safetensors")
@@ -500,6 +550,23 @@ class TestAllZeroModuleSkip(unittest.TestCase):
 
         self.assertEqual(merged, {})
         self.assertIn("Warning: all merged modules were exact-zero", buf.getvalue())
+
+
+class TestNonFiniteMergedDelta(unittest.TestCase):
+    def test_non_finite_delta_cli_error_has_no_traceback(self) -> None:
+        bad_sd = _lora_sd(down=torch.tensor([[float("nan"), 0.0, 0.0], [0.0, 1.0, 0.0]]), up=torch.eye(2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = _save_sd(tmp, "nan_lora.safetensors", bad_sd)
+            out = tmp / "out.safetensors"
+
+            with self.assertRaises(SystemExit) as cm:
+                mla.main(["--method", "linear", "--input", source, "1.0", "--output", str(out), "--output_rank", "2"])
+
+        message = str(cm.exception)
+        self.assertIn("Non-finite merged delta", message)
+        self.assertIn("lora_unet_block", message)
+        self.assertNotIn("Traceback", message)
 
 
 class TestRsLoRAInputStandardOutput(unittest.TestCase):

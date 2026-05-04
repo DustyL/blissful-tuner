@@ -371,5 +371,88 @@ class TestQwenImageLoadDitModelLifecycleOrdering(unittest.TestCase):
         self.assertLess(merge_idx, note_idx)
 
 
+class TestQwenImageLoadDitModelMockedIntegration(unittest.TestCase):
+    """Execute the hotswap load branch with the heavy model loader mocked out."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tdpath = Path(self.tmpdir.name)
+        self.dit_path = _save_tiny_dit(self.tdpath)
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def _args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            prepare_for_hotswap=True,
+            cache_unmerged_base=False,
+            hotswap_strict_base_hash=True,
+            dit=self.dit_path,
+            blocks_to_swap=0,
+            prefer_lycoris=False,
+            lora_weight=["initial.safetensors"],
+            lora_multiplier=[0.25],
+            include_patterns=None,
+            exclude_patterns=None,
+            fp8_scaled=False,
+            fp8=False,
+            save_merged_model=None,
+            disable_numpy_memmap=False,
+            attn_mode="torch",
+            model_version="original",
+            is_layered=False,
+            num_layers=1,
+            use_pinned_memory_for_block_swap=False,
+            compile=False,
+            disable_linear_for_compile=False,
+        )
+
+    def test_load_branch_suppresses_preload_then_captures_merges_and_notes(self) -> None:
+        import musubi_tuner.qwen_image_generate_image as mod
+
+        args = self._args()
+        device = torch.device("cpu")
+        model = _TinyQwenImageStub()
+        events: list[str] = []
+        original_prepare = mod.prepare_qwen_image_hotswap_state
+        original_note = mod.note_qwen_image_initial_loras
+
+        def load_spy(*_args, **kwargs):
+            events.append("load")
+            self.assertIsNone(kwargs["lora_weights_list"])
+            return model
+
+        def prepare_spy(loaded_model, loaded_args):
+            events.append("capture")
+            self.assertIs(loaded_model, model)
+            return original_prepare(loaded_model, loaded_args)
+
+        def merge_spy(*merge_args, **kwargs):
+            events.append("merge")
+            self.assertIs(merge_args[1], model)
+            self.assertIsNotNone(model.hotswap_state)
+            self.assertEqual(merge_args[2], ["initial.safetensors"])
+            self.assertEqual(merge_args[3], [0.25])
+            self.assertTrue(kwargs["standard_lora_only"])
+
+        def note_spy(loaded_model, loaded_args):
+            events.append("note")
+            return original_note(loaded_model, loaded_args)
+
+        with (
+            patch.object(mod.qwen_image_model, "load_qwen_image_model", side_effect=load_spy),
+            patch.object(mod, "prepare_qwen_image_hotswap_state", side_effect=prepare_spy),
+            patch.object(mod, "merge_lora_weights", side_effect=merge_spy),
+            patch.object(mod, "note_qwen_image_initial_loras", side_effect=note_spy),
+            patch.object(mod, "clean_memory_on_device"),
+        ):
+            result = mod.load_dit_model(args, device, torch.float32)
+
+        self.assertIs(result, model)
+        self.assertEqual(events, ["load", "capture", "merge", "note"])
+        self.assertEqual(model.hotswap_state.active_lora_paths, ["initial.safetensors"])
+        self.assertEqual(model.hotswap_state.active_lora_multipliers, [0.25])
+
+
 if __name__ == "__main__":
     unittest.main()

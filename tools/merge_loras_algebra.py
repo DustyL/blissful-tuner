@@ -155,6 +155,16 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
 
     if args.method in {"ties", "dare_ties"} and args.density is None:
         raise ValueError(f"--density is required for --method {args.method}.")
+    if args.method == "linear":
+        for flag_name, value in (("--density", args.density), ("--drop_prob", args.drop_prob), ("--seed", args.seed)):
+            if value is not None:
+                raise ValueError(f"{flag_name} is not used with --method linear.")
+    if args.method == "ties":
+        for flag_name, value in (("--drop_prob", args.drop_prob), ("--seed", args.seed)):
+            if value is not None:
+                raise ValueError(f"{flag_name} is not used with --method ties.")
+    if args.method == "dare_linear" and args.density is not None:
+        raise ValueError("--density is not used with --method dare_linear.")
     if args.density is not None and not (0.0 <= args.density <= 1.0):
         raise ValueError("--density must be in [0, 1].")
     if args.method in {"dare_linear", "dare_ties"}:
@@ -645,6 +655,9 @@ def merge_adapters(
             else None,
         )
         modules_processed += 1
+        if not torch.isfinite(merged_delta).all():
+            del deltas, merged_delta, delta
+            raise ValueError(f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args.")
         if torch.count_nonzero(merged_delta).item() == 0:
             del deltas, merged_delta, delta
             continue
