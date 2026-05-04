@@ -4,6 +4,7 @@
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
 import ast
+import json
 import math
 import os
 import re
@@ -20,6 +21,8 @@ else:
     CLIPTextModel = Any
 
 logger = BlissfulLogger(__name__, "green")
+
+RANK_PATTERN_MATCH_SEMANTICS = "original_name_fullmatch_first_match"
 
 
 def parse_bool_arg(value, default: bool = False) -> bool:
@@ -58,6 +61,54 @@ def parse_init_lora_weights_arg(value: Any = None) -> str:
         if normalized in ("kaiming", "orthogonal"):
             return normalized
     raise ValueError(f"init_lora_weights must be one of 'kaiming', 'orthogonal', or 'true' (alias for kaiming), got {value!r}")
+
+
+def parse_rank_or_alpha_pattern_arg(value: Any = None, kind: str = "rank_pattern") -> Optional[Dict[re.Pattern, Union[int, float]]]:
+    if kind not in ("rank_pattern", "alpha_pattern"):
+        raise ValueError(f"kind must be 'rank_pattern' or 'alpha_pattern', got {kind!r}")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"{kind} must be a JSON or Python dict literal, got {value!r}: {e}") from e
+    if not isinstance(value, dict):
+        raise ValueError(f"{kind} must parse to a dict, got {type(value).__name__}")
+
+    parsed = {}
+    for raw_pattern, raw_val in value.items():
+        if not isinstance(raw_pattern, str):
+            raise ValueError(f"{kind} keys must be regex strings, got {raw_pattern!r}")
+        try:
+            compiled = re.compile(raw_pattern)
+        except re.error as e:
+            raise ValueError(f"{kind} regex {raw_pattern!r} did not compile: {e}") from e
+
+        if kind == "rank_pattern":
+            if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val <= 0:
+                raise ValueError(f"{kind} value for {raw_pattern!r} must be a positive int, got {raw_val!r}")
+        else:
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)) or raw_val <= 0:
+                raise ValueError(f"{kind} value for {raw_pattern!r} must be a positive number, got {raw_val!r}")
+        parsed[compiled] = raw_val
+    return parsed
+
+
+def _match_pattern_value(
+    patterns: Optional[Dict[re.Pattern, Union[int, float]]],
+    original_name: str,
+) -> tuple[Optional[Union[int, float]], Optional[str]]:
+    if not patterns:
+        return None, None
+    for pattern, value in patterns.items():
+        if pattern.fullmatch(original_name):
+            return value, pattern.pattern
+    return None, None
+
+
+def _pattern_metadata_json(patterns: Dict[re.Pattern, Union[int, float]]) -> str:
+    return json.dumps({pattern.pattern: value for pattern, value in patterns.items()})
 
 
 def _init_kaiming_lora_pair(lora_down: torch.nn.Module, lora_up: torch.nn.Module) -> None:
@@ -693,7 +744,8 @@ def create_network(
         else:
             conv_alpha = float(conv_alpha)
 
-    # TODO generic rank/dim setting with regular expression
+    rank_pattern = parse_rank_or_alpha_pattern_arg(kwargs.get("rank_pattern", None), "rank_pattern")
+    alpha_pattern = parse_rank_or_alpha_pattern_arg(kwargs.get("alpha_pattern", None), "alpha_pattern")
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -734,6 +786,10 @@ def create_network(
             f"init_lora_weights={init_lora_weights!r} is only supported by standard LoRA modules, "
             f"got module_class={module_class.__name__}."
         )
+    if (rank_pattern or alpha_pattern) and not issubclass(module_class, LoRAModule):
+        raise ValueError(
+            f"rank_pattern and alpha_pattern are only supported by standard LoRA modules, got module_class={module_class.__name__}."
+        )
     module_kwargs = kwargs.pop("module_kwargs", None)
     if isinstance(module_kwargs, str):
         module_kwargs = ast.literal_eval(module_kwargs)
@@ -764,6 +820,8 @@ def create_network(
         use_dora=use_dora,
         init_lora_weights=init_lora_weights,
         enable_conv2d=enable_conv2d,
+        rank_pattern=rank_pattern,
+        alpha_pattern=alpha_pattern,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -806,6 +864,8 @@ class LoRANetwork(torch.nn.Module):
         use_dora: bool = False,
         init_lora_weights: str = "kaiming",
         enable_conv2d: bool = True,
+        rank_pattern: Optional[Dict[re.Pattern, Union[int, float]]] = None,
+        alpha_pattern: Optional[Dict[re.Pattern, Union[int, float]]] = None,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -822,6 +882,8 @@ class LoRANetwork(torch.nn.Module):
         self.module_kwargs = module_kwargs or {}
         self.enable_conv2d = enable_conv2d
         self.init_lora_weights = parse_init_lora_weights_arg(init_lora_weights)
+        self.rank_pattern = rank_pattern or {}
+        self.alpha_pattern = alpha_pattern or {}
         self._persist_init_lora_weights_metadata = issubclass(module_class, LoRAModule) and modules_dim is None
 
         # RS-LoRA and DoRA flags with network-level buffers for auto-detection
@@ -937,11 +999,35 @@ class LoRANetwork(torch.nn.Module):
                                     dim = self.conv_lora_dim
                                     alpha = self.conv_alpha
 
+                                rank_override, rank_pattern_str = _match_pattern_value(self.rank_pattern, original_name)
+                                alpha_override, alpha_pattern_str = _match_pattern_value(self.alpha_pattern, original_name)
+                                if rank_override is not None:
+                                    dim = rank_override
+                                    if alpha is None:
+                                        alpha = self.alpha
+                                if alpha_override is not None and dim is not None:
+                                    alpha = alpha_override
+
                             if dim is None or dim == 0:
                                 # skipした情報を出力
                                 if is_linear or is_conv2d_1x1 or (self.conv_lora_dim is not None):
                                     skipped.append(lora_name)
                                 continue
+
+                            if self.init_lora_weights == "orthogonal" and dim % 2 != 0:
+                                if modules_dim is not None:
+                                    source = "loaded weights"
+                                elif rank_pattern_str is not None:
+                                    source = f"rank_pattern {rank_pattern_str!r}"
+                                elif alpha_pattern_str is not None:
+                                    source = f"alpha_pattern {alpha_pattern_str!r} with default rank"
+                                else:
+                                    source = "default network_dim/conv_dim"
+                                raise ValueError(
+                                    f"Module {original_name!r} resolved to rank {dim} via {source}, "
+                                    "but init_lora_weights='orthogonal' requires even rank. "
+                                    "Adjust the matching pattern or use init_lora_weights=kaiming."
+                                )
 
                             lora = module_class(
                                 lora_name,
@@ -1299,6 +1385,12 @@ class LoRANetwork(torch.nn.Module):
                 metadata = {}
             if self._persist_init_lora_weights_metadata:
                 metadata.setdefault("ss_init_lora_weights", self.init_lora_weights)
+                if self.rank_pattern:
+                    metadata["ss_rank_pattern"] = _pattern_metadata_json(self.rank_pattern)
+                if self.alpha_pattern:
+                    metadata["ss_alpha_pattern"] = _pattern_metadata_json(self.alpha_pattern)
+                if self.rank_pattern or self.alpha_pattern:
+                    metadata["ss_rank_pattern_match_semantics"] = RANK_PATTERN_MATCH_SEMANTICS
             model_hash, legacy_hash = model_utils.precalculate_safetensors_hashes(state_dict, metadata)
             metadata["sshs_model_hash"] = model_hash
             metadata["sshs_legacy_hash"] = legacy_hash

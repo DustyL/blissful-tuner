@@ -31,14 +31,15 @@ network_args = ["use_rslora=True", "use_dora=True", "loraplus_lr_ratio=8"]
 1. [RS-LoRA](#rs-lora-use_rslora)
 2. [DoRA](#dora-use_dora)
 3. [LoRA Init](#lora-init-init_lora_weights)
-4. [LoRA+](#lora-loraplus_lr_ratio)
-5. [Dropout Options](#dropout-options)
-6. [Conv-Specific Settings](#conv-specific-settings)
-7. [Module Selection Patterns](#module-selection-patterns)
-8. [Architecture-Specific Options](#architecture-specific-options)
-9. [Utility Options](#utility-options)
-10. [Quick Reference Table](#quick-reference-table)
-11. [Known-Good Combinations](#known-good-combinations)
+4. [Rank / Alpha Patterns](#rank--alpha-patterns-rank_pattern--alpha_pattern)
+5. [LoRA+](#lora-loraplus_lr_ratio)
+6. [Dropout Options](#dropout-options)
+7. [Conv-Specific Settings](#conv-specific-settings)
+8. [Module Selection Patterns](#module-selection-patterns)
+9. [Architecture-Specific Options](#architecture-specific-options)
+10. [Utility Options](#utility-options)
+11. [Quick Reference Table](#quick-reference-table)
+12. [Known-Good Combinations](#known-good-combinations)
 
 ---
 
@@ -175,6 +176,53 @@ Selects the initialization scheme for standard LoRA `lora_down` / `lora_up` weig
 
 ```toml
 network_args = ["init_lora_weights=orthogonal"]
+```
+
+---
+
+## Rank / Alpha Patterns (`rank_pattern` / `alpha_pattern`)
+
+**Options:**
+- `rank_pattern=<dict[str, int]>` (default: unset)
+- `alpha_pattern=<dict[str, int|float]>` (default: unset)
+
+### What they do
+
+Override LoRA rank and alpha per target module at fresh network creation time. Patterns are regexes matched with `re.fullmatch()` against the module's dotted `original_name`, for example `block.attn.to_q`, `double_blocks.0.img_attn.qkv`, or `single_blocks.12.linear1`.
+
+| Option | Effect |
+|--------|--------|
+| `rank_pattern` | Overrides `network_dim` for matching modules |
+| `alpha_pattern` | Overrides `network_alpha` for matching modules that receive LoRA |
+
+Non-matching modules continue to use `network_dim` / `network_alpha`. If multiple patterns match the same module, the first pattern in the dict wins. Python preserves dict insertion order, so put more specific rules before broader fallback rules when you want them to win.
+
+### Technical notes / gotchas
+
+| Topic | Detail |
+|-------|--------|
+| **Fresh creation only** | Patterns are used when creating a new LoRA. When loading existing weights, the ranks and alphas in the state dict are authoritative. |
+| **Regex target** | Match against dotted `original_name`, not saved LoRA key names. Use `.*attn\.to_q` rather than `lora_unet_block_attn_to_q`. |
+| **Match semantics** | `re.fullmatch()` + first-match-wins. Metadata records `ss_rank_pattern_match_semantics=original_name_fullmatch_first_match` for forward compatibility. |
+| **Input format** | Both JSON-style dict strings and Python literal dict strings are accepted. Values must be positive; ranks must be integers. |
+| **Conv2d targets** | `rank_pattern` can target Conv2d modules. There is no separate `conv_rank_pattern` / `conv_alpha_pattern` in this phase. |
+| **Orthogonal init** | With `init_lora_weights=orthogonal`, each resolved rank must be even. Errors name the module and matching pattern. |
+| **Scope** | Pattern overrides are standard-LoRA-only. They are rejected for LoHa/LoKr/LyCORIS module classes. |
+| **Saved weights** | Safetensors metadata records compact JSON strings in `ss_rank_pattern` and `ss_alpha_pattern` when used. |
+
+### Examples
+
+```toml
+# Higher rank on early double blocks, lower rank elsewhere
+network_args = [
+  "rank_pattern={'.*double_blocks\\.[0-7]\\..*': 32, '.*single_blocks\\..*': 16}",
+  "alpha_pattern={'.*double_blocks\\.[0-7]\\..*': 32, '.*single_blocks\\..*': 16}",
+]
+```
+
+```toml
+# Fullmatch means this targets any dotted name ending in attn.to_q
+network_args = ["rank_pattern={'.*attn\\.to_q': 16}"]
 ```
 
 ---
@@ -374,6 +422,8 @@ network_args = ["verbose=True"]
 | `use_rslora` | bool | `False` | RS-LoRA scaling (`alpha/sqrt(r)`) |
 | `use_dora` | bool | `False` | DoRA magnitude decomposition (Linear only) |
 | `init_lora_weights` | str | `kaiming` | LoRA init scheme: `kaiming`, `orthogonal`, or `true` alias |
+| `rank_pattern` | dict | None | Per-module rank overrides matched with `re.fullmatch()` on dotted module names |
+| `alpha_pattern` | dict | None | Per-module alpha overrides using the same matching semantics as `rank_pattern` |
 | `loraplus_lr_ratio` | float | None | LoRA-B learning rate multiplier |
 | `rank_dropout` | float | None | Dropout on rank dimension (disables DoRA) |
 | `module_dropout` | float | None | Dropout on entire module (DoRA OK) |
@@ -418,6 +468,15 @@ network_args = ["init_lora_weights=orthogonal", "use_rslora=True"]
 ```
 Best for: Higher-rank standard LoRA training where you want nonzero initial LoRA-A and LoRA-B while preserving zero initial delta.
 
+### Per-layer rank shaping
+```toml
+network_args = [
+  "rank_pattern={'.*double_blocks\\.[0-7]\\..*': 32, '.*single_blocks\\..*': 16}",
+  "alpha_pattern={'.*double_blocks\\.[0-7]\\..*': 32, '.*single_blocks\\..*': 16}",
+]
+```
+Best for: Allocating more capacity to selected block ranges while keeping the global `network_dim` as a fallback.
+
 ### Full combo (RS-LoRA + DoRA + LoRA+)
 ```toml
 network_args = ["use_rslora=True", "use_dora=True", "loraplus_lr_ratio=8"]
@@ -458,10 +517,16 @@ Best for: Training only double blocks (or vice versa).
 | `DoRA disabled for X modules` (info) | Conv layers, dropout, or split_dims | Expected behavior; those modules use standard LoRA |
 | `Orthogonal LoRA init requires even rank` | `init_lora_weights=orthogonal` with an odd Linear rank | Use an even `network_dim` or set `init_lora_weights=kaiming` |
 | `Conv2d LoRA modules fell back to kaiming init` | Conv2d targets cannot use the Linear-only orthogonal algorithm | Expected behavior; Linear targets still use orthogonal init |
+| `rank_pattern regex ... did not compile` | Invalid regex in `rank_pattern` / `alpha_pattern` | Fix the regex string; patterns are compiled with Python `re` |
+| `rank_pattern value ... must be a positive int` | Rank override is zero, negative, bool, or non-integer | Use a positive integer rank |
+| `resolved to rank ... via rank_pattern ... orthogonal requires even rank` | Pattern selected an odd rank while using orthogonal init | Change that pattern to an even rank or use `init_lora_weights=kaiming` |
 
 ---
 
 ## Changelog
+
+### 2026-05-04
+- Added static `rank_pattern` / `alpha_pattern` per-module overrides with fullmatch/first-match semantics and safetensors metadata.
 
 ### 2026-05-03
 - Added orthogonal LoRA init (`init_lora_weights=orthogonal`) with `true` alias compatibility and metadata persistence.

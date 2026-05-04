@@ -289,7 +289,8 @@ def create_network(
         else:
             conv_alpha = float(conv_alpha)
 
-    # TODO generic rank/dim setting with regular expression
+    if kwargs.get("rank_pattern", None) is not None or kwargs.get("alpha_pattern", None) is not None:
+        raise ValueError("rank_pattern and alpha_pattern are only supported by standard LoRA modules, got network module LoHa.")
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
