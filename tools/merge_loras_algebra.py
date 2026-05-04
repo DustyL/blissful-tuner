@@ -19,6 +19,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Callable, Iterable
 
 import torch
@@ -93,6 +94,19 @@ class MergeResult:
     spectrum_energy: dict[int, list[float]]
     per_module_energy: dict[str, dict[int, float]]
 
+@dataclass
+class MergedModuleDelta:
+    """One module's merged delta in materialized-delta space (float32, CPU).
+
+    Yielded by ``iter_merged_module_deltas`` for every module that has at least
+    one contributing adapter. ``was_pruned=True`` indicates the merged delta is
+    at or below ``--prune_threshold`` — still counted in ``modules_processed``
+    accounting, but downstream consumers (SVD output, fold mode) must skip it.
+    """
+
+    module_name: str
+    merged_delta: torch.Tensor
+    was_pruned: bool = False
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -636,20 +650,24 @@ def _module_union(adapters: list[AdapterInfo]) -> list[str]:
     return sorted({name for adapter in adapters for name in adapter.modules})
 
 
-def merge_adapters(
+def iter_merged_module_deltas(
     config: MergeConfig,
-    adapters: list[AdapterInfo] | None = None,
+    adapters: list[AdapterInfo],
     *,
     module_callback: Callable[[str], None] | None = None,
-) -> MergeResult:
-    adapters = load_adapters(config.inputs) if adapters is None else adapters
-    _validate_module_shapes_and_output_rank(config, adapters)
-    output_sd: dict[str, torch.Tensor] = {}
-    spectrum_energy = {rank: [] for rank in SPECTRUM_RANKS}
-    per_module_energy: dict[str, dict[int, float]] = {}
+) -> Iterator[MergedModuleDelta]:
+    """Yield merged-delta results per module in module-union order.
 
-    modules_written = 0
-    modules_processed = 0
+    For each module that has at least one contributing adapter, yields a
+    :class:`MergedModuleDelta` carrying the materialized merged delta in float32
+    on CPU. Modules below ``--prune_threshold`` are still yielded (with
+    ``was_pruned=True``) so callers can preserve v1 ``modules_processed``
+    accounting; consumers (SVD output, fold mode) must skip pruned items
+    themselves. Modules with no contributing adapters are skipped entirely.
+
+    Raises ``ValueError`` if any module produces a non-finite merged delta or a
+    shape mismatch across adapters.
+    """
     for module_name in _module_union(adapters):
         if module_callback is not None:
             module_callback(module_name)
@@ -689,18 +707,42 @@ def merge_adapters(
             if config.seed is not None
             else None,
         )
-        modules_processed += 1
         if not torch.isfinite(merged_delta).all():
-            del deltas, merged_delta, delta
-            raise ValueError(f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args.")
+            raise ValueError(
+                f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args."
+            )
         # At default --prune_threshold 0.0, this is byte-equivalent to the v1
         # exact-zero check (since |x| <= 0 requires x == 0). Larger thresholds
         # skip near-zero modules — see Tier 2 #5 v1.5 #1 in the plan doc.
-        if merged_delta.abs().max().item() <= config.prune_threshold:
-            del deltas, merged_delta, delta
+        was_pruned = merged_delta.abs().max().item() <= config.prune_threshold
+        yield MergedModuleDelta(module_name=module_name, merged_delta=merged_delta, was_pruned=was_pruned)
+        # Drop generator-local references so the previous iteration's per-adapter deltas
+        # are freed before the next module's module_callback fires. The yielded
+        # MergedModuleDelta still holds merged_delta via the consumer; the consumer's
+        # next loop step releases it. See test_weakref_probe_confirms_previous_module_deltas_are_released.
+        del deltas, delta, merged_delta
+
+def merge_adapters(
+    config: MergeConfig,
+    adapters: list[AdapterInfo] | None = None,
+    *,
+    module_callback: Callable[[str], None] | None = None,
+) -> MergeResult:
+    adapters = load_adapters(config.inputs) if adapters is None else adapters
+    _validate_module_shapes_and_output_rank(config, adapters)
+    output_sd: dict[str, torch.Tensor] = {}
+    spectrum_energy: dict[int, list[float]] = {rank: [] for rank in SPECTRUM_RANKS}
+    per_module_energy: dict[str, dict[int, float]] = {}
+
+    modules_written = 0
+    modules_processed = 0
+    for item in iter_merged_module_deltas(config, adapters, module_callback=module_callback):
+        modules_processed += 1
+        if item.was_pruned:
             continue
-        energy = _singular_energy(merged_delta)
-        per_module_energy[module_name] = energy
+
+        energy = _singular_energy(item.merged_delta)
+        per_module_energy[item.module_name] = energy
         for rank, value in energy.items():
             spectrum_energy[rank].append(value)
 
@@ -709,8 +751,8 @@ def merge_adapters(
             assert config.output_alpha is not None
             output_sd.update(
                 svd_recompress_delta(
-                    merged_delta,
-                    module_name,
+                    item.merged_delta,
+                    item.module_name,
                     config.output_rank,
                     config.output_alpha,
                     config.output_dtype,
@@ -718,7 +760,6 @@ def merge_adapters(
                 )
             )
             modules_written += 1
-        del deltas, merged_delta, delta
 
     # rsLoRA output: write the global use_rslora_flag tensor only when at least one module
     # was actually written. Empty/all-pruned outputs would otherwise contain just a lone
@@ -735,7 +776,6 @@ def merge_adapters(
         spectrum_energy=spectrum_energy,
         per_module_energy=per_module_energy,
     )
-
 
 def _format_percent(value: float) -> str:
     return f"{100.0 * value:5.1f}%"
