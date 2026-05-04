@@ -295,6 +295,45 @@ def parse_args() -> argparse.Namespace:
 
     validate_lycoris_arg(args)
 
+    # Phase 1 hotswap rejections (see docs/plans/2026-05-04-peft-tier1b-flux2-hotswap.md):
+    # --prepare_for_hotswap is incompatible with --prefer_lycoris (separate merge bridge),
+    # with --fp8_scaled (registers per-layer scale_weight buffers that hotswap would not
+    # refresh), with raw --fp8 (standard FLUX.2 path merges in bf16 BEFORE casting; a later
+    # hotswap into already-fp8 params would discard precision and not be parity-shaped),
+    # and with --save_merged_model (one-shot offline workflow, not live sweep).
+    # Reject at parse time, not at run time.
+    if getattr(args, "prepare_for_hotswap", False):
+        if args.prefer_lycoris:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --prefer_lycoris in FLUX.2 Phase 1. "
+                "LyCORIS uses its own merge path; omit --prepare_for_hotswap to use the standard merge."
+            )
+        if args.fp8_scaled:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --fp8_scaled in FLUX.2 Phase 1. "
+                "FP8-scaled optimization registers per-layer scale_weight buffers that the hotswap "
+                "path would not refresh, producing silently wrong outputs. "
+                "Omit --prepare_for_hotswap to use the standard merge path with FP8."
+            )
+        if args.fp8:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --fp8 in FLUX.2 Phase 1. "
+                "The standard FLUX.2 path merges LoRA in bf16 then casts to fp8; hotswap into "
+                "already-fp8 params would not be bit-equivalent and would discard base precision before merge. "
+                "Omit --prepare_for_hotswap to use the standard merge path with FP8."
+            )
+        if args.save_merged_model:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --save_merged_model. "
+                "Hotswap is for live inference sweeps; saving the merged model is a one-shot operation."
+            )
+        if args.latent_path is not None and len(args.latent_path) > 0:
+            raise ValueError(
+                "--prepare_for_hotswap is incompatible with --latent_path. "
+                "Latent-only decode mode does not load the DiT, so hotswap state cannot be prepared. "
+                "Omit --prepare_for_hotswap when decoding pre-computed latents."
+            )
+
     # Fill defaults and enforce fixed params per variant (e.g. Klein distilled fixed steps/guidance).
     apply_model_defaults_and_enforce_fixed_params(args)
 
@@ -473,6 +512,59 @@ def get_or_load_ae(
         device=device,
         disable_mmap=True,
     )
+
+
+def prepare_flux2_hotswap_state(model: flux2_models.Flux2, args: argparse.Namespace) -> Optional[Any]:
+    """Capture un-merged base for compile-friendly LoRA hotswap.
+
+    MUST be called immediately after `load_dit_model()` and BEFORE the
+    initial LoRA merge, so the cached base never contains a LoRA delta.
+
+    Always sets `model.hotswap_state` (to None or to the populated state),
+    so downstream code can `getattr(model, "hotswap_state", None)` without
+    branching on whether the attribute exists.
+    """
+    model.hotswap_state = None
+    if not getattr(args, "prepare_for_hotswap", False):
+        return None
+
+    from musubi_tuner.utils.lora_utils import prepare_for_hotswap as _prepare_for_hotswap
+
+    state = _prepare_for_hotswap(
+        model,
+        dit_paths=[args.dit],
+        base_weights_paths=None,  # FLUX.2 generation has no --base_weights equivalent
+        base_weights_multipliers=None,
+        cache_in_ram=args.cache_unmerged_base,
+        strict_base_hash=args.hotswap_strict_base_hash,
+    )
+    model.hotswap_state = state
+    return state
+
+
+def note_flux2_initial_loras(model: flux2_models.Flux2, args: argparse.Namespace) -> None:
+    """Record the initial active LoRA set on the hotswap state.
+
+    No-op when hotswap is off. When on, this records the LoRAs that were
+    just merged via the standard post-load path so a later call to
+    `hotswap_lora()` knows what's currently applied (informational only —
+    the hotswap reset path always restores from the cached/disk base).
+
+    Mirrors the WAN convention at wan_generate_video.py:825-831 of padding
+    multipliers to 1.0 to match the LoRA count.
+    """
+    if not getattr(args, "prepare_for_hotswap", False):
+        return
+    state = getattr(model, "hotswap_state", None)
+    if state is None:
+        raise RuntimeError("FLUX.2 hotswap_state missing after prepare; call prepare_flux2_hotswap_state first")
+    lora_paths = list(args.lora_weight or [])
+    multipliers = list(args.lora_multiplier or [])
+    if len(multipliers) < len(lora_paths):
+        multipliers = multipliers + [1.0] * (len(lora_paths) - len(multipliers))
+    multipliers = multipliers[: len(lora_paths)]
+    state.active_lora_paths = lora_paths
+    state.active_lora_multipliers = multipliers
 
 
 def optimize_model(model: flux2_models.Flux2, args: argparse.Namespace, device: torch.device) -> None:
@@ -766,6 +858,11 @@ def generate(
         # load DiT model
         model = load_dit_model(args, device)
 
+        # Hotswap: capture un-merged base BEFORE the initial LoRA merge so the cached
+        # base never accumulates a delta. Always sets model.hotswap_state (None or state).
+        # See docs/plans/2026-05-04-peft-tier1b-flux2-hotswap.md.
+        prepare_flux2_hotswap_state(model, args)
+
         # merge LoRA weights
         if args.lora_weight is not None and len(args.lora_weight) > 0:
             merge_lora_weights(
@@ -778,11 +875,15 @@ def generate(
                 device,
                 args.prefer_lycoris,
                 args.save_merged_model,
+                standard_lora_only=getattr(args, "prepare_for_hotswap", False),
             )
 
             # if we only want to save the model, we can skip the rest
             if args.save_merged_model:
                 return None, None
+
+            # Record initial active LoRA set on hotswap state (no-op when hotswap off).
+            note_flux2_initial_loras(model, args)
 
         # optimize model: fp8 conversion, block swap etc.
         optimize_model(model, args, device)
@@ -1103,6 +1204,11 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     first_prompt_args = all_prompt_args_list[0]
     dit_model = load_dit_model(first_prompt_args, device)  # Load directly to target device if possible
 
+    # Hotswap: capture un-merged base BEFORE the initial LoRA merge. Per Tier 1b plan
+    # decision 14, batch/from-file uses first_prompt_args because LoRA settings are
+    # already treated as batch-consistent for the shared DiT.
+    prepare_flux2_hotswap_state(dit_model, first_prompt_args)
+
     if first_prompt_args.lora_weight is not None and len(first_prompt_args.lora_weight) > 0:
         logger.info("Merging LoRA weights into DiT model...")
         merge_lora_weights(
@@ -1115,12 +1221,16 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
             device,
             first_prompt_args.prefer_lycoris,
             first_prompt_args.save_merged_model,
+            standard_lora_only=getattr(first_prompt_args, "prepare_for_hotswap", False),
         )
         if first_prompt_args.save_merged_model:
             logger.info("Merged DiT model saved. Skipping generation.")
             del dit_model
             clean_memory_on_device(device)
             return
+
+        # Record initial active LoRA set on hotswap state (no-op when hotswap off).
+        note_flux2_initial_loras(dit_model, first_prompt_args)
 
     logger.info("Optimizing DiT model...")
     optimize_model(dit_model, first_prompt_args, device)  # Handles device placement, fp8 etc.
