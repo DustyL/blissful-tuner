@@ -220,7 +220,10 @@ class TestHashValidation(unittest.TestCase):
         _check_lora_base_hash({"ss_base_sha256": "abc"}, "lora.st", "abc", strict=True)
 
     def test_missing_metadata_warns_only(self) -> None:
-        # Should not raise — back-compat for old checkpoints
+        # Should not raise — back-compat for old checkpoints. LOAD-BEARING for
+        # the entire fork's existing LoRAs; do NOT delete or rewrite this test
+        # without an explicit reason — the init_pissa=False default path must
+        # preserve this behavior exactly.
         _check_lora_base_hash(None, "lora.st", "abc", strict=True)
         _check_lora_base_hash({}, "lora.st", "abc", strict=True)
         _check_lora_base_hash({"other_key": "x"}, "lora.st", "abc", strict=True)
@@ -232,6 +235,115 @@ class TestHashValidation(unittest.TestCase):
     def test_mismatch_nonstrict_warns_only(self) -> None:
         # Should not raise
         _check_lora_base_hash({"ss_base_sha256": "wrong"}, "lora.st", "right", strict=False)
+
+
+class TestHashValidationPissa(unittest.TestCase):
+    """Pin the PiSSA-specific hash contract per the locked Tier 2 #6b Fork 4
+    truth table. init_pissa is keyword-only so every existing positional
+    caller stays on the back-compat path — TestHashValidation above remains
+    the canonical pin for non-PiSSA semantics; this class adds PiSSA rows
+    on top WITHOUT modifying the back-compat surface."""
+
+    def test_pissa_match_passes_silently(self) -> None:
+        _check_lora_base_hash(
+            {"ss_base_sha256": "abc", "ss_init_lora_weights": "pissa"},
+            "lora.st",
+            "abc",
+            strict=True,
+            init_pissa=True,
+        )
+
+    def test_pissa_mismatch_raises_under_strict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "PiSSA-trained adapters require an exact base match"):
+            _check_lora_base_hash(
+                {"ss_base_sha256": "wrong", "ss_init_lora_weights": "pissa"},
+                "lora.st",
+                "right",
+                strict=True,
+                init_pissa=True,
+            )
+
+    def test_pissa_mismatch_raises_even_when_strict_false(self) -> None:
+        """The 'always raise on mismatch' clause distinguishes PiSSA from non-
+        PiSSA — math is provably wrong, so no opt-out via --no-hotswap_strict_base_hash.
+        Non-PiSSA mismatch+non-strict warns; PiSSA mismatch+non-strict raises."""
+        with self.assertRaisesRegex(ValueError, "PiSSA-trained adapters require an exact base match"):
+            _check_lora_base_hash(
+                {"ss_base_sha256": "wrong", "ss_init_lora_weights": "pissa"},
+                "lora.st",
+                "right",
+                strict=False,
+                init_pissa=True,
+            )
+
+    def test_pissa_missing_hash_raises_under_strict(self) -> None:
+        """Missing ss_base_sha256 on a PiSSA-tagged LoRA suggests external
+        metadata stripping (Tier 2 #6a writes both keys together). Strict
+        mode raises; non-strict warns. Wording matches user-facing 'metadata
+        appears stripped' framing."""
+        with self.assertRaisesRegex(ValueError, "base-hash metadata appears stripped"):
+            _check_lora_base_hash(
+                {"ss_init_lora_weights": "pissa"},
+                "lora.st",
+                "right",
+                strict=True,
+                init_pissa=True,
+            )
+
+    def test_pissa_missing_hash_warns_only_when_strict_false(self) -> None:
+        # Should not raise — user opted out via --no-hotswap_strict_base_hash
+        _check_lora_base_hash(
+            {"ss_init_lora_weights": "pissa"},
+            "lora.st",
+            "right",
+            strict=False,
+            init_pissa=True,
+        )
+
+    def test_pissa_niter_variant_routes_through_pissa_branch(self) -> None:
+        """ss_init_lora_weights="pissa_niter_<N>" must hit the same contract.
+        The startswith('pissa') predicate the caller derives covers both."""
+        with self.assertRaisesRegex(ValueError, "PiSSA-trained adapters require an exact base match"):
+            _check_lora_base_hash(
+                {"ss_base_sha256": "wrong", "ss_init_lora_weights": "pissa_niter_8"},
+                "lora.st",
+                "right",
+                strict=False,
+                init_pissa=True,
+            )
+
+    def test_init_pissa_is_keyword_only(self) -> None:
+        """Pin the API contract: init_pissa cannot be passed positionally.
+        Prevents accidental positional drift at call sites (the existing
+        4-positional-arg shape is what every prior caller uses)."""
+        with self.assertRaises(TypeError):
+            _check_lora_base_hash({"ss_base_sha256": "abc"}, "lora.st", "abc", True, True)
+
+    def test_runtime_derivation_from_metadata(self) -> None:
+        """Pin the caller-side derivation pattern that hotswap_lora uses:
+        init_pissa = metadata.get('ss_init_lora_weights', '').startswith('pissa').
+        This test documents the canonical derivation for any future caller
+        (e.g., merge_lora.py preflight in a follow-up commit)."""
+        # PiSSA modes -> True
+        for value in ("pissa", "pissa_niter_5", "pissa_niter_20"):
+            with self.subTest(init=value):
+                derived = bool({"ss_init_lora_weights": value}) and {
+                    "ss_init_lora_weights": value
+                }.get("ss_init_lora_weights", "").startswith("pissa")
+                self.assertTrue(derived)
+        # Non-PiSSA modes -> False
+        for value in ("kaiming", "orthogonal", ""):
+            with self.subTest(init=value):
+                derived = bool({"ss_init_lora_weights": value}) and {
+                    "ss_init_lora_weights": value
+                }.get("ss_init_lora_weights", "").startswith("pissa")
+                self.assertFalse(derived)
+        # Missing metadata key -> False (init_pissa=False, fall through to
+        # back-compat path)
+        derived = bool({}) and {}.get("ss_init_lora_weights", "").startswith("pissa")
+        self.assertFalse(derived)
+        derived = bool(None) and (None or {}).get("ss_init_lora_weights", "").startswith("pissa")
+        self.assertFalse(derived)
 
 
 # -----------------------------

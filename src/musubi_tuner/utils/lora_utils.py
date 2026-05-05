@@ -697,12 +697,37 @@ def _check_lora_base_hash(
     lora_path: str,
     expected_sha256: str,
     strict: bool,
+    *,
+    init_pissa: bool = False,
 ) -> None:
     """Validate the LoRA's ss_base_sha256 metadata against expected.
 
-    Missing on the LoRA side: warn-only (back-compat for old checkpoints).
-    Mismatched + strict: raise.
-    Mismatched + not strict: warn.
+    Two contracts in one helper, gated by init_pissa (keyword-only so
+    every existing positional caller stays on the back-compat path):
+
+    init_pissa=False (default — back-compat for non-PiSSA LoRAs):
+      - Missing metadata or missing ss_base_sha256: warn-only (gentle
+        back-compat for old checkpoints).
+      - Mismatch + strict: raise.
+      - Mismatch + non-strict: warn.
+
+    init_pissa=True (PiSSA-tagged LoRA — math correctness is load-bearing):
+      - Match: silent OK.
+      - Mismatch: raise ALWAYS, regardless of strict — math is provably
+        wrong because PiSSA's residualized base assumption breaks under
+        a different base.
+      - Missing ss_base_sha256 + strict: raise (default behavior; the
+        hash was on the LoRA when it was saved by blissful-tuner, so
+        absence indicates external metadata stripping).
+      - Missing ss_base_sha256 + non-strict: warn (user opted out via
+        --no-hotswap_strict_base_hash).
+
+    Caller pattern: derive init_pissa from the LoRA's metadata via
+    `lora_sd_metadata.get("ss_init_lora_weights", "").startswith("pissa")`.
+    Note that this requires the metadata block itself to survive — a
+    fully metadata-stripped safetensors will fall through to the
+    init_pissa=False branch, since there's no signal to detect PiSSA-ness
+    once the metadata is gone.
     """
     if not lora_sd_metadata:
         logger.warning(
@@ -712,6 +737,20 @@ def _check_lora_base_hash(
         return
     lora_base = lora_sd_metadata.get("ss_base_sha256")
     if lora_base is None:
+        if init_pissa:
+            msg = (
+                f"Hotswap: {lora_path} carries ss_init_lora_weights=pissa* but ss_base_sha256 "
+                "is missing from its metadata — base-hash metadata appears stripped. "
+                "PiSSA-trained adapters require base-hash validation because their math "
+                "depends on the exact base bytes used at training time. "
+            )
+            if strict:
+                raise ValueError(
+                    msg + "Re-save the LoRA via a path that preserves blissful-tuner metadata, "
+                    "or pass --no-hotswap_strict_base_hash to proceed at your own risk."
+                )
+            logger.warning(msg + "Proceeding because --no-hotswap_strict_base_hash is set.")
+            return
         logger.warning(f"Hotswap: {lora_path} metadata lacks ss_base_sha256; cannot validate base hash. Proceeding.")
         return
     if lora_base == expected_sha256:
@@ -722,6 +761,16 @@ def _check_lora_base_hash(
         f"Hotswap base-hash mismatch for {lora_path}: "
         f"LoRA was trained against base {short_lora}..., but the loaded base is {short_expected}.... "
     )
+    if init_pissa:
+        # PiSSA mismatch is math-wrong regardless of strict — the residualized
+        # base assumption breaks under any other base. No --no-hotswap_strict_base_hash
+        # opt-out for this case.
+        raise ValueError(
+            msg + "PiSSA-trained adapters require an exact base match (residualized base "
+            "assumption breaks under any other base). Load the matching base DiT, or "
+            "convert the PiSSA adapter to standard LoRA via the (future Tier 2 #6c) "
+            "tools/pissa_to_standard_lora.py."
+        )
     if strict:
         raise ValueError(
             msg + "Pass --no-hotswap_strict_base_hash to downgrade this to a warning, " + "or load the matching base DiT."
@@ -894,7 +943,18 @@ def hotswap_lora(
         _assert_standard_lora_only(sd, path)
         if state.base_sha256 is not None:
             metadata = _read_safetensors_metadata(path)
-            _check_lora_base_hash(metadata, path, state.base_sha256, state.strict_base_hash)
+            # Derive init_pissa from metadata so PiSSA-tagged LoRAs get the stricter
+            # contract (mismatch always raises, missing raises under strict). A fully
+            # metadata-stripped safetensors falls through to init_pissa=False — there's
+            # no signal to detect PiSSA-ness without the metadata block.
+            init_pissa = bool(metadata) and metadata.get("ss_init_lora_weights", "").startswith("pissa")
+            _check_lora_base_hash(
+                metadata,
+                path,
+                state.base_sha256,
+                state.strict_base_hash,
+                init_pissa=init_pissa,
+            )
         new_sds.append(sd)
 
     # Step 1 (RESET) — only proceed once all guards pass
