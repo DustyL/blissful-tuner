@@ -24,6 +24,7 @@ from musubi_tuner.utils.lora_utils import (
     _check_lora_base_hash,
     compute_base_hash,
     compute_training_base_hash,
+    inject_ss_base_sha256_metadata,
 )
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
@@ -226,6 +227,75 @@ class TestSafetensorsMetadataRoundTrip(unittest.TestCase):
             with safe_open(str(out), framework="pt") as f:
                 md = f.metadata() or {}
                 self.assertEqual(md.get("ss_steps"), "42")
+
+
+class TestInjectSsBaseSha256Metadata(unittest.TestCase):
+    """Wiring helper called from every metadata composition site.
+
+    Pinning this helper directly is cheaper than running the full
+    NetworkTrainer.train() loop. Each trainer site reduces to one line:
+    `inject_ss_base_sha256_metadata(args, metadata)`. Future code
+    archaeologists who refactor the inline call should rerun this test
+    to confirm the contract holds.
+    """
+
+    def test_single_dit_writes_ss_base_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            dit_path = Path(td) / "model.safetensors"
+            _write_synthetic_dit(dit_path)
+            args = _ns(dit=str(dit_path))
+            metadata: dict = {}
+
+            inject_ss_base_sha256_metadata(args, metadata)
+
+            self.assertIn("ss_base_sha256", metadata)
+            self.assertEqual(metadata["ss_base_sha256"], compute_base_hash([str(dit_path)]))
+
+    def test_missing_dit_leaves_metadata_unchanged(self) -> None:
+        args = _ns(dit=None)
+        metadata: dict = {"ss_other": "untouched"}
+
+        inject_ss_base_sha256_metadata(args, metadata)
+
+        self.assertNotIn("ss_base_sha256", metadata)
+        self.assertEqual(metadata["ss_other"], "untouched")
+
+    def test_wan_dual_expert_warns_and_does_not_inject(self) -> None:
+        """Option D: WAN dual-expert deferral. No metadata key, but warn loudly."""
+        with tempfile.TemporaryDirectory() as td:
+            low = Path(td) / "low.safetensors"
+            high = Path(td) / "high.safetensors"
+            _write_synthetic_dit(low, seed=1)
+            _write_synthetic_dit(high, seed=2)
+            args = _ns(dit=str(low), dit_high_noise=str(high))
+            metadata: dict = {}
+
+            with self.assertLogs("musubi_tuner.utils.lora_utils", level="WARNING") as cm:
+                inject_ss_base_sha256_metadata(args, metadata)
+
+            self.assertNotIn("ss_base_sha256", metadata)
+            joined = "\n".join(cm.output)
+            self.assertIn("WAN dual-expert", joined)
+            self.assertIn("Tier 2 #6a-2", joined)
+
+    def test_helper_is_idempotent(self) -> None:
+        """Calling twice on the same metadata dict yields the same final state.
+
+        Regression guard against per-save-loop accumulation surprises if any
+        trainer ends up calling the helper more than once per metadata dict
+        (e.g., a refactor that moves the call into a per-checkpoint hook).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            dit_path = Path(td) / "model.safetensors"
+            _write_synthetic_dit(dit_path)
+            args = _ns(dit=str(dit_path))
+            metadata: dict = {}
+
+            inject_ss_base_sha256_metadata(args, metadata)
+            first_value = metadata["ss_base_sha256"]
+            inject_ss_base_sha256_metadata(args, metadata)
+
+            self.assertEqual(metadata["ss_base_sha256"], first_value)
 
 
 if __name__ == "__main__":

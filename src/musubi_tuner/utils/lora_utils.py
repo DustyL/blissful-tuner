@@ -594,6 +594,32 @@ def _expand_weight_paths(paths: List[str]) -> List[str]:
     return expanded
 
 
+def inject_ss_base_sha256_metadata(args: argparse.Namespace, metadata: Dict[str, str]) -> None:
+    """Add ss_base_sha256 to metadata when computable; warn when deferred.
+
+    Single helper called from every trainer's metadata composition site
+    (1 shared LoRA path in hv_train_network.py + 3 full-FT trainers).
+    Mutates the metadata dict in place so each caller reduces to one line:
+    `inject_ss_base_sha256_metadata(args, metadata)`.
+
+    Behavior matches compute_training_base_hash:
+      - args.dit unset/empty: no metadata change, no log.
+      - args.dit_high_noise truthy: no metadata change, warn about WAN
+        dual-expert deferral so the user knows hotswap on the resulting
+        LoRA will be warn-only.
+      - otherwise: metadata["ss_base_sha256"] set, info log with prefix.
+    """
+    base_sha256 = compute_training_base_hash(args)
+    if base_sha256 is not None:
+        metadata["ss_base_sha256"] = base_sha256
+        logger.info(f"recorded ss_base_sha256={base_sha256[:12]}... for base provenance validation")
+    elif getattr(args, "dit_high_noise", None):
+        logger.warning(
+            "ss_base_sha256 omitted: WAN dual-expert (args.dit_high_noise set) deferred "
+            "to Tier 2 #6a-2 follow-up. Hotswap of LoRAs from this run will be warn-only."
+        )
+
+
 def compute_training_base_hash(args: argparse.Namespace) -> Optional[str]:
     """Compute SHA256 of the DiT base file at training time.
 

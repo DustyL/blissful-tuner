@@ -69,7 +69,7 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, r
 from blissful_tuner.blissful_logger import BlissfulLogger
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
-from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed
+from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, inject_ss_base_sha256_metadata
 
 logger = BlissfulLogger(__name__, "green")
 
@@ -2362,6 +2362,8 @@ class NetworkTrainer:
                 # metadata["ss_new_sd_model_hash"] = model_utils.calculate_sha256(sd_model_name)
                 sd_model_name = os.path.basename(sd_model_name)
             metadata["ss_sd_model_name"] = sd_model_name
+
+        inject_ss_base_sha256_metadata(args, metadata)
 
         if args.vae is not None:
             # logger.info(f"calculate hash for VAE model: {args.vae}")
