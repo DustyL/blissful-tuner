@@ -49,6 +49,9 @@ def parse_bool_arg(value, default: bool = False) -> bool:
     return default
 
 
+_PISSA_NITER_RE = re.compile(r"^pissa_niter_(\d+)$")
+
+
 def parse_init_lora_weights_arg(value: Any = None) -> str:
     if value is None:
         return "kaiming"
@@ -58,9 +61,21 @@ def parse_init_lora_weights_arg(value: Any = None) -> str:
         normalized = value.strip().lower()
         if normalized == "true":
             return "kaiming"
-        if normalized in ("kaiming", "orthogonal"):
+        if normalized in ("kaiming", "orthogonal", "pissa"):
             return normalized
-    raise ValueError(f"init_lora_weights must be one of 'kaiming', 'orthogonal', or 'true' (alias for kaiming), got {value!r}")
+        m = _PISSA_NITER_RE.match(normalized)
+        if m is not None:
+            niter = int(m.group(1))
+            if niter <= 0:
+                raise ValueError(
+                    f"init_lora_weights={value!r}: niter must be a positive integer (got {niter}). "
+                    "Example: 'pissa_niter_5'."
+                )
+            return normalized
+    raise ValueError(
+        f"init_lora_weights must be one of 'kaiming', 'orthogonal', 'pissa', "
+        f"'pissa_niter_<N>' (positive int), or 'true' (alias for kaiming), got {value!r}"
+    )
 
 
 def parse_rank_or_alpha_pattern_arg(value: Any = None, kind: str = "rank_pattern") -> Optional[Dict[re.Pattern, Union[int, float]]]:
@@ -148,6 +163,106 @@ def _init_orthogonal_lora_pair(
 
         lora_down.weight.copy_(new_down.to(dtype=dtype))
         lora_up.weight.copy_(new_up.to(dtype=dtype))
+
+
+_PISSA_ALLOWED_BASE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _init_pissa_lora_pair(
+    lora_down: torch.nn.Module,
+    lora_up: torch.nn.Module,
+    base_weight: torch.Tensor,
+    rank: int,
+    scaling: float,
+    mode: str,
+) -> torch.Tensor:
+    """Initialize lora_down (A) and lora_up (B) via PiSSA decomposition.
+
+    Mirrors PEFT's pissa_init at peft/src/peft/tuners/lora/layer.py:360-393.
+    The math uses SVD of the base weight to seed lora_A/lora_B with the
+    principal-rank-r components, then returns the residual weight tensor
+    so the caller can mutate org_module.weight.data with it.
+
+    Returning the residual (rather than mutating in place) keeps this
+    helper a pure function — easier to test in isolation against PEFT
+    for math parity. The caller (LoRAModule.__init__, in commit 2) is
+    responsible for the in-place base-weight mutation.
+
+    Forward equivalence at step 0 holds because:
+        original_weight == residual + scaling * lora_B @ lora_A
+
+    Args:
+        lora_down: LoRA A module (the down-projection). Modified in place.
+        lora_up: LoRA B module (the up-projection). Modified in place.
+        base_weight: The base layer's weight tensor. NOT mutated; the
+            residual is returned for the caller to write back.
+        rank: LoRA rank (must equal lora_down.out_features and
+            lora_up.in_features after this init).
+        scaling: The LoRA scale (alpha/r for standard, alpha/sqrt(r) for
+            rsLoRA). PEFT's pissa_init divides Sr by scaling so the
+            forward-equivalence reconstruction holds.
+        mode: "pissa" (full SVD) or "pissa_niter_<N>" (Newton-Schulz
+            approximate SVD via torch.svd_lowrank, faster for big weights).
+
+    Returns:
+        The residual weight tensor (same shape, dtype, device as base_weight).
+        Caller mutates `org_module.weight.data = returned_residual`.
+
+    Raises:
+        TypeError: when base_weight dtype is not fp32/fp16/bf16 (PiSSA
+            cannot run on fp8/int8 bases — SVD is unstable).
+        ValueError: when mode does not match "pissa" or "pissa_niter_<N>".
+        NotImplementedError: when base_weight is not 2D (Conv2d 4D weights
+            are not supported; PEFT's reference also crashes on them).
+    """
+    if base_weight.dtype not in _PISSA_ALLOWED_BASE_DTYPES:
+        raise TypeError(
+            f"PiSSA initialization requires base weight in float32/float16/bfloat16, "
+            f"got {base_weight.dtype}. Re-quantize after PiSSA init if you need fp8."
+        )
+    if base_weight.dim() != 2:
+        raise NotImplementedError(
+            f"PiSSA initialization requires a 2D base weight (Linear). "
+            f"Got {base_weight.dim()}D weight (likely Conv2d). PEFT's pissa_init also "
+            f"crashes on 4D weights — this is a math limitation, not a missing "
+            f"implementation. Use init_lora_weights=kaiming for non-Linear modules."
+        )
+
+    target_dtype = lora_down.weight.dtype
+    target_device = lora_down.weight.device
+
+    # PEFT does the SVD in fp32 regardless of base dtype, then casts back.
+    weight_fp32 = base_weight.to(torch.float32)
+
+    if mode == "pissa":
+        V, S, Uh = torch.linalg.svd(weight_fp32, full_matrices=False)
+        Vr = V[:, :rank]
+        Sr = S[:rank].clone()  # clone so the in-place /= doesn't touch the SVD output
+        Sr /= scaling
+        Uhr = Uh[:rank, :]
+    else:
+        m = _PISSA_NITER_RE.match(mode)
+        if m is None:
+            raise ValueError(
+                f"PiSSA mode must be 'pissa' or 'pissa_niter_<N>', got {mode!r}."
+            )
+        niter = int(m.group(1))
+        Vr, Sr, Ur = torch.svd_lowrank(weight_fp32, rank, niter=niter)
+        Sr = Sr / scaling
+        Uhr = Ur.t()
+
+    sqrt_sr = torch.sqrt(Sr)
+    lora_A = torch.diag(sqrt_sr) @ Uhr  # (rank, in_features)
+    lora_B = Vr @ torch.diag(sqrt_sr)   # (out_features, rank)
+
+    # Residual: original - scaling * (B @ A) so forward(residual) + scale*forward(LoRA) == forward(original)
+    residual_fp32 = weight_fp32 - scaling * lora_B @ lora_A
+
+    with torch.no_grad():
+        lora_down.weight.copy_(lora_A.to(device=target_device, dtype=target_dtype))
+        lora_up.weight.copy_(lora_B.to(device=target_device, dtype=target_dtype))
+
+    return residual_fp32.to(device=base_weight.device, dtype=base_weight.dtype)
 
 
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
