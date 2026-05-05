@@ -368,5 +368,223 @@ class TestPissaBfloat16BaseSupport(unittest.TestCase):
         self.assertTrue(torch.allclose(reconstructed, base_bf16.to(torch.float32), rtol=1e-2, atol=1e-2))
 
 
+class TestAlphaScaleBackCompatAfterMove(unittest.TestCase):
+    """Pin the back-compat invariant for the alpha/scale block move in
+    LoRAModule.__init__: the block was moved earlier so PiSSA can read
+    self.scale before the init dispatch. Kaiming/orthogonal don't depend
+    on self.scale, so the move is semantically a no-op for them — but
+    the only way to be sure is to pin the produced (alpha buffer, self.scale)
+    pair across all the alpha/use_rslora combinations the old code
+    handled."""
+
+    def _build(self, alpha, use_rslora, lora_dim=4, init="kaiming"):
+        from musubi_tuner.networks.lora import LoRAModule
+
+        base = torch.nn.Linear(8, 4, bias=False)
+        return LoRAModule(
+            lora_name="test",
+            org_module=base,
+            multiplier=1.0,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            use_rslora=use_rslora,
+            init_lora_weights=init,
+        )
+
+    def test_alpha_explicit_no_rslora(self) -> None:
+        m = self._build(alpha=4.0, use_rslora=False, lora_dim=2)
+        self.assertAlmostEqual(m.alpha.item(), 4.0)
+        self.assertAlmostEqual(m.scale, 4.0 / 2)  # alpha / r
+
+    def test_alpha_explicit_with_rslora(self) -> None:
+        m = self._build(alpha=4.0, use_rslora=True, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 4.0)
+        self.assertAlmostEqual(m.scale, 4.0 / (4 ** 0.5))  # alpha / sqrt(r)
+
+    def test_alpha_none_no_rslora_collapses_to_unit_scale(self) -> None:
+        m = self._build(alpha=None, use_rslora=False, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 4.0)  # set to lora_dim
+        self.assertAlmostEqual(m.scale, 1.0)
+
+    def test_alpha_zero_no_rslora_collapses_to_unit_scale(self) -> None:
+        m = self._build(alpha=0, use_rslora=False, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 4.0)
+        self.assertAlmostEqual(m.scale, 1.0)
+
+    def test_alpha_none_with_rslora_collapses_to_unit_scale(self) -> None:
+        m = self._build(alpha=None, use_rslora=True, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 4.0 ** 0.5)  # set to sqrt(r)
+        self.assertAlmostEqual(m.scale, 1.0)
+
+    def test_alpha_zero_with_rslora_collapses_to_unit_scale(self) -> None:
+        m = self._build(alpha=0, use_rslora=True, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 4.0 ** 0.5)
+        self.assertAlmostEqual(m.scale, 1.0)
+
+    def test_alpha_tensor_input_unwraps(self) -> None:
+        """alpha can be passed as a torch.Tensor (legacy load path); the
+        existing code does .detach().float().numpy() to unwrap. Pin that
+        the unwrap still works at the new location."""
+        m = self._build(alpha=torch.tensor(2.0), use_rslora=False, lora_dim=4)
+        self.assertAlmostEqual(m.alpha.item(), 2.0)
+        self.assertAlmostEqual(m.scale, 2.0 / 4)
+
+    def test_alpha_buffer_persists_under_kaiming_unchanged(self) -> None:
+        """Kaiming init shouldn't touch self.scale — verify the alpha buffer
+        the move produces is still byte-equal to what the pre-move code
+        produced for the most common case."""
+        m_kaiming = self._build(alpha=4.0, use_rslora=False, lora_dim=4, init="kaiming")
+        # Reference values from pre-move arithmetic
+        self.assertAlmostEqual(m_kaiming.alpha.item(), 4.0)
+        self.assertAlmostEqual(m_kaiming.scale, 1.0)
+
+    def test_alpha_buffer_persists_under_orthogonal_unchanged(self) -> None:
+        m_ortho = self._build(alpha=4.0, use_rslora=False, lora_dim=4, init="orthogonal")
+        self.assertAlmostEqual(m_ortho.alpha.item(), 4.0)
+        self.assertAlmostEqual(m_ortho.scale, 1.0)
+
+
+class TestLoRAModulePissaWiring(unittest.TestCase):
+    """End-to-end PiSSA via LoRAModule.__init__: helper-level math is
+    pinned in TestPissaMathParityVsPeft; this class pins the wiring —
+    that PiSSA actually fires when init_lora_weights='pissa', and that
+    org_module.weight.data is mutated to the residual."""
+
+    def _make_module(self, init, in_dim=8, out_dim=4, lora_dim=2, alpha=2.0, use_rslora=False, use_dora=False, split_dims=None):
+        from musubi_tuner.networks.lora import LoRAModule
+
+        base = torch.nn.Linear(in_dim, out_dim, bias=False)
+        # Set deterministic base weight
+        with torch.no_grad():
+            base.weight.copy_(_make_base_weight(in_dim, out_dim, seed=42))
+        return base, LoRAModule(
+            lora_name="m",
+            org_module=base,
+            multiplier=1.0,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            use_rslora=use_rslora,
+            use_dora=use_dora,
+            split_dims=split_dims,
+            init_lora_weights=init,
+        )
+
+    def test_pissa_wiring_mutates_org_module_weight_to_residual(self) -> None:
+        """The wiring contract: after LoRAModule(init='pissa'), org_module.weight.data
+        is the residual (NOT the original). Forward equivalence reconstructed via
+        residual + scale * B @ A."""
+        original = _make_base_weight(8, 4, seed=42)
+        base, module = self._make_module(init="pissa", in_dim=8, out_dim=4, lora_dim=2, alpha=2.0)
+
+        # base.weight is now the residual
+        residual = base.weight.detach().to(torch.float32)
+        lora_A = module.lora_down.weight.detach().to(torch.float32)
+        lora_B = module.lora_up.weight.detach().to(torch.float32)
+
+        reconstructed = residual + module.scale * lora_B @ lora_A
+        self.assertTrue(torch.allclose(reconstructed, original.to(torch.float32), rtol=1e-5, atol=1e-5))
+        # Sanity: residual should differ from original (PiSSA actually ran)
+        self.assertFalse(torch.allclose(residual, original.to(torch.float32), rtol=1e-3, atol=1e-3))
+
+    def test_pissa_init_records_init_lora_weights_attr(self) -> None:
+        """The init choice is persisted on the module for later metadata write-out."""
+        _, module = self._make_module(init="pissa")
+        self.assertEqual(module.init_lora_weights, "pissa")
+
+    def test_pissa_niter_init_preserves_n_in_attr(self) -> None:
+        _, module = self._make_module(init="pissa_niter_5")
+        self.assertEqual(module.init_lora_weights, "pissa_niter_5")
+
+    def test_pissa_with_rslora_uses_rslora_scale(self) -> None:
+        """rsLoRA + PiSSA composition: PiSSA receives self.scale = alpha/sqrt(r)
+        and the forward equivalence still holds with that scale."""
+        original = _make_base_weight(8, 4, seed=42)
+        base, module = self._make_module(init="pissa", lora_dim=4, alpha=4.0, use_rslora=True, in_dim=8, out_dim=4)
+
+        # Scale should be rsLoRA-shaped
+        self.assertAlmostEqual(module.scale, 4.0 / (4 ** 0.5))
+
+        residual = base.weight.detach().to(torch.float32)
+        lora_A = module.lora_down.weight.detach().to(torch.float32)
+        lora_B = module.lora_up.weight.detach().to(torch.float32)
+        reconstructed = residual + module.scale * lora_B @ lora_A
+        self.assertTrue(torch.allclose(reconstructed, original.to(torch.float32), rtol=1e-5, atol=1e-5))
+
+
+class TestLoRAModulePissaRejects(unittest.TestCase):
+    """The four fail-fast rejects in LoRAModule.__init__ when init starts with pissa."""
+
+    def test_pissa_with_conv2d_hard_rejects(self) -> None:
+        from musubi_tuner.networks.lora import LoRAModule
+
+        conv = torch.nn.Conv2d(4, 8, kernel_size=3, padding=1, bias=False)
+        with self.assertRaises(ValueError) as ctx:
+            LoRAModule("conv_lora", conv, lora_dim=2, alpha=2.0, init_lora_weights="pissa")
+        msg = str(ctx.exception)
+        self.assertIn("Conv2d", msg)
+        self.assertIn("pissa", msg)
+
+    def test_pissa_niter_with_conv2d_hard_rejects(self) -> None:
+        from musubi_tuner.networks.lora import LoRAModule
+
+        conv = torch.nn.Conv2d(4, 8, kernel_size=3, padding=1, bias=False)
+        with self.assertRaises(ValueError):
+            LoRAModule("conv_lora", conv, lora_dim=2, alpha=2.0, init_lora_weights="pissa_niter_5")
+
+    def test_pissa_with_split_dims_hard_rejects(self) -> None:
+        from musubi_tuner.networks.lora import LoRAModule
+
+        # split_dims requires Linear with out_features summing to sum(split_dims)
+        base = torch.nn.Linear(16, 12, bias=False)
+        with self.assertRaises(ValueError) as ctx:
+            LoRAModule(
+                "split_lora",
+                base,
+                lora_dim=4,
+                alpha=4.0,
+                split_dims=[4, 4, 4],
+                init_lora_weights="pissa",
+            )
+        self.assertIn("split_dims", str(ctx.exception))
+
+    def test_pissa_with_use_dora_hard_rejects(self) -> None:
+        """Gates on user intent (use_dora=True), not on the post-disable
+        self.use_dora — so the user gets a clear contract message even
+        for cases where DoRA would have been silently disabled anyway."""
+        from musubi_tuner.networks.lora import LoRAModule
+
+        base = torch.nn.Linear(8, 4, bias=False)
+        with self.assertRaises(ValueError) as ctx:
+            LoRAModule(
+                "dora_pissa",
+                base,
+                lora_dim=2,
+                alpha=2.0,
+                use_dora=True,
+                init_lora_weights="pissa",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("use_dora", msg)
+        self.assertIn("pissa", msg)
+        self.assertIn("Tier 2 #6d", msg)  # pointer to the future combined item
+
+    def test_pissa_with_fp8_base_hard_rejects(self) -> None:
+        """fp8 base routes through the helper's dtype check, but the reject
+        path goes through LoRAModule.__init__ in this commit. Pin that
+        the helper-level reject still surfaces cleanly through the wiring."""
+        # Skip if fp8 dtypes not available on this torch build
+        if not hasattr(torch, "float8_e4m3fn"):
+            self.skipTest("torch.float8_e4m3fn unavailable")
+        from musubi_tuner.networks.lora import LoRAModule
+
+        base = torch.nn.Linear(8, 4, bias=False)
+        # Re-cast the weight to fp8
+        with torch.no_grad():
+            base.weight.data = base.weight.data.to(torch.float8_e4m3fn)
+        with self.assertRaises(TypeError) as ctx:
+            LoRAModule("fp8_pissa", base, lora_dim=2, alpha=2.0, init_lora_weights="pissa")
+        self.assertIn("float32/float16/bfloat16", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

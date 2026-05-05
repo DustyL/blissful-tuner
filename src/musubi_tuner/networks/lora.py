@@ -370,6 +370,51 @@ class LoRAModule(torch.nn.Module):
         self.lora_dim = lora_dim
         self.split_dims = split_dims
 
+        # alpha/scale moved earlier (was below init dispatch) so PiSSA can read self.scale
+        # for its SVD divide step. Kaiming/orthogonal don't depend on self.scale, so this
+        # move is semantically a no-op for those paths — pinned by TestAlphaScaleBackCompatAfterMove.
+        if type(alpha) == torch.Tensor:
+            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
+
+        self.use_rslora = use_rslora
+
+        # Handle alpha==0/None: means "no scaling" (scale=1)
+        # NOTE: For RS-LoRA with alpha=0, we store alpha=sqrt(r) so scale=1. This computed
+        # alpha is what gets saved in weights. External tools that ignore use_rslora_flag
+        # and assume alpha/r scaling will misinterpret it. The use_rslora_flag buffer in
+        # saved weights indicates the correct interpretation.
+        if alpha is None or alpha == 0:
+            alpha = math.sqrt(self.lora_dim) if use_rslora else self.lora_dim
+
+        self.scale = alpha / math.sqrt(self.lora_dim) if use_rslora else alpha / self.lora_dim
+        self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
+
+        # PiSSA fail-fast rejects: fire before any layer allocation so we don't silently
+        # disable a user's intended init choice. Gates on the user's intent (init_lora_weights
+        # / use_dora arg), not on the post-disable self.use_dora.
+        is_pissa = init_lora_weights.startswith("pissa")
+        if is_pissa:
+            if org_module.__class__.__name__ == "Conv2d":
+                raise ValueError(
+                    f"init_lora_weights={init_lora_weights!r} is not supported for Conv2d module {lora_name!r}. "
+                    "PEFT's pissa_init also crashes on 4D weights — this is a math limitation, "
+                    "not a missing implementation. Use init_lora_weights=kaiming for Conv2d modules, "
+                    "or restrict --include_patterns to skip them."
+                )
+            if split_dims is not None:
+                raise ValueError(
+                    f"init_lora_weights={init_lora_weights!r} is not supported with split_dims for module {lora_name!r}. "
+                    "Per-split SVD doesn't have a single canonical interpretation in v1. "
+                    "Use init_lora_weights=kaiming or train without split_dims for fused-QKV PiSSA."
+                )
+            if use_dora:
+                raise ValueError(
+                    f"init_lora_weights={init_lora_weights!r} cannot be combined with use_dora=True "
+                    f"for module {lora_name!r}. PEFT mixes the two only via a separate "
+                    "pissa_decompose_dora utility (deferred to Tier 2 #6d). "
+                    "Pick one of init_lora_weights=pissa OR use_dora=True for v1."
+                )
+
         if split_dims is None:
             if org_module.__class__.__name__ == "Conv2d":
                 kernel_size = org_module.kernel_size
@@ -381,7 +426,19 @@ class LoRAModule(torch.nn.Module):
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-            if init_lora_weights == "orthogonal" and org_module.__class__.__name__ != "Conv2d":
+            if is_pissa:
+                # PiSSA: SVD the base, residualize. Conv2d / split_dims / DoRA already rejected above.
+                residual = _init_pissa_lora_pair(
+                    self.lora_down,
+                    self.lora_up,
+                    org_module.weight.data,
+                    self.lora_dim,
+                    self.scale,
+                    init_lora_weights,
+                )
+                with torch.no_grad():
+                    org_module.weight.data.copy_(residual)
+            elif init_lora_weights == "orthogonal" and org_module.__class__.__name__ != "Conv2d":
                 _init_orthogonal_lora_pair(self.lora_down, self.lora_up, in_dim, out_dim, self.lora_dim)
             else:
                 if init_lora_weights == "orthogonal":
@@ -401,30 +458,6 @@ class LoRAModule(torch.nn.Module):
                     _init_orthogonal_lora_pair(lora_down, lora_up, in_dim, split_dim, self.lora_dim)
                 else:
                     _init_kaiming_lora_pair(lora_down, lora_up)
-
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
-
-        self.use_rslora = use_rslora
-
-        # Handle alpha==0/None: means "no scaling" (scale=1)
-        # NOTE: For RS-LoRA with alpha=0, we store alpha=sqrt(r) so scale=1. This computed
-        # alpha is what gets saved in weights. External tools that ignore use_rslora_flag
-        # and assume alpha/r scaling will misinterpret it. The use_rslora_flag buffer in
-        # saved weights indicates the correct interpretation.
-        if alpha is None or alpha == 0:
-            if use_rslora:
-                alpha = math.sqrt(self.lora_dim)  # sqrt(r)/sqrt(r) = 1
-            else:
-                alpha = self.lora_dim  # r/r = 1
-
-        # Compute scale based on RS-LoRA flag
-        if use_rslora:
-            self.scale = alpha / math.sqrt(self.lora_dim)
-        else:
-            self.scale = alpha / self.lora_dim
-
-        self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
 
         # same as microsoft's
         self.multiplier = multiplier
