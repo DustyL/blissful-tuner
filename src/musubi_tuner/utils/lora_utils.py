@@ -594,6 +594,40 @@ def _expand_weight_paths(paths: List[str]) -> List[str]:
     return expanded
 
 
+def compute_training_base_hash(args: argparse.Namespace) -> Optional[str]:
+    """Compute SHA256 of the DiT base file at training time.
+
+    Single canonical helper for trainer metadata composers. Returns the
+    same byte-for-byte hash that hotswap's prepare_for_hotswap computes
+    from the same path, so a hotswap-time check can validate a saved
+    LoRA against the live base.
+
+    Returns None in two cases (caller should warn-and-omit the metadata
+    key in both):
+
+      1. args.dit is unset / empty. No DiT path to hash. Trainers that
+         construct the model from a config rather than a checkpoint
+         path land here.
+      2. args.dit_high_noise is set (WAN 2.2 dual-expert training). The
+         hotswap read-side hashes per-expert (single-element dit_paths
+         list per HotswapState; verified at wan_generate_video.py:800
+         and test_lora_hotswap.py:259), so a combined two-file hash
+         would never match either expert's hotswap state. Symmetric
+         per-expert metadata keys + read-side any-match validation are
+         deferred to a Tier 2 #6a follow-up.
+
+    Empty-string defense for dit_high_noise: == "" is treated as None,
+    mirroring the if-truthy gate at wan_generate_video.py:613.
+    """
+    dit = getattr(args, "dit", None)
+    if not dit:
+        return None
+    high = getattr(args, "dit_high_noise", None)
+    if high:
+        return None
+    return compute_base_hash([dit])
+
+
 def _assert_standard_lora_only(lora_sd: Dict[str, torch.Tensor], lora_path: str) -> None:
     """Phase 1 contract: hotswap accepts only standard LoRA networks.
 
