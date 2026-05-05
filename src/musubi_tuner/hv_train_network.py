@@ -70,8 +70,84 @@ from blissful_tuner.blissful_logger import BlissfulLogger
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 from musubi_tuner.utils.lora_utils import convert_diffusers_if_needed, inject_ss_base_sha256_metadata
+from musubi_tuner.networks import lora as _lora_module_for_pissa_validation
 
 logger = BlissfulLogger(__name__, "green")
+
+
+def _network_args_init_lora_weights(network_args: Optional[List[str]]) -> str:
+    """Extract init_lora_weights value from --network_args list, or default 'kaiming'.
+
+    Routes through lora.parse_init_lora_weights_arg so the canonical detection
+    logic stays in one place — same predicate as LoRAModule.__init__'s
+    `init_lora_weights.startswith("pissa")` check at lora.py:382.
+    """
+    for arg in network_args or []:
+        if arg.startswith("init_lora_weights="):
+            return _lora_module_for_pissa_validation.parse_init_lora_weights_arg(arg.split("=", 1)[1])
+    return "kaiming"
+
+
+def _network_args_bool(network_args: Optional[List[str]], key: str) -> bool:
+    """Extract a bool value from --network_args list (key=value pairs)."""
+    for arg in network_args or []:
+        if arg.startswith(f"{key}="):
+            return _lora_module_for_pissa_validation.parse_bool_arg(arg.split("=", 1)[1])
+    return False
+
+
+def validate_pissa_training_args(args: argparse.Namespace) -> None:
+    """Fail-fast rejects for PiSSA + incompatible training surfaces.
+
+    Called near the top of NetworkTrainer.train (after required-arg checks,
+    before any heavy model/dataset loading) so unsafe combinations fire
+    BEFORE the user pays the cost of model load + dataset prep.
+
+    Three rejects gate on the user's INTENT (init_lora_weights="pissa*"
+    + the conflicting flag), regardless of whether downstream code would
+    silently disable one path:
+
+      - args.dit_high_noise (WAN dual-expert): blocked on Tier 2 #6a-2
+        per-expert metadata follow-up. PiSSA's hash-coupling needs
+        per-expert keys + read-side any-match, not in scope here.
+      - args.resume (checkpoint resume): PiSSA mutates the base in place
+        at LoRAModule init time. Resuming would re-residualize an
+        already-residualized base, silently producing wrong math.
+      - use_dora=True in network_args: defense in depth; LoRAModule.__init__
+        also catches this at module construction time. Surfacing it at
+        training-start gives a clearer-path error message.
+    """
+    init_lora_weights = _network_args_init_lora_weights(getattr(args, "network_args", None))
+    if not init_lora_weights.startswith("pissa"):
+        return
+
+    if getattr(args, "dit_high_noise", None):
+        raise ValueError(
+            f"init_lora_weights={init_lora_weights!r} is not supported with WAN dual-expert "
+            "training (--dit_high_noise set). PiSSA on WAN dual-expert is blocked on the "
+            "Tier 2 #6a-2 follow-up that designs per-expert ss_base_sha256 metadata. "
+            "Train PiSSA against a single-DiT architecture (Qwen / Z-Image / FLUX.2 / "
+            "single-expert WAN) for v1, or use init_lora_weights=kaiming for WAN dual-expert."
+        )
+
+    if getattr(args, "resume", None):
+        raise ValueError(
+            f"init_lora_weights={init_lora_weights!r} cannot be combined with --resume. "
+            "PiSSA mutates the base DiT in place at LoRAModule init time; resuming from a "
+            "checkpoint would re-residualize an already-residualized base, silently "
+            "producing wrong math. Train PiSSA from scratch, or convert the PiSSA adapter "
+            "to standard LoRA via the (future Tier 2 #6c) tools/pissa_to_standard_lora.py "
+            "and resume from that instead."
+        )
+
+    if _network_args_bool(getattr(args, "network_args", None), "use_dora"):
+        raise ValueError(
+            f"init_lora_weights={init_lora_weights!r} cannot be combined with use_dora=True "
+            "in --network_args. PEFT mixes the two only via a separate pissa_decompose_dora "
+            "utility (deferred to Tier 2 #6d). Pick one of init_lora_weights=pissa OR "
+            "use_dora=True for v1. (LoRAModule.__init__ also catches this at module "
+            "construction time, but failing here surfaces the error before model loading.)"
+        )
 
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
@@ -1891,6 +1967,11 @@ class NetworkTrainer:
                 "SageAttention doesn't support training currently. Please use `--sdpa` or `--xformers` etc. instead."
                 " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
             )
+
+        # PiSSA + (WAN dual-expert | --resume | use_dora) rejects, fired BEFORE any
+        # model/dataset loading so unsafe combos fail in milliseconds, not minutes.
+        # See validate_pissa_training_args() docstring for the contract.
+        validate_pissa_training_args(args)
 
         if args.fp16_accumulation:
             logger.info("Enabling FP16 accumulation")
