@@ -45,6 +45,31 @@ def _lora_sd(
     return sd
 
 
+def _dora_lora_sd(
+    name: str = "lora_unet_block",
+    *,
+    in_dim: int = 3,
+    out_dim: int = 2,
+    rank: int = 2,
+    alpha: float | None = None,
+    down: torch.Tensor | None = None,
+    up: torch.Tensor | None = None,
+    magnitude: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Build a well-formed DoRA adapter fixture: standard LoRA factors + magnitude + global flag.
+
+    Used by v1.5 #4 tests. Magnitude defaults to ``ones(out_dim)`` so DoRA materialization
+    produces predictable values for shape/dtype checks; override for parity tests that need
+    specific magnitudes.
+    """
+    sd = _lora_sd(name=name, in_dim=in_dim, out_dim=out_dim, rank=rank, alpha=alpha, down=down, up=up)
+    sd["use_dora_flag"] = torch.tensor(True)
+    if magnitude is None:
+        magnitude = torch.ones(out_dim, dtype=torch.float32)
+    sd[f"{name}.dora_layer.weight"] = magnitude.clone()
+    return sd
+
+
 def _save_sd(tmp: Path, filename: str, sd: dict[str, torch.Tensor], metadata: dict[str, str] | None = None) -> str:
     path = tmp / filename
     save_file(sd, str(path), metadata=metadata)
@@ -223,25 +248,188 @@ class TestMethodValidation(unittest.TestCase):
 
 
 class TestAdapterFormatRejection(unittest.TestCase):
-    def test_dora_input_rejected_with_actionable_message(self) -> None:
+    def test_partial_dora_global_flag_without_magnitude_rejects_at_load(self) -> None:
+        # v1.5 #4 decision #15: global use_dora_flag=True means EVERY module needs a
+        # matching .dora_layer.weight. The existing fixture (global flag, no magnitudes)
+        # now hits the partial-DoRA validation in _collect_modules instead of the
+        # legacy "DoRA family rejected" wall.
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _save_sd(Path(tmpdir), "dora.safetensors", _lora_sd() | {"use_dora_flag": torch.tensor(True)})
 
             with self.assertRaises(ValueError) as cm:
                 mla.load_adapter(path, 1.0)
 
-        self.assertIn("DoRA adapter merge algebra", str(cm.exception))
-        self.assertIn("Rejected input: dora.safetensors", str(cm.exception))
+        self.assertIn("use_dora_flag but missing", str(cm.exception))
+        self.assertIn("lora_unet_block.dora_layer.weight", str(cm.exception))
+        self.assertIn("partial-DoRA", str(cm.exception))
+        self.assertIn("decision #15", str(cm.exception))
 
     def test_dora_cli_rejection_has_no_traceback(self) -> None:
+        # CLI no-traceback contract preserved: a DoRA-input rejection (any kind) must
+        # exit through SystemExit with the actionable message, not a Python traceback.
+        # Fixture is well-formed DoRA (passes partial-DoRA validation) so we hit the
+        # post-load preflight "DoRA requires --base_dit" reject — the rejection layer
+        # most users will encounter in practice.
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = _save_sd(Path(tmpdir), "dora.safetensors", _lora_sd() | {"use_dora_flag": torch.tensor(True)})
+            path = _save_sd(
+                Path(tmpdir),
+                "dora.safetensors",
+                _lora_sd() | {
+                    "use_dora_flag": torch.tensor(True),
+                    "lora_unet_block.dora_layer.weight": torch.zeros(2),
+                },
+            )
 
             with self.assertRaises(SystemExit) as cm:
                 mla.main(["--method", "linear", "--input", path, "1.0", "--preview_spectrum"])
 
-        self.assertIn("DoRA adapter merge algebra", str(cm.exception))
+        self.assertIn("--base_dit", str(cm.exception))
+        self.assertIn("dora.safetensors", str(cm.exception))
         self.assertNotIn("Traceback", str(cm.exception))
+
+    def test_per_module_dora_flag_without_magnitude_rejects_at_load(self) -> None:
+        # _detect_dora's per-module branch detects per-module *.use_dora_flag, and
+        # _collect_modules' partial-DoRA validation rejects when the matching
+        # magnitude key is missing. The original step-2-corrections test for this
+        # now exercises the partial-DoRA reject (decision #15) instead of the
+        # legacy "DoRA family rejected" wall.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _save_sd(
+                Path(tmpdir),
+                "per_module_dora.safetensors",
+                _lora_sd() | {"lora_unet_block.use_dora_flag": torch.tensor(True)},
+            )
+            with self.assertRaises(ValueError) as cm:
+                mla.load_adapter(path, 1.0)
+        self.assertIn("use_dora_flag but missing", str(cm.exception))
+        self.assertIn("lora_unet_block.dora_layer.weight", str(cm.exception))
+        self.assertIn("decision #15", str(cm.exception))
+
+    def test_well_formed_dora_input_rejected_at_preflight_without_base_dit(self) -> None:
+        # v1.5 #4 decision #1: DoRA input passes load_adapter (no longer rejected at
+        # the family wall, has all required magnitudes) but is rejected at post-load
+        # preflight when --base_dit is missing. This is the contract a real DoRA user
+        # will encounter when they forget to pass --base_dit.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _save_sd(
+                Path(tmpdir),
+                "well_formed_dora.safetensors",
+                _lora_sd() | {
+                    "use_dora_flag": torch.tensor(True),
+                    "lora_unet_block.dora_layer.weight": torch.zeros(2),
+                },
+            )
+            # load_adapter itself succeeds — DoRA is now allowed through.
+            adapter = mla.load_adapter(path, 1.0)
+            self.assertTrue(adapter.is_dora)
+            self.assertTrue(adapter.modules["lora_unet_block"].is_dora)
+            self.assertTrue(adapter.modules["lora_unet_block"].has_dora_magnitude)
+
+            # The rejection fires at merge_adapters' post-load preflight.
+            config = _config("--method", "linear", "--input", path, "1.0", "--preview_spectrum")
+            with self.assertRaisesRegex(ValueError, r"DoRA input.*require --base_dit"):
+                mla.run(config)
+
+    def test_magnitude_only_module_treated_as_dora(self) -> None:
+        # Finding 1 fix: a `.dora_layer.weight` key alone (no use_dora_flag anywhere)
+        # marks the module as DoRA — matches _detect_dora's broader detection. Without
+        # this, the adapter would be tagged DoRA at the adapter level (requiring
+        # --base_dit) but silently merged as standard LoRA at the module level (the
+        # magnitude vector ignored). Locks the post-fix unified detection.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _lora_sd() | {"lora_unet_block.dora_layer.weight": torch.ones(2, dtype=torch.float32)}
+            path = _save_sd(Path(tmpdir), "magnitude_only.safetensors", sd)
+            adapter = mla.load_adapter(path, 1.0)
+
+        # Adapter is tagged DoRA (via _detect_dora).
+        self.assertTrue(adapter.is_dora)
+        # AND the module itself is tagged DoRA (no longer split-brain).
+        self.assertTrue(adapter.modules["lora_unet_block"].is_dora)
+        self.assertTrue(adapter.modules["lora_unet_block"].has_dora_magnitude)
+
+    def test_magnitude_only_module_rejects_at_preflight_without_base_dit(self) -> None:
+        # End-to-end consequence of finding 1 fix: a magnitude-only adapter must
+        # require --base_dit through the same preflight path as a flag-marked DoRA
+        # adapter. Pre-fix, this would silently merge as standard LoRA.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _lora_sd() | {"lora_unet_block.dora_layer.weight": torch.ones(2, dtype=torch.float32)}
+            path = _save_sd(Path(tmpdir), "magnitude_only.safetensors", sd)
+            config = _config("--method", "linear", "--input", path, "1.0", "--preview_spectrum")
+            with self.assertRaisesRegex(ValueError, r"DoRA input.*require --base_dit"):
+                mla.run(config)
+
+    def test_orphan_dora_magnitude_without_lora_module_rejects(self) -> None:
+        # Finding 1 second-half: a `.dora_layer.weight` key with no matching LoRA
+        # module would tag the adapter DoRA via _detect_dora but never reach the
+        # per-module DoRA branch — silently leaving the magnitude unused.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _lora_sd() | {"orphan_module.dora_layer.weight": torch.ones(2, dtype=torch.float32)}
+            path = _save_sd(Path(tmpdir), "orphan_mag.safetensors", sd)
+            with self.assertRaisesRegex(ValueError, r"orphan DoRA magnitude key.*orphan_module\.dora_layer\.weight"):
+                mla.load_adapter(path, 1.0)
+
+    def test_dora_magnitude_shape_mismatch_rejects_with_actionable_message(self) -> None:
+        # Finding 2 fix: malformed magnitude tensor (wrong row-norm length) must reject
+        # at load with an actionable ValueError, not escape as a torch RuntimeError
+        # mid-materialization. The default _lora_sd has out_dim=2, so magnitude must
+        # be shape (2,); we provide (3,) to trigger the check.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _lora_sd() | {
+                "use_dora_flag": torch.tensor(True),
+                "lora_unet_block.dora_layer.weight": torch.ones(3, dtype=torch.float32),
+            }
+            path = _save_sd(Path(tmpdir), "bad_mag.safetensors", sd)
+            with self.assertRaisesRegex(ValueError, r"DoRA magnitude shape mismatch.*\(2,\).*\(3,\)"):
+                mla.load_adapter(path, 1.0)
+
+    def test_dora_magnitude_shape_mismatch_cli_no_traceback(self) -> None:
+        # Finding 2 CLI contract: malformed magnitude → SystemExit with the actionable
+        # message, not a Python traceback. Locks the no-traceback contract for the
+        # newly-added shape validation.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _lora_sd() | {
+                "use_dora_flag": torch.tensor(True),
+                "lora_unet_block.dora_layer.weight": torch.ones(3, dtype=torch.float32),
+            }
+            path = _save_sd(Path(tmpdir), "bad_mag.safetensors", sd)
+            with self.assertRaises(SystemExit) as cm:
+                mla.main(["--method", "linear", "--input", path, "1.0", "--preview_spectrum"])
+        self.assertIn("DoRA magnitude shape mismatch", str(cm.exception))
+        self.assertNotIn("Traceback", str(cm.exception))
+
+    def test_conv2d_dora_input_rejected_at_load(self) -> None:
+        # Decision #8: Conv2d DoRA pre-decided as preflight reject, mirroring the
+        # production helper's NotImplementedError. Fires from _collect_modules during
+        # load_adapter, not later in the pipeline.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _save_sd(
+                Path(tmpdir),
+                "conv_dora.safetensors",
+                _lora_sd(
+                    name="lora_unet_conv",
+                    rank=2, in_dim=3, out_dim=2,
+                    down=torch.zeros(2, 3, 1, 1),
+                    up=torch.zeros(2, 2, 1, 1),
+                ) | {
+                    "use_dora_flag": torch.tensor(True),
+                    "lora_unet_conv.dora_layer.weight": torch.zeros(2),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, r"Conv2d DoRA.*decision #8"):
+                mla.load_adapter(path, 1.0)
+
+    def test_false_per_module_dora_flag_without_magnitude_does_not_mark_dora(self) -> None:
+        # Inverse boundary: per-module *.use_dora_flag=False (explicit, no other
+        # DoRA markers) must NOT trigger DoRA detection. _bool_tensor_value honors
+        # the actual boolean value, so a False flag is just unused metadata.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _save_sd(
+                Path(tmpdir),
+                "false_flag.safetensors",
+                _lora_sd() | {"lora_unet_block.use_dora_flag": torch.tensor(False)},
+            )
+            adapter = mla.load_adapter(path, 1.0)
+        self.assertIn("lora_unet_block", adapter.modules)
 
     def test_loha_lokr_hybrid_and_unknown_reject(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1095,8 +1283,16 @@ class TestMetadata(unittest.TestCase):
         self.assertEqual(inputs[0]["weight"], 0.5)
         self.assertEqual(inputs[0]["rank"], 2)
         self.assertEqual(inputs[0]["alpha"], 2.0)
+        # Per-input format tag (v1.5 #4 decision #10) — standard LoRA inputs always "lora".
+        self.assertEqual(inputs[0]["format"], "lora")
         self.assertEqual(metadata["ss_merge_match_semantics"], mla.MATCH_SEMANTICS)
         self.assertEqual(metadata["ss_merge_recompression"], mla.RECOMPRESSION_SEMANTICS)
+        # Backward-compat lock (v1.5 #4 finding-3 follow-up): standard-LoRA-only runs
+        # still record "true" for downstream readers that grep on this key. Only DoRA
+        # runs flip to "false". The companion DoRA-side test is
+        # test_dora_metadata_does_not_claim_rejects_dora_when_dora_input_present.
+        self.assertEqual(metadata["ss_merge_rejects_dora"], "true")
+        self.assertEqual(metadata["ss_merge_dora_inputs"], "false")
 
     def test_metadata_method_specific_args_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1308,10 +1504,15 @@ class TestOutputDtypeAndMaterializationShape(unittest.TestCase):
                 self.assertEqual(live, [], f"Previous module deltas still alive at start of {module_name}")
                 seen.append(module_name)
 
-            def wrapped_materialize(adapter: mla.AdapterInfo, module_name: str) -> torch.Tensor | None:
+            def wrapped_materialize(
+                adapter: mla.AdapterInfo,
+                module_name: str,
+                *,
+                dora_base_tensor: torch.Tensor | None = None,
+            ) -> torch.Tensor | None:
                 live = [ref for ref in refs if ref() is not None]
                 self.assertLessEqual(len(live), len(config.inputs))
-                delta = original(adapter, module_name)
+                delta = original(adapter, module_name, dora_base_tensor=dora_base_tensor)
                 if delta is not None:
                     refs.append(weakref.ref(delta))
                 return delta
@@ -1483,6 +1684,85 @@ def _write_split_shard(tmp: Path, prefix: str, idx: int, count: int, sd: dict[st
     path = tmp / f"{prefix}-{idx:05d}-of-{count:05d}.safetensors"
     save_file(sd, str(path))
     return str(path)
+
+
+class TestBaseDitValidation(unittest.TestCase):
+    """Pins --base_dit CLI surface and mutex contracts for v1.5 #4.
+
+    Tests in this class lock the parse-time portion of the v1.5 #4 contract — flag
+    presence, mutex with --fold_into, and config field plumbing. Adapter-content-dependent
+    rejections (DoRA + no --base_dit, --base_dit + no DoRA, etc.) live in later test
+    classes that land alongside the loader-wall opening and post-load preflight code.
+    """
+
+    def test_base_dit_plus_fold_into_rejects_separate_surfaces(self) -> None:
+        # Decision #4: fold mode and DoRA mode are separate surfaces in v1.5 #4.
+        # Both flags are file-path arguments → mutex is parse-time (no file introspection).
+        with self.assertRaisesRegex(ValueError, r"--base_dit and --fold_into are mutually exclusive"):
+            _config(
+                "--method", "linear",
+                "--input", "a.safetensors", "1.0",
+                "--base_dit", "base.safetensors",
+                "--fold_into", "fold_base.safetensors",
+                "--output", "out.safetensors",
+            )
+
+    def test_base_dit_field_populated_in_config(self) -> None:
+        config = _config(
+            "--method", "linear",
+            "--input", "a.safetensors", "1.0",
+            "--base_dit", "/path/to/base.safetensors",
+            "--output", "out.safetensors",
+            "--output_rank", "8",
+        )
+        self.assertEqual(config.base_dit, "/path/to/base.safetensors")
+
+    def test_base_dit_default_is_none(self) -> None:
+        config = _config(
+            "--method", "linear",
+            "--input", "a.safetensors", "1.0",
+            "--output", "out.safetensors",
+            "--output_rank", "8",
+        )
+        self.assertIsNone(config.base_dit)
+
+    def test_base_dit_without_dora_input_rejects(self) -> None:
+        # Decision #11: --base_dit without DoRA inputs is the accepted-but-ignored case.
+        # Loud reject so a misconfigured pipeline surfaces immediately.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            standard_lora_path = _save_sd(tmp, "standard.safetensors", _lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
+            config = _config(
+                "--method", "linear",
+                "--input", standard_lora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", str(tmp / "out.safetensors"),
+                "--output_rank", "2",
+            )
+            with self.assertRaisesRegex(ValueError, r"--base_dit was provided but no input adapter is DoRA"):
+                mla.run(config)
+
+    def test_base_dit_validation_happens_after_adapter_load_not_at_parse_time(self) -> None:
+        # Decision #11 wording lock: argparse cannot see file contents — DoRA detection
+        # requires opening the safetensors and inspecting use_dora_flag / .dora_layer.weight.
+        # The "no DoRA inputs" check must fire AFTER load_adapter, not at validate_args.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            standard_lora_path = _save_sd(tmp, "standard.safetensors", _lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
+            # validate_args succeeds (parse-time): base_dit is just a path string at this layer.
+            config = _config(
+                "--method", "linear",
+                "--input", standard_lora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", str(tmp / "out.safetensors"),
+                "--output_rank", "2",
+            )
+            # Validation accepts the args; merge_adapters does the post-load preflight reject.
+            self.assertEqual(config.base_dit, base_path)
+            with self.assertRaises(ValueError):
+                mla.run(config)
 
 
 class TestExpandFoldBasePaths(unittest.TestCase):
@@ -2336,6 +2616,268 @@ class TestFoldPipeline(unittest.TestCase):
             self.assertTrue(os.path.exists(out_path))
             self.assertEqual(result.output_path, out_path)
             self.assertEqual(result.base_path, base_path)
+
+
+class TestBaseDitDoraPipeline(unittest.TestCase):
+    """End-to-end tests for v1.5 #4 --base_dit DoRA materialization.
+
+    The load-bearing test is ``test_dora_materialization_matches_production_merge_path``
+    — direct parity against the production runtime DoRA merge formula at
+    ``src/musubi_tuner/utils/lora_utils.py:401-405``. If that test passes, v1.5 #4's
+    DoRA math is correct. If it fails, the entire feature is wrong.
+    """
+
+    def test_dora_materialization_matches_production_merge_path(self) -> None:
+        # THE load-bearing test — v1.5 #4 decision #14 lock at the math level.
+        # Construct a known-good DoRA module and a known-good base tensor; compute the
+        # delta two ways and assert byte-identity:
+        #   Path 1: production formula (lora_utils.py:401-405) reimplemented inline
+        #   Path 2: v1.5 #4 materialize_module_delta with dora_base_tensor
+        rank, in_dim, out_dim = 2, 4, 3
+        down = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.float32)
+        up = torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=torch.float32)
+        alpha = 4.0
+        magnitude = torch.tensor([1.5, 2.5, 3.5], dtype=torch.float32)
+        base_weight = torch.tensor(
+            [[0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2], [1.3, 1.4, 1.5, 1.6]],
+            dtype=torch.float32,
+        )
+
+        # Path 1: production formula
+        scale = alpha / rank
+        lora_delta = (up @ down) * scale
+        weight_norm = mla.dora_weight_norm_materialized(base_weight, lora_delta, 1.0)
+        dora_factor = magnitude / weight_norm
+        merged_weight = dora_factor.view(-1, 1) * (base_weight + lora_delta)
+        expected_delta = merged_weight - base_weight
+
+        # Path 2: v1.5 #4 materialization
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _dora_lora_sd(
+                name="lora_unet_test",
+                rank=rank, in_dim=in_dim, out_dim=out_dim,
+                alpha=alpha, down=down, up=up, magnitude=magnitude,
+            )
+            adapter = mla.load_adapter(_save_sd(Path(tmpdir), "dora.safetensors", sd), 1.0)
+            actual_delta = mla.materialize_module_delta(
+                adapter, "lora_unet_test", dora_base_tensor=base_weight
+            )
+
+        self.assertIsNotNone(actual_delta)
+        self.assertTrue(
+            torch.allclose(actual_delta, expected_delta, atol=1e-6),
+            f"DoRA materialization parity broken: max diff = {(actual_delta - expected_delta).abs().max().item()}",
+        )
+
+    def test_dora_materialization_returns_delta_not_merged_weight(self) -> None:
+        # Decision #14 explicit lock: materialize_module_delta MUST return DELTA
+        # (merged - base), not merged_weight. Surgical assertion: compute both delta
+        # and merged inline using the production formula, then assert the actual return
+        # matches DELTA but NOT MERGED. Catches the off-by-one-concept bug where someone
+        # returns merged_weight by mistake even when both have similar magnitudes.
+        base_weight = torch.full((2, 3), 5.0, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sd = _dora_lora_sd()  # default: in_dim=3, out_dim=2, rank=2
+            adapter = mla.load_adapter(_save_sd(Path(tmpdir), "dora.safetensors", sd), 1.0)
+            actual = mla.materialize_module_delta(adapter, "lora_unet_block", dora_base_tensor=base_weight)
+
+        # Recompute production formula inline.
+        info = adapter.modules["lora_unet_block"]
+        down_t = adapter.state_dict["lora_unet_block.lora_down.weight"].float()
+        up_t = adapter.state_dict["lora_unet_block.lora_up.weight"].float()
+        scale = info.alpha / info.rank
+        lora_delta = (up_t @ down_t) * scale
+        magnitude = adapter.state_dict["lora_unet_block.dora_layer.weight"].float()
+        weight_norm = mla.dora_weight_norm_materialized(base_weight, lora_delta, 1.0)
+        dora_factor = magnitude / weight_norm
+        expected_merged = dora_factor.view(-1, 1) * (base_weight + lora_delta)
+        expected_delta = expected_merged - base_weight
+
+        # The load-bearing assertion: actual matches DELTA, not MERGED.
+        self.assertTrue(torch.allclose(actual, expected_delta, atol=1e-6))
+        # Sanity: delta and merged are sufficiently different to make this test meaningful
+        # (otherwise the test couldn't distinguish them and would silently pass).
+        self.assertFalse(
+            torch.allclose(actual, expected_merged, atol=0.01),
+            "Test fixture is degenerate: delta ≈ merged, so the test cannot detect the bug",
+        )
+
+    def test_mixed_lora_and_dora_inputs_merge_uniformly(self) -> None:
+        # Decision #5: a single invocation can mix standard LoRA and DoRA inputs in the
+        # same --input list. Both become materialized deltas; combine_deltas treats them
+        # uniformly. Proves the dora_base_lookup correctly returns None for non-DoRA
+        # adapters and the resolved base tensor for DoRA adapters.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            standard_path = _save_sd(tmp, "standard.safetensors", _lora_sd())
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", standard_path, "1.0",
+                "--input", dora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", out_path,
+                "--output_rank", "2",
+            )
+            result = mla.run(config)
+
+            self.assertEqual(result.modules_written, 1)
+            # Output exists and is a standard LoRA file (has lora_down/up/alpha keys).
+            loaded = load_file(out_path)
+            self.assertIn("lora_unet_block.lora_down.weight", loaded)
+            self.assertIn("lora_unet_block.lora_up.weight", loaded)
+            self.assertIn("lora_unet_block.alpha", loaded)
+
+    def test_dora_output_does_not_include_use_dora_flag_or_dora_layer_keys(self) -> None:
+        # Decision #13: standard-LoRA output by definition has no DoRA marker tensors.
+        # The SVD recompression naturally produces only lora_down/up/alpha keys, so this
+        # is structurally enforced — but locking it as a test prevents any future
+        # "preserve metadata" regression that might forward DoRA tensors.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", dora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", out_path,
+                "--output_rank", "2",
+            )
+            mla.run(config)
+
+            loaded = load_file(out_path)
+            for key in loaded:
+                with self.subTest(key=key):
+                    self.assertFalse(key.endswith(".dora_layer.weight"), f"DoRA magnitude key leaked: {key}")
+                    self.assertNotIn("use_dora_flag", key, f"DoRA flag key leaked: {key}")
+
+    def test_dora_metadata_records_base_dit_basename_sha256_and_inputs_flag(self) -> None:
+        # Decision #10 metadata contract: ss_merge_dora_inputs aggregate flag,
+        # ss_merge_dora_output_format, ss_merge_base_dit_basename (privacy-safe),
+        # ss_merge_base_dit_sha256, plus per-input "format" field in ss_merge_inputs.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", dora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", out_path,
+                "--output_rank", "2",
+            )
+            mla.run(config)
+
+            with safe_open(out_path, framework="pt") as f:
+                meta = f.metadata()
+
+            self.assertEqual(meta["ss_merge_dora_inputs"], "true")
+            self.assertEqual(meta["ss_merge_dora_output_format"], "standard_lora")
+            self.assertEqual(meta["ss_merge_base_dit_basename"], "base.safetensors")
+            self.assertEqual(meta["ss_merge_base_dit_sha256"], mla._file_sha256(base_path))
+            # Privacy: no absolute paths leaked.
+            self.assertNotIn(tmpdir, meta["ss_merge_base_dit_basename"])
+            # Per-input "format" field present and correctly tagged.
+            inputs = json.loads(meta["ss_merge_inputs"])
+            self.assertEqual(inputs[0]["format"], "dora")
+
+    def test_dora_with_split_safetensors_base_dit(self) -> None:
+        # Decision #7: --base_dit reuses _load_base_as_stored, which handles single-file
+        # AND multi-shard bases. Pass any shard, the helper expands to the canonical set.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            shard_1 = _write_split_shard(tmp, "base", 1, 2, {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            _write_split_shard(tmp, "base", 2, 2, {"other.weight": torch.zeros(4, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", dora_path, "1.0",
+                "--base_dit", shard_1,
+                "--output", out_path,
+                "--output_rank", "2",
+            )
+            mla.run(config)
+
+            with safe_open(out_path, framework="pt") as f:
+                meta = f.metadata()
+            # Hash recorded is the COMPOSITE hash, not the bare file SHA of shard 1.
+            self.assertEqual(meta["ss_merge_base_dit_sha256"], mla._composite_base_hash(shard_1))
+            self.assertNotEqual(meta["ss_merge_base_dit_sha256"], mla._file_sha256(shard_1))
+
+    def test_dora_metadata_does_not_claim_rejects_dora_when_dora_input_present(self) -> None:
+        # Finding 3 fix: ss_merge_rejects_dora must NOT be "true" in DoRA-output runs.
+        # The pre-fix behavior unconditionally wrote "true", which contradicted
+        # ss_merge_dora_inputs="true" and was false provenance. This test pins the
+        # consistent metadata contract. Standard-LoRA-only runs still record "true"
+        # for backward compat — a separate test would verify that, but it's already
+        # implicit in TestMetadata's existing "key is present" check.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", dora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", out_path,
+                "--output_rank", "2",
+            )
+            mla.run(config)
+
+            with safe_open(out_path, framework="pt") as f:
+                meta = f.metadata()
+
+            self.assertEqual(meta["ss_merge_dora_inputs"], "true")
+            self.assertEqual(meta["ss_merge_rejects_dora"], "false")
+
+    def test_fp8_base_dit_error_message_names_correct_flag(self) -> None:
+        # Finding 4 fix: _assert_no_fp8_in_base now takes a flag_name parameter so
+        # the DoRA path's error message says "--base_dit" instead of the fold-mode
+        # default "--fold_into". Direct unit test on the helper.
+        if not hasattr(torch, "float8_e4m3fn"):
+            self.skipTest("torch build lacks float8_e4m3fn")
+        sd = {"fc.weight": torch.zeros(4, 4, dtype=torch.float8_e4m3fn)}
+        with self.assertRaisesRegex(ValueError, r"--base_dit base 'base\.safetensors'"):
+            mla._assert_no_fp8_in_base(sd, "/some/dir/base.safetensors", flag_name="--base_dit")
+        # And the default still says --fold_into.
+        with self.assertRaisesRegex(ValueError, r"--fold_into base 'base\.safetensors'"):
+            mla._assert_no_fp8_in_base(sd, "/some/dir/base.safetensors")
+
+    def test_dora_input_with_output_use_rslora_writes_rslora_standard_lora_output(self) -> None:
+        # Decision #16: DoRA inputs are compatible with --output_use_rslora because output
+        # is LoRA-shaped regardless of input mode. DoRA factors become materialized deltas
+        # first; rsLoRA scaling is a post-SVD output convention. Output has rsLoRA flag
+        # AND no DoRA markers (decision #13 still applies).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dora_path = _save_sd(tmp, "dora.safetensors", _dora_lora_sd())
+            base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
+            out_path = str(tmp / "merged.safetensors")
+            config = _config(
+                "--method", "linear",
+                "--input", dora_path, "1.0",
+                "--base_dit", base_path,
+                "--output", out_path,
+                "--output_rank", "2",
+                "--output_use_rslora",
+            )
+            mla.run(config)
+
+            loaded = load_file(out_path)
+        # rsLoRA flag present.
+        self.assertIn("use_rslora_flag", loaded)
+        self.assertTrue(bool(loaded["use_rslora_flag"].item()))
+        # No DoRA markers (decision #13).
+        for key in loaded:
+            self.assertFalse(key.endswith(".dora_layer.weight"))
+            self.assertNotIn("use_dora_flag", key)
 
 
 class TestFoldResultShape(unittest.TestCase):

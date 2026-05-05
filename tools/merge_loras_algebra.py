@@ -32,6 +32,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from musubi_tuner.networks.dora_utils import dora_weight_norm_materialized
 from musubi_tuner.utils.lora_utils import (
     _make_lora_name_from_model_key,
     convert_diffusers_if_needed,
@@ -75,6 +76,14 @@ class ModuleInfo:
     down_shape: tuple[int, ...]
     up_shape: tuple[int, ...]
     use_rslora: bool = False
+    # v1.5 #4: per-module DoRA tagging. is_dora is True when this specific module is
+    # DoRA-flagged (global use_dora_flag OR per-module *.use_dora_flag), even if the
+    # adapter as a whole has DoRA-shaped metadata for other modules. has_dora_magnitude
+    # records whether the matching .dora_layer.weight tensor is present in the state_dict
+    # — used by the partial-DoRA validation in _collect_modules (decision #15) and by
+    # the materialization dispatch in materialize_module_delta.
+    is_dora: bool = False
+    has_dora_magnitude: bool = False
 
 
 @dataclass
@@ -85,6 +94,10 @@ class AdapterInfo:
     sha256: str
     modules: dict[str, ModuleInfo]
     use_rslora: bool = False
+    # v1.5 #4: adapter-level DoRA tag. True if any DoRA marker is present (see
+    # _detect_dora). Set by load_adapter once the loader wall opens in checkpoint 2;
+    # remains False in checkpoint 1 because DoRA still rejects at _assert_supported_adapter.
+    is_dora: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,6 +123,11 @@ class MergeConfig:
     # When set, switches from LoRA-output to fold-into-checkpoint mode. Mutually exclusive
     # with --output_rank / --output_alpha / --output_use_rslora and preview flags.
     fold_into: str | None
+    # v1.5 #4: when set, enables DoRA input materialization via base-loaded norms. Required
+    # whenever any input adapter is DoRA (decision #1); rejected when no input is DoRA
+    # (decision #11, accepted-but-ignored lens). Output remains standard LoRA in v1.5 #4.
+    # Mutually exclusive with --fold_into (decision #4).
+    base_dit: str | None
 
 
 @dataclass
@@ -277,8 +295,23 @@ def build_parser() -> argparse.ArgumentParser:
             "Path to a base model safetensors checkpoint. Switches output mode from "
             "LoRA-adapter to full-checkpoint: the merged adapter delta is folded into the "
             "matching base tensors (full-rank, no SVD recompression) and written to --output. "
-            "Mutually exclusive with --output_rank, --output_alpha, --output_use_rslora, and "
-            "preview flags. Splits supported via the same shard-pattern rules as model loading."
+            "Mutually exclusive with --output_rank, --output_alpha, --output_use_rslora, "
+            "preview flags, and --base_dit. Splits supported via the same shard-pattern "
+            "rules as model loading."
+        ),
+    )
+    parser.add_argument(
+        "--base_dit",
+        type=str,
+        default=None,
+        help=(
+            "Path to a base model safetensors checkpoint, REQUIRED when any --input adapter "
+            "is DoRA. Enables DoRA input materialization via base-loaded row-wise norms "
+            "(DoRA's direction × magnitude decomposition cannot be materialized correctly "
+            "without the base weight). Output remains standard LoRA — DoRA magnitude vectors "
+            "are discarded on output (lossy but interoperable with every loader). Mutually "
+            "exclusive with --fold_into. Rejected if no inputs are DoRA. Splits supported "
+            "via the same shard-pattern rules as --fold_into."
         ),
     )
     parser.add_argument(
@@ -299,6 +332,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> MergeConfig:
+    # v1.5 #4 decision #4: fold mode and DoRA mode are separate surfaces in v1.5 #4.
+    # A unified mode is deferred to a hypothetical v1.5 #6. Both flags can be checked
+    # for presence at parse time since neither requires file content introspection.
+    if args.base_dit and args.fold_into:
+        raise ValueError(
+            "--base_dit and --fold_into are mutually exclusive. Fold mode writes a "
+            "checkpoint with merged deltas; --base_dit enables DoRA input materialization "
+            "with standard-LoRA output. Use one or the other; a unified mode is deferred."
+        )
+
     fold_mode = bool(args.fold_into)
 
     # ----- Mode-specific output validation (must run before generic rules
@@ -416,6 +459,7 @@ def validate_args(args: argparse.Namespace) -> MergeConfig:
         prune_threshold=args.prune_threshold,
         output_use_rslora=args.output_use_rslora,
         fold_into=args.fold_into,
+        base_dit=args.base_dit,
     )
 
 
@@ -500,12 +544,21 @@ def _composite_base_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> None:
-    """Refuse fold-mode operations on fp8 base checkpoints.
+def _assert_no_fp8_in_base(
+    base_sd: dict[str, torch.Tensor],
+    base_path: str,
+    *,
+    flag_name: str = "--fold_into",
+) -> None:
+    """Refuse base-loaded operations on fp8 base checkpoints.
 
-    fp8 fold would require de-quantize → add delta → re-quantize, including calibration
+    fp8 base would require de-quantize → operate → re-quantize, including calibration
     of new scale factors. That is out of scope for the merge CLI. The actionable
-    resolution is to fold into the unquantized base, then re-quantize downstream.
+    resolution is to operate on the unquantized base, then re-quantize downstream.
+
+    Used by both ``fold_adapters_into_base`` (default ``flag_name="--fold_into"``) and
+    ``merge_adapters`` for v1.5 #4 DoRA mode (callers pass ``flag_name="--base_dit"``).
+    Naming the correct flag in the error message keeps the actionable-error posture.
     """
     fp8_keys = [k for k, t in base_sd.items() if t.dtype in _FP8_DTYPES]
     if not fp8_keys:
@@ -513,10 +566,10 @@ def _assert_no_fp8_in_base(base_sd: dict[str, torch.Tensor], base_path: str) -> 
     sample = ", ".join(f"{k} ({base_sd[k].dtype})" for k in fp8_keys[:3])
     more = f" (+{len(fp8_keys) - 3} more)" if len(fp8_keys) > 3 else ""
     raise ValueError(
-        f"--fold_into base {os.path.basename(base_path)!r} contains fp8 tensors which fold "
-        f"mode does not support: {sample}{more}. fp8 fold would require de-quantize → add → "
-        "re-quantize with scale recalibration, which is out of the merge CLI's scope. Fold "
-        "into the unquantized base, then re-quantize downstream."
+        f"{flag_name} base {os.path.basename(base_path)!r} contains fp8 tensors which "
+        f"the merge CLI does not support: {sample}{more}. fp8 base would require "
+        "de-quantize → operate → re-quantize with scale recalibration, which is out of "
+        "the merge CLI's scope. Operate on the unquantized base, then re-quantize downstream."
     )
 
 
@@ -640,6 +693,71 @@ def resolve_fold_plan(
     return plan
 
 
+def resolve_dora_plan(
+    adapter: AdapterInfo,
+    base_sd: dict[str, torch.Tensor],
+) -> dict[str, FoldTarget]:
+    """Per-adapter DoRA target resolution for ``--base_dit`` materialization.
+
+    Parallel to :func:`resolve_fold_plan` but **per-adapter** — each DoRA adapter
+    independently resolves its own DoRA modules to base keys. Standard LoRA modules
+    inside the same adapter are skipped (they don't need base tensors). The hard
+    rejections mirror :func:`resolve_fold_plan`'s contract (orphan / ambiguous /
+    non-floating / shape mismatch), each with adapter-basename context so multi-adapter
+    error messages name the offending file.
+    """
+    index = build_base_lora_index(base_sd)
+    plan: dict[str, FoldTarget] = {}
+    basename = os.path.basename(adapter.spec.path)
+
+    for module_name, info in adapter.modules.items():
+        if not info.is_dora:
+            continue  # standard LoRA module — no base lookup needed
+
+        candidates = index.get(module_name, [])
+        if not candidates:
+            raise ValueError(
+                f"--base_dit DoRA orphan in {basename}: LoRA module {module_name!r} has "
+                "no matching base tensor (forward index lookup empty). Verify the base "
+                "checkpoint matches the architecture the DoRA adapter was trained against."
+            )
+        if len(candidates) > 1:
+            sample = ", ".join(sorted(candidates)[:3])
+            more = f" (+{len(candidates) - 3} more)" if len(candidates) > 3 else ""
+            raise ValueError(
+                f"--base_dit DoRA ambiguity in {basename}: LoRA module {module_name!r} "
+                f"forward-maps to multiple base keys: {sample}{more}. Refusing to guess. "
+                "Rename or remove the duplicate base keys before merging."
+            )
+
+        base_key = candidates[0]
+        base_tensor = base_sd[base_key]
+
+        if not base_tensor.is_floating_point():
+            raise ValueError(
+                f"--base_dit DoRA non-floating target in {basename}: LoRA module "
+                f"{module_name!r} matched base tensor {base_key!r} with non-floating dtype "
+                f"{base_tensor.dtype}. DoRA norm computation requires a floating-point base."
+            )
+
+        delta_shape = _delta_shape_from_module_info(info)
+        if tuple(base_tensor.shape) != delta_shape:
+            raise ValueError(
+                f"--base_dit DoRA shape mismatch in {basename}: LoRA module {module_name!r} "
+                f"would produce a delta of shape {delta_shape}, but base tensor {base_key!r} "
+                f"has shape {tuple(base_tensor.shape)}."
+            )
+
+        plan[module_name] = FoldTarget(
+            lora_name=module_name,
+            base_key=base_key,
+            base_shape=tuple(base_tensor.shape),
+            base_dtype=base_tensor.dtype,
+        )
+
+    return plan
+
+
 def _git_version() -> str:
     try:
         return subprocess.check_output(
@@ -682,11 +800,41 @@ def _format_rejection_message(path: str, detected_type: str) -> str:
     )
 
 
-def _assert_supported_adapter(sd: dict[str, torch.Tensor], path: str) -> None:
-    has_dora = _has_true_flag(sd, "use_dora_flag") or any(key.endswith(".dora_layer.weight") for key in sd)
-    if has_dora:
-        raise ValueError(_format_rejection_message(path, "dora"))
+def _detect_dora(sd: dict[str, torch.Tensor]) -> bool:
+    """True if the adapter state_dict carries any DoRA marker.
 
+    Markers checked (any one is sufficient):
+
+    * Global ``use_dora_flag`` boolean tensor with value True
+    * Any per-module ``*.use_dora_flag`` boolean tensor with value True
+    * Any ``*.dora_layer.weight`` magnitude tensor key
+
+    Used by :func:`load_adapter` to set :class:`AdapterInfo.is_dora`. The detection
+    is intentionally broader than ``_collect_modules``' per-module check (which sets
+    :class:`ModuleInfo.is_dora`): adapter-level detection considers any DoRA marker
+    (any flag or any magnitude key) so the post-load preflight
+    :func:`_assert_dora_inputs_have_base` always sees ``adapter.is_dora=True`` when
+    ``--base_dit`` should be required. The per-module check independently uses the
+    same broader criterion (global flag OR per-module flag OR has-magnitude) to
+    prevent the split-brain state where the adapter is tagged DoRA but no module
+    receives the DoRA materialization branch (silent corruption — see hardening
+    finding 1 patched 2026-05-04).
+    """
+    if _has_true_flag(sd, "use_dora_flag"):
+        return True
+    for key, value in sd.items():
+        if key.endswith(".use_dora_flag") and _bool_tensor_value(value):
+            return True
+        if key.endswith(".dora_layer.weight"):
+            return True
+    return False
+
+
+def _assert_supported_adapter(sd: dict[str, torch.Tensor], path: str) -> None:
+    # v1.5 #4: DoRA NO LONGER rejected here — load_adapter now tags AdapterInfo.is_dora
+    # via _detect_dora, _collect_modules validates partial-DoRA and Conv2d DoRA per-module,
+    # and the post-load preflight _assert_dora_inputs_have_base rejects DoRA inputs without
+    # --base_dit. LoHa / LoKr / hybrid / split-dims continue to reject at this layer.
     net_type = detect_network_type(sd)
     if net_type != "lora":
         raise ValueError(_format_rejection_message(path, net_type))
@@ -708,6 +856,10 @@ def _alpha_value(sd: dict[str, torch.Tensor], module_name: str, rank: int) -> fl
 def _collect_modules(sd: dict[str, torch.Tensor], path: str) -> dict[str, ModuleInfo]:
     modules: dict[str, ModuleInfo] = {}
     use_rslora = _has_true_flag(sd, "use_rslora_flag")
+    # v1.5 #4: global DoRA flag means EVERY module needs a magnitude tensor (decision #15).
+    # Per-module flags are checked individually below.
+    global_dora = _has_true_flag(sd, "use_dora_flag")
+    basename = os.path.basename(path)
 
     for key, down in sd.items():
         if not key.endswith(".lora_down.weight"):
@@ -715,19 +867,66 @@ def _collect_modules(sd: dict[str, torch.Tensor], path: str) -> dict[str, Module
         module_name = key[: -len(".lora_down.weight")]
         up_key = f"{module_name}.lora_up.weight"
         if up_key not in sd:
-            raise ValueError(f"{os.path.basename(path)} has {key} but missing {up_key}.")
+            raise ValueError(f"{basename} has {key} but missing {up_key}.")
         up = sd[up_key]
         if down.ndim not in (2, 4) or up.ndim not in (2, 4):
-            raise ValueError(f"{os.path.basename(path)} module {module_name} has unsupported LoRA tensor rank.")
+            raise ValueError(f"{basename} module {module_name} has unsupported LoRA tensor rank.")
         rank = int(down.shape[0])
         if rank <= 0:
-            raise ValueError(f"{os.path.basename(path)} module {module_name} has non-positive rank {rank}.")
+            raise ValueError(f"{basename} module {module_name} has non-positive rank {rank}.")
         if int(up.shape[1]) != rank:
             raise ValueError(
-                f"{os.path.basename(path)} module {module_name} has mismatched rank: "
+                f"{basename} module {module_name} has mismatched rank: "
                 f"down shape {tuple(down.shape)}, up shape {tuple(up.shape)}."
             )
         module_use_rslora = use_rslora or _has_true_flag(sd, f"{module_name}.use_rslora_flag")
+
+        # v1.5 #4 per-module DoRA detection + validation.
+        # Finding 1 fix: a magnitude key alone (no flag) ALSO marks the module as DoRA,
+        # matching _detect_dora's broader detection. Without this, a magnitude-only
+        # adapter would tag adapter.is_dora=True, require --base_dit, claim DoRA
+        # provenance in metadata, then silently materialize as standard LoRA (the
+        # magnitude vector ignored). Closes the split-brain detection inconsistency.
+        magnitude_key = f"{module_name}.dora_layer.weight"
+        has_magnitude = magnitude_key in sd
+        module_is_dora = (
+            global_dora
+            or _has_true_flag(sd, f"{module_name}.use_dora_flag")
+            or has_magnitude
+        )
+        if module_is_dora:
+            # Decision #15: partial-DoRA inputs are rejected — silent fallback to standard-LoRA
+            # for any module would produce wrong output. Mirrors production check at
+            # src/musubi_tuner/utils/lora_utils.py:392-396.
+            if not has_magnitude:
+                raise ValueError(
+                    f"{basename} module {module_name} has use_dora_flag but missing "
+                    f"{magnitude_key}. v1.5 #4 rejects partial-DoRA inputs to prevent "
+                    "silent standard-LoRA fallback (decision #15)."
+                )
+            # Decision #8: Conv2d DoRA pre-decided as preflight reject, mirroring the
+            # production helper's NotImplementedError at lora_utils.py:408-409 / :416-417.
+            if down.ndim == 4 or up.ndim == 4:
+                raise ValueError(
+                    f"{basename} module {module_name} is Conv2d DoRA (down shape "
+                    f"{tuple(down.shape)}, up shape {tuple(up.shape)}). v1.5 #4 supports "
+                    "Linear DoRA only — Conv2d DoRA is rejected at preflight, mirroring "
+                    "the production runtime helper's NotImplementedError (decision #8)."
+                )
+            # Finding 2 fix: validate magnitude tensor shape against the LoRA's out_dim.
+            # Without this, a malformed magnitude (e.g. wrong row-norm length) escapes
+            # _collect_modules, then fails mid-materialization with a raw torch RuntimeError
+            # that main()'s except ValueError doesn't catch — surfacing a Python traceback
+            # instead of an actionable CLI rejection.
+            magnitude_tensor = sd[magnitude_key]
+            expected_magnitude_shape = (int(up.shape[0]),)
+            if tuple(magnitude_tensor.shape) != expected_magnitude_shape:
+                raise ValueError(
+                    f"{basename} module {module_name} DoRA magnitude shape mismatch: "
+                    f"expected {expected_magnitude_shape} (row-norm vector matches "
+                    f"up.shape[0]={int(up.shape[0])}), got {tuple(magnitude_tensor.shape)}."
+                )
+
         modules[module_name] = ModuleInfo(
             name=module_name,
             rank=rank,
@@ -735,10 +934,28 @@ def _collect_modules(sd: dict[str, torch.Tensor], path: str) -> dict[str, Module
             down_shape=tuple(down.shape),
             up_shape=tuple(up.shape),
             use_rslora=module_use_rslora,
+            is_dora=module_is_dora,
+            has_dora_magnitude=has_magnitude,
         )
 
+    # Finding 1 second half: orphan-magnitude check. A `.dora_layer.weight` key with
+    # no matching LoRA module would tag the adapter as DoRA via _detect_dora but never
+    # reach the per-module DoRA branch, leaving the magnitude unused and the adapter
+    # mis-tagged. Reject loud at load.
+    for key in sd:
+        if not key.endswith(".dora_layer.weight"):
+            continue
+        magnitude_module = key[: -len(".dora_layer.weight")]
+        if magnitude_module not in modules:
+            raise ValueError(
+                f"{basename} has orphan DoRA magnitude key {key!r} with no matching "
+                f"LoRA module (expected {magnitude_module}.lora_down.weight and "
+                f"{magnitude_module}.lora_up.weight). v1.5 #4 rejects orphan magnitudes "
+                "to prevent silent omission of DoRA factors."
+            )
+
     if not modules:
-        raise ValueError(f"{os.path.basename(path)} contains no standard LoRA modules.")
+        raise ValueError(f"{basename} contains no standard LoRA modules.")
     return modules
 
 
@@ -756,6 +973,10 @@ def load_adapter(path: str, weight: float) -> AdapterInfo:
         sha256=_file_sha256(path),
         modules=modules,
         use_rslora=_has_true_flag(sd, "use_rslora_flag"),
+        # v1.5 #4: tag at load. _detect_dora returns True iff any DoRA marker is present
+        # (global flag, per-module flag, or magnitude key). Used by post-load preflight
+        # _assert_dora_inputs_have_base and (in checkpoint 3) the materialization dispatch.
+        is_dora=_detect_dora(sd),
     )
 
 
@@ -763,7 +984,58 @@ def load_adapters(inputs: Iterable[InputSpec]) -> list[AdapterInfo]:
     return [load_adapter(spec.path, spec.weight) for spec in inputs]
 
 
-def materialize_module_delta(adapter: AdapterInfo, module_name: str) -> torch.Tensor | None:
+def _assert_dora_inputs_have_base(adapters: list[AdapterInfo], config: MergeConfig) -> None:
+    """Enforce v1.5 #4 decisions #1 and #11: DoRA-base pairing is symmetric.
+
+    **Decision #1** — DoRA inputs require ``--base_dit``. Without the base, DoRA's
+    direction × magnitude decomposition cannot be materialized correctly; v1.5 #4
+    refuses to silently fall back to a standard-LoRA approximation.
+
+    **Decision #11** — ``--base_dit`` without any DoRA inputs is the
+    accepted-but-ignored case. Loud reject so a misconfigured pipeline surfaces
+    immediately rather than silently loading and ignoring the base. This check
+    fires at preflight (post-adapter-load), NOT at parse time, because adapter
+    DoRA detection requires opening the safetensors files.
+
+    Called by both ``merge_adapters`` and ``fold_adapters_into_base``. Fold mode
+    never has ``--base_dit`` (decision #4 mutex at parse time), so it can only hit
+    decision #1 — never decision #11.
+    """
+    dora_inputs = [a for a in adapters if a.is_dora]
+    if dora_inputs and config.base_dit is None:
+        names = ", ".join(os.path.basename(a.spec.path) for a in dora_inputs)
+        raise ValueError(
+            f"DoRA input(s) require --base_dit BASE for materialization: {names}. "
+            "DoRA's direction × magnitude decomposition cannot be computed without "
+            "the base weight tensors. v1.5 #4 supports this via standard-LoRA output."
+        )
+    if not dora_inputs and config.base_dit is not None:
+        raise ValueError(
+            "--base_dit was provided but no input adapter is DoRA. --base_dit only "
+            "has meaning for DoRA-input materialization (v1.5 #4 decision #11, "
+            "accepted-but-ignored lens). Remove --base_dit or pass at least one "
+            "DoRA input."
+        )
+
+
+def materialize_module_delta(
+    adapter: AdapterInfo,
+    module_name: str,
+    *,
+    dora_base_tensor: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Compute the materialized delta for one module of one adapter.
+
+    For standard LoRA modules (``info.is_dora=False``): returns ``(up @ down) * scale``,
+    matching v1 behavior exactly. Caller passes ``dora_base_tensor=None`` (the default).
+
+    For DoRA modules (``info.is_dora=True``, v1.5 #4): caller MUST pass the resolved
+    base tensor via ``dora_base_tensor`` (decision #14). Computes the production formula
+    from ``src/musubi_tuner/utils/lora_utils.py:401-405`` and returns the DELTA
+    ``merged_weight - base_weight``, NOT the merged_weight itself. This is the highest-
+    risk off-by-one-concept bug — the merge algebra (``combine_deltas``) expects
+    additive increments, not absolute weights.
+    """
     info = adapter.modules.get(module_name)
     if info is None:
         return None
@@ -785,7 +1057,29 @@ def materialize_module_delta(adapter: AdapterInfo, module_name: str) -> torch.Te
     else:
         raise ValueError(f"{module_name} mixes Linear and Conv2d LoRA tensor shapes, which v1 cannot merge.")
 
-    return delta * scale
+    delta = delta * scale  # standard LoRA materialized delta
+
+    # v1.5 #4 decision #14: DoRA modules return the DELTA (merged - base), NOT merged.
+    # Standard LoRA modules skip this branch and return delta * scale unchanged.
+    if info.is_dora:
+        if dora_base_tensor is None:
+            raise ValueError(
+                f"Module {module_name!r} is DoRA but dora_base_tensor not provided. "
+                "DoRA materialization requires the base weight tensor for the row-wise "
+                "norm computation (decision #14). This indicates a wiring bug — caller "
+                "(merge_adapters) must pass the resolved base tensor for every DoRA module."
+            )
+        magnitude = sd[f"{module_name}.dora_layer.weight"].to(device="cpu", dtype=torch.float32)
+        base_fp32 = dora_base_tensor.to(device="cpu", dtype=torch.float32)
+        # Production formula at src/musubi_tuner/utils/lora_utils.py:401-405.
+        # Pass scaling=1.0 to dora_weight_norm_materialized: the scale is already
+        # absorbed into delta above, so the helper sees `base + delta` directly.
+        weight_norm = dora_weight_norm_materialized(base_fp32, delta, 1.0)
+        dora_factor = magnitude / weight_norm
+        merged_weight = dora_factor.view(-1, 1) * (base_fp32 + delta)
+        delta = merged_weight - base_fp32  # ← DECISION #14: delta, NOT merged_weight
+
+    return delta
 
 
 def _prune_magnitude(tensor: torch.Tensor, density: float) -> torch.Tensor:
@@ -1002,13 +1296,17 @@ def _merge_inputs_metadata(adapters: list[AdapterInfo]) -> str:
                 "weight": adapter.spec.weight,
                 "rank": ranks[0] if len(ranks) == 1 else ranks,
                 "alpha": alphas[0] if len(alphas) == 1 else alphas,
+                # v1.5 #4 decision #10: per-input format provenance. Future readers can tell
+                # which inputs needed base materialization without re-opening every input file.
+                "format": "dora" if adapter.is_dora else "lora",
             }
         )
     return json.dumps(items, sort_keys=True, separators=(",", ":"))
 
 
 def build_metadata(config: MergeConfig, adapters: list[AdapterInfo]) -> dict[str, str]:
-    return {
+    has_dora = any(a.is_dora for a in adapters)
+    metadata: dict[str, str] = {
         "ss_merge_tool": "blissful-tuner",
         "ss_merge_tool_version": _git_version(),
         "ss_merge_method": config.method,
@@ -1025,8 +1323,22 @@ def build_metadata(config: MergeConfig, adapters: list[AdapterInfo]) -> dict[str
         "ss_merge_input_count": str(len(adapters)),
         "ss_merge_match_semantics": MATCH_SEMANTICS,
         "ss_merge_recompression": RECOMPRESSION_SEMANTICS,
-        "ss_merge_rejects_dora": "true",
+        # Finding 3 fix: with v1.5 #4, DoRA inputs are no longer categorically rejected.
+        # When at least one DoRA input is accepted (via --base_dit), recording "true" here
+        # would be false provenance. v1 standard-LoRA-only runs still record "true" for
+        # backward compatibility with downstream readers.
+        "ss_merge_rejects_dora": "false" if has_dora else "true",
     }
+    # v1.5 #4 decision #10: DoRA-specific aggregate provenance. Always record
+    # ss_merge_dora_inputs (as "true"/"false") so a future reader can grep for it
+    # without parsing the per-input JSON. The base_dit basename + composite hash are
+    # only meaningful when --base_dit was actually used, so they're conditional.
+    metadata["ss_merge_dora_inputs"] = "true" if has_dora else "false"
+    if config.base_dit is not None:
+        metadata["ss_merge_dora_output_format"] = "standard_lora"
+        metadata["ss_merge_base_dit_basename"] = os.path.basename(config.base_dit)
+        metadata["ss_merge_base_dit_sha256"] = _composite_base_hash(config.base_dit)
+    return metadata
 
 
 def build_fold_metadata(
@@ -1149,6 +1461,7 @@ def iter_merged_module_deltas(
     adapters: list[AdapterInfo],
     *,
     module_callback: Callable[[str], None] | None = None,
+    dora_base_lookup: Callable[[AdapterInfo, str], torch.Tensor | None] | None = None,
 ) -> Iterator[MergedModuleDelta]:
     """Yield merged-delta results per module in module-union order.
 
@@ -1158,6 +1471,12 @@ def iter_merged_module_deltas(
     ``was_pruned=True``) so callers can preserve v1 ``modules_processed``
     accounting; consumers (SVD output, fold mode) must skip pruned items
     themselves. Modules with no contributing adapters are skipped entirely.
+
+    ``dora_base_lookup`` is an optional callback ``(adapter, module_name) ->
+    base_tensor | None`` used by v1.5 #4 to route DoRA materialization without
+    coupling the generator to ``base_sd`` internals. The callback returns the
+    base tensor for DoRA modules and ``None`` for standard LoRA modules. Callers
+    that don't need DoRA support pass ``None`` (the default).
 
     Raises ``ValueError`` if any module produces a non-finite merged delta or a
     shape mismatch across adapters.
@@ -1169,7 +1488,8 @@ def iter_merged_module_deltas(
         deltas: list[torch.Tensor] = []
         ref_shape: tuple[int, ...] | None = None
         for adapter in adapters:
-            delta = materialize_module_delta(adapter, module_name)
+            base_tensor = dora_base_lookup(adapter, module_name) if dora_base_lookup is not None else None
+            delta = materialize_module_delta(adapter, module_name, dora_base_tensor=base_tensor)
             if delta is None:
                 if ref_shape is None:
                     deltas.append(delta)  # type: ignore[arg-type]
@@ -1224,14 +1544,43 @@ def merge_adapters(
     module_callback: Callable[[str], None] | None = None,
 ) -> MergeResult:
     adapters = load_adapters(config.inputs) if adapters is None else adapters
+    _assert_dora_inputs_have_base(adapters, config)
     _validate_module_shapes_and_output_rank(config, adapters)
+
+    # v1.5 #4: load base + resolve per-DoRA-adapter plans when --base_dit is set.
+    # _assert_dora_inputs_have_base above guarantees: base_dit set ⇔ at least one
+    # DoRA input. So if base_dit is None here, no adapter is DoRA — skip entirely.
+    base_sd: dict[str, torch.Tensor] | None = None
+    dora_plans: dict[int, dict[str, FoldTarget]] = {}
+    dora_base_lookup: Callable[[AdapterInfo, str], torch.Tensor | None] | None = None
+    if config.base_dit is not None:
+        base_sd = _load_base_as_stored(config.base_dit)
+        _assert_no_fp8_in_base(base_sd, config.base_dit, flag_name="--base_dit")
+        for adapter in adapters:
+            if adapter.is_dora:
+                dora_plans[id(adapter)] = resolve_dora_plan(adapter, base_sd)
+        # Closure over base_sd + dora_plans. Returns the resolved base tensor for
+        # DoRA modules; returns None for standard LoRA modules and for adapters
+        # not in the DoRA plan dict (mixed standard + DoRA inputs, decision #5).
+        def dora_base_lookup(adapter: AdapterInfo, module_name: str) -> torch.Tensor | None:
+            plan = dora_plans.get(id(adapter))
+            if plan is None:
+                return None
+            target = plan.get(module_name)
+            if target is None:
+                return None
+            assert base_sd is not None
+            return base_sd[target.base_key]
+
     output_sd: dict[str, torch.Tensor] = {}
     spectrum_energy: dict[int, list[float]] = {rank: [] for rank in SPECTRUM_RANKS}
     per_module_energy: dict[str, dict[int, float]] = {}
 
     modules_written = 0
     modules_processed = 0
-    for item in iter_merged_module_deltas(config, adapters, module_callback=module_callback):
+    for item in iter_merged_module_deltas(
+        config, adapters, module_callback=module_callback, dora_base_lookup=dora_base_lookup
+    ):
         modules_processed += 1
         if item.was_pruned:
             continue
@@ -1303,6 +1652,11 @@ def fold_adapters_into_base(
         FoldResult docstring for the memory rationale).
     """
     adapters = load_adapters(config.inputs) if adapters is None else adapters
+    # v1.5 #4 decision #1: DoRA inputs require --base_dit. Fold mode never has --base_dit
+    # (mutex at parse time), so DoRA + --fold_into hits this with the same actionable
+    # message that LoRA-output-mode users see — naturally surfaces "DoRA + fold mode is
+    # unsupported in v1.5 #4" without a separate fold-specific code path.
+    _assert_dora_inputs_have_base(adapters, config)
     _validate_module_shapes_and_output_rank(config, adapters)
 
     assert config.fold_into is not None
