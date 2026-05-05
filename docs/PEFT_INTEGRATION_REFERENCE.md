@@ -382,22 +382,32 @@ this list and are kept here as anchor points for grep searches.
      `.safetensors` with provenance metadata.
 
 6. **PiSSA / OLoRA initialization (deferred from Tier 1).**
-   _Status: not implemented; gated on metadata + safety-check infrastructure
-   that doesn't exist yet._
+   _Status: ready to start for single-DiT architectures (Tier 2 #6a write
+   infrastructure landed 2026-05-05); WAN dual-expert still blocked on a
+   Tier 2 #6a-2 follow-up._
    - **PEFT references**: `/home/dustin/peft/src/peft/tuners/lora/layer.py:360`
      (PiSSA), `:315` (OLoRA). Both are SVD-on-base then split-out
      initialization that *mutates the base DiT weights at init time*.
-   - **Prerequisite work** before this is safe to ship:
-     1. Persist a base-weight hash in the LoRA safetensors metadata
-        (e.g. `ss_base_sha256` for the DiT file) at save time.
-     2. `merge_lora.py` reads the hash and refuses to merge if the user-
-        supplied base doesn't match. Same check in the Tier 0 fast helper.
+   - **Prerequisite work** status:
+     1. ✅ Persist a base-weight hash in the LoRA safetensors metadata
+        (`ss_base_sha256`) at save time. Shipped 2026-05-05 — see "Already
+        shipped" entry for Tier 2 #6a above. Single-DiT only; WAN
+        dual-expert hash semantics (per-expert keys + any-match validation)
+        deferred to Tier 2 #6a-2 follow-up.
+     2. Promote the hotswap-side check from warn-only to hard-reject when
+        the LoRA metadata declares it was PiSSA-initialized. Same check
+        applicable in `merge_lora.py` and the Tier 0 fast helper. Read
+        infrastructure already exists (`_check_lora_base_hash` in
+        `lora_utils.py`); needs a new `ss_lora_init=pissa` discriminator
+        or a stricter mode of the existing `--hotswap_strict_base_hash`.
      3. Explicit metadata flag like `ss_lora_init=pissa` so downstream
         tooling can render warnings or special-case behavior.
-   - **Why deferred**: an init that mutates base weights is a foot-gun
-     without the hash check. A user training PiSSA on `flux2-base.safetensors`
-     and then merging into `flux2-base-finetuned.safetensors` gets silently
-     wrong results.
+   - **Why this matters now**: with prereq #1 shipped, PiSSA on
+     single-DiT trainers (Qwen, Z-Image, FLUX.2, etc.) can ship behind a
+     hash-checked safety net. A user training PiSSA on
+     `flux2-base.safetensors` and then merging into
+     `flux2-base-finetuned.safetensors` will get a hard reject (or
+     loud warn) instead of silently wrong results.
 
 7. **AdaLoRA rank allocator** for adaptive `--network_dim`.
    _Status: blissful-tuner's `--network_dim` is a fixed scalar; users
@@ -501,6 +511,29 @@ A. **`merge_lora.py` + `--base_weights` + block-swap interaction** in
   2026-05-03** — see `docs/plans/2026-05-02-peft-tier1-hotswap.md`
   "Validation summary." Other architectures (FLUX.2, Z-Image, etc.)
   deferred to Phase 2.
+- **Tier 2 #6a `ss_base_sha256` write infrastructure** — commits
+  `fd4a4db` / `ffb7c29` / `ab3fd85` (2026-05-05). Closes the read/write
+  loop on the hotswap base-hash validator that shipped in Tier 1 #1
+  (which had been warn-only because no trainer wrote the metadata).
+  `compute_training_base_hash(args)` reuses the existing
+  `compute_base_hash` primitive; `inject_ss_base_sha256_metadata` and
+  `compute_and_log_base_sha256` cover the two trainer composition
+  patterns (single-pass dict reuse vs per-save closure rebuild). Wired
+  into the shared `NetworkTrainer` metadata block (covers 9 LoRA
+  trainers via inheritance: HV, WAN, HV1.5, Qwen, Z-Image, FLUX.2,
+  Kontext, FramePack, K5) plus all 3 full-FT trainers
+  (`qwen_image_train.py`, `zimage_train.py`, `hv_train.py` SAI per-save
+  closure). 24 CPU tests in `tests/test_compute_training_base_hash.py`
+  including round-trip closure with `_check_lora_base_hash` (the test
+  that caught the original combined-list-hash design bug). Option D
+  scope: WAN dual-expert (`args.dit_high_noise` truthy) returns None
+  with a deferral warning, since the read-side hashes per-expert and
+  a combined two-file hash would silently hard-reject every WAN
+  dual-expert LoRA at hotswap strict mode. Per-expert metadata keys
+  + read-side any-match validation are deferred to a Tier 2 #6a-2
+  follow-up. Tier 2 #6 PiSSA's "prerequisite #1" is now satisfied for
+  single-DiT trainers (Qwen / Z-Image / FLUX.2 etc.); WAN PiSSA still
+  blocked. See `docs/plans/2026-05-05-peft-tier2-6a-base-hash-write.md`.
 
 ## What is *not* worth integrating
 
