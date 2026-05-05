@@ -6,6 +6,9 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 from musubi_tuner.networks import lora
 from musubi_tuner.utils.lora_utils import (
+    _check_lora_base_hash,
+    _read_safetensors_metadata,
+    compute_base_hash,
     convert_diffusers_if_needed,
     detect_network_type,
     format_unknown_network_type_error,
@@ -107,12 +110,61 @@ def parse_args():
     return parser.parse_args()
 
 
+def _pissa_base_hash_preflight(args: argparse.Namespace) -> None:
+    """Validate PiSSA-tagged LoRA base hashes BEFORE loading the DiT model.
+
+    Iterates args.lora_weight, reads each LoRA's metadata header (no tensor
+    load), and for any LoRA tagged with ss_init_lora_weights="pissa*" runs
+    _check_lora_base_hash with init_pissa=True and strict=True. Computes
+    the base hash exactly once (cached) regardless of how many PiSSA LoRAs
+    are in the merge set.
+
+    Strict-by-default rationale (per locked Tier 2 #6b plan): offline merge
+    writes a derived checkpoint, so artifact-safety failures should be loud.
+    Hotswap has --no-hotswap_strict_base_hash because it's an interactive
+    runtime path; merge has no such opt-out in v1. A future
+    --allow_pissa_missing_base_hash flag can have its own design pass if a
+    real user needs it.
+
+    Skips entirely for non-PiSSA LoRAs to avoid noisy new behavior for
+    standard merge users — pinned by tests to ensure no metadata read or
+    hash compute fires when no PiSSA-tagged LoRAs are present.
+    """
+    lora_paths = getattr(args, "lora_weight", None) or []
+    if not lora_paths:
+        return
+
+    base_hash: Optional[str] = None
+    for lora_path in lora_paths:
+        metadata = _read_safetensors_metadata(lora_path)
+        if not metadata:
+            continue
+        init_lora_weights = metadata.get("ss_init_lora_weights", "")
+        if not init_lora_weights.startswith("pissa"):
+            continue
+        if base_hash is None:
+            logger.info(f"PiSSA LoRA detected ({lora_path}); computing base hash for preflight")
+            base_hash = compute_base_hash([args.dit])
+        _check_lora_base_hash(
+            metadata,
+            lora_path,
+            base_hash,
+            strict=True,
+            init_pissa=True,
+        )
+
+
 def main():
     args = parse_args()
 
     device = torch.device(args.device)
     logger.info(f"Using device: {device}")
     logger.info(f"safe_merge finite checks: {'enabled' if args.safe_merge else 'disabled'}")
+
+    # PiSSA preflight: fail before load_transformer if any input LoRA is
+    # PiSSA-tagged and the base hash doesn't match. Cheaper than discovering
+    # the mismatch after a multi-GB model load.
+    _pissa_base_hash_preflight(args)
 
     architecture = _resolve_architecture(args.architecture, args.lora_weight)
     logger.info(f"Architecture: {architecture}")
