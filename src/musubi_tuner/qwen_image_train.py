@@ -48,6 +48,7 @@ import logging
 from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.device_utils import synchronize_device
+from musubi_tuner.utils.lora_utils import inject_ss_base_sha256_metadata
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors, mem_eff_save_file
 
 logger = logging.getLogger(__name__)
@@ -495,6 +496,8 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                 # metadata["ss_new_sd_model_hash"] = model_utils.calculate_sha256(sd_model_name)
                 sd_model_name = os.path.basename(sd_model_name)
             metadata["ss_sd_model_name"] = sd_model_name
+
+        inject_ss_base_sha256_metadata(args, metadata)
 
         if args.vae is not None:
             # logger.info(f"calculate hash for VAE model: {args.vae}")

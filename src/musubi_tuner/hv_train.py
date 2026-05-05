@@ -48,6 +48,7 @@ from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
 from blissful_tuner.blissful_logger import BlissfulLogger
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
+from musubi_tuner.utils.lora_utils import compute_and_log_base_sha256
 
 logger = BlissfulLogger(__name__, "green")
 
@@ -971,6 +972,13 @@ class FineTuningTrainer:
         loss_recorder = train_utils.LossRecorder()
         del train_dataset_group
 
+        # Cache base hash once at training start; the per-save SAI metadata
+        # closure below rebuilds sai_metadata on every checkpoint and would
+        # otherwise recompute the hash from disk each time (~50s for HV's
+        # ~26 GB base). compute_and_log_base_sha256 also emits the
+        # provenance log / WAN dual-expert deferral warning here.
+        base_sha256 = compute_and_log_base_sha256(args)
+
         # function for saving/removing
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1000,6 +1008,8 @@ class FineTuningTrainer:
                 is_lora=False,
                 custom_arch=args.metadata_arch,
             )
+            if base_sha256 is not None:
+                sai_metadata["ss_base_sha256"] = base_sha256
 
             save_file(unwrapped_nw.state_dict(), ckpt_file, sai_metadata)
             if args.huggingface_repo_id is not None:

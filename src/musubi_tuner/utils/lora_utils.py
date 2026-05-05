@@ -594,30 +594,51 @@ def _expand_weight_paths(paths: List[str]) -> List[str]:
     return expanded
 
 
-def inject_ss_base_sha256_metadata(args: argparse.Namespace, metadata: Dict[str, str]) -> None:
-    """Add ss_base_sha256 to metadata when computable; warn when deferred.
+def compute_and_log_base_sha256(args: argparse.Namespace) -> Optional[str]:
+    """Compute the training-time base hash and log the appropriate message.
 
-    Single helper called from every trainer's metadata composition site
-    (1 shared LoRA path in hv_train_network.py + 3 full-FT trainers).
-    Mutates the metadata dict in place so each caller reduces to one line:
-    `inject_ss_base_sha256_metadata(args, metadata)`.
+    Returns the hash for the caller to cache. Use this directly when the
+    metadata composition happens INSIDE a per-save closure (e.g.,
+    hv_train.py's FineTuningTrainer.train.save_model) so the hash isn't
+    recomputed from disk on every checkpoint write — a real cost for big
+    bases (HV's ~26 GB → ~50s SHA256 per save).
 
-    Behavior matches compute_training_base_hash:
-      - args.dit unset/empty: no metadata change, no log.
-      - args.dit_high_noise truthy: no metadata change, warn about WAN
-        dual-expert deferral so the user knows hotswap on the resulting
-        LoRA will be warn-only.
-      - otherwise: metadata["ss_base_sha256"] set, info log with prefix.
+    For the simpler "metadata dict built once, reused per save" pattern,
+    use inject_ss_base_sha256_metadata(args, metadata) instead — it
+    wraps this helper plus the dict mutation in a single one-line call.
+
+    Behavior:
+      - args.dit unset/empty: returns None silently.
+      - args.dit_high_noise truthy: returns None and warns about WAN
+        dual-expert deferral.
+      - otherwise: returns hash and logs an info line with the prefix.
     """
     base_sha256 = compute_training_base_hash(args)
     if base_sha256 is not None:
-        metadata["ss_base_sha256"] = base_sha256
         logger.info(f"recorded ss_base_sha256={base_sha256[:12]}... for base provenance validation")
     elif getattr(args, "dit_high_noise", None):
         logger.warning(
             "ss_base_sha256 omitted: WAN dual-expert (args.dit_high_noise set) deferred "
             "to Tier 2 #6a-2 follow-up. Hotswap of LoRAs from this run will be warn-only."
         )
+    return base_sha256
+
+
+def inject_ss_base_sha256_metadata(args: argparse.Namespace, metadata: Dict[str, str]) -> None:
+    """Add ss_base_sha256 to metadata when computable; warn when deferred.
+
+    One-line caller for the "metadata dict built once, reused per save"
+    pattern (the shared LoRA NetworkTrainer path + the two image full-FT
+    trainers). Wraps compute_and_log_base_sha256 plus the dict mutation.
+
+    For the rebuilt-per-save closure pattern (hv_train.py SAI metadata),
+    cache compute_and_log_base_sha256(args) once at training start and
+    check-and-inject inside the closure to avoid recomputing the hash
+    on every save.
+    """
+    base_sha256 = compute_and_log_base_sha256(args)
+    if base_sha256 is not None:
+        metadata["ss_base_sha256"] = base_sha256
 
 
 def compute_training_base_hash(args: argparse.Namespace) -> Optional[str]:

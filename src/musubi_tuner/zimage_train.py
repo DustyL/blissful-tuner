@@ -40,6 +40,7 @@ import logging
 
 from musubi_tuner.zimage_train_network import ZImageNetworkTrainer
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
+from musubi_tuner.utils.lora_utils import inject_ss_base_sha256_metadata
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
 logger = logging.getLogger(__name__)
@@ -401,6 +402,8 @@ class ZImageTrainer(ZImageNetworkTrainer):
             if os.path.exists(sd_model_name):
                 sd_model_name = os.path.basename(sd_model_name)
             metadata["ss_sd_model_name"] = sd_model_name
+
+        inject_ss_base_sha256_metadata(args, metadata)
 
         if args.vae is not None:
             logger.info(f"set VAE model name for metadata: {args.vae}")

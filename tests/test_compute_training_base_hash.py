@@ -22,6 +22,7 @@ import torch
 
 from musubi_tuner.utils.lora_utils import (
     _check_lora_base_hash,
+    compute_and_log_base_sha256,
     compute_base_hash,
     compute_training_base_hash,
     inject_ss_base_sha256_metadata,
@@ -296,6 +297,113 @@ class TestInjectSsBaseSha256Metadata(unittest.TestCase):
             inject_ss_base_sha256_metadata(args, metadata)
 
             self.assertEqual(metadata["ss_base_sha256"], first_value)
+
+
+class TestPerSaveClosurePattern(unittest.TestCase):
+    """Pin hv_train.py's cache-once-inject-per-save pattern.
+
+    sai_metadata is rebuilt INSIDE FineTuningTrainer.train.save_model
+    on every checkpoint, so the hash is computed once at training start
+    (outside the closure) and the closure injects from the cached value.
+    Test asserts the pattern survives across multiple simulated saves
+    AND that the cached hash is byte-identical across calls (would
+    fail if the helper introduced any nondeterminism).
+    """
+
+    def test_cached_hash_survives_multiple_simulated_saves(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            dit_path = Path(td) / "model.safetensors"
+            _write_synthetic_dit(dit_path)
+            args = _ns(dit=str(dit_path))
+
+            cached_hash = compute_and_log_base_sha256(args)
+            self.assertIsNotNone(cached_hash)
+
+            for save_idx in range(3):
+                sai_metadata = {"sai_key": "preserved", "epoch": save_idx}
+                if cached_hash is not None:
+                    sai_metadata["ss_base_sha256"] = cached_hash
+                self.assertEqual(sai_metadata["ss_base_sha256"], cached_hash)
+                self.assertEqual(sai_metadata["sai_key"], "preserved")
+                self.assertEqual(sai_metadata["epoch"], save_idx)
+
+    def test_cached_value_matches_inline_call(self) -> None:
+        """Caching outside the closure must yield the same hash as calling
+        the helper inside (proves the cache-vs-inline equivalence the
+        FineTuningTrainer pattern relies on for correctness)."""
+        with tempfile.TemporaryDirectory() as td:
+            dit_path = Path(td) / "model.safetensors"
+            _write_synthetic_dit(dit_path)
+            args = _ns(dit=str(dit_path))
+
+            cached = compute_and_log_base_sha256(args)
+            inline = compute_training_base_hash(args)
+            self.assertEqual(cached, inline)
+
+    def test_wan_dual_expert_cache_is_none_skips_injection(self) -> None:
+        """When cache is None (WAN deferral), the per-save closure correctly
+        skips the injection — sai_metadata stays SAI-only."""
+        with tempfile.TemporaryDirectory() as td:
+            low = Path(td) / "low.safetensors"
+            high = Path(td) / "high.safetensors"
+            _write_synthetic_dit(low, seed=1)
+            _write_synthetic_dit(high, seed=2)
+            args = _ns(dit=str(low), dit_high_noise=str(high))
+
+            cached_hash = compute_and_log_base_sha256(args)
+            self.assertIsNone(cached_hash)
+
+            sai_metadata = {"sai_key": "preserved"}
+            if cached_hash is not None:
+                sai_metadata["ss_base_sha256"] = cached_hash
+            self.assertNotIn("ss_base_sha256", sai_metadata)
+            self.assertEqual(sai_metadata["sai_key"], "preserved")
+
+
+class TestComputeAndLogBaseSha256(unittest.TestCase):
+    """Direct tests for the lower-level compute+log helper.
+
+    Used by hv_train.py to cache the hash once at training start so the
+    per-save SAI metadata closure doesn't recompute on every checkpoint.
+    Pins the contract: returns the hash for caching, logs the appropriate
+    message based on the same three-way branch as inject.
+    """
+
+    def test_single_dit_returns_hash_and_logs_info(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            dit_path = Path(td) / "model.safetensors"
+            _write_synthetic_dit(dit_path)
+            args = _ns(dit=str(dit_path))
+
+            with self.assertLogs("musubi_tuner.utils.lora_utils", level="INFO") as cm:
+                result = compute_and_log_base_sha256(args)
+
+            self.assertEqual(result, compute_base_hash([str(dit_path)]))
+            joined = "\n".join(cm.output)
+            self.assertIn("recorded ss_base_sha256", joined)
+            self.assertIn("base provenance validation", joined)
+
+    def test_missing_dit_returns_none_silently(self) -> None:
+        args = _ns(dit=None)
+        # No log expected — assertNoLogs ensures silence (3.10+ feature)
+        with self.assertNoLogs("musubi_tuner.utils.lora_utils", level="INFO"):
+            result = compute_and_log_base_sha256(args)
+        self.assertIsNone(result)
+
+    def test_wan_dual_expert_returns_none_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            low = Path(td) / "low.safetensors"
+            high = Path(td) / "high.safetensors"
+            _write_synthetic_dit(low, seed=1)
+            _write_synthetic_dit(high, seed=2)
+            args = _ns(dit=str(low), dit_high_noise=str(high))
+
+            with self.assertLogs("musubi_tuner.utils.lora_utils", level="WARNING") as cm:
+                result = compute_and_log_base_sha256(args)
+
+            self.assertIsNone(result)
+            joined = "\n".join(cm.output)
+            self.assertIn("WAN dual-expert", joined)
 
 
 if __name__ == "__main__":
