@@ -61,9 +61,9 @@ After training, standard LoRA checkpoints can be combined with `tools/merge_lora
   --output merged_ties_rank64.safetensors
 ```
 
-The tool supports `linear`, `ties`, `dare_linear`, and `dare_ties`. By default it writes standard LoRA safetensors by SVD recompression, so `--output_rank` is required when writing a LoRA output file. Use `--preview_spectrum` to inspect singular-value energy before choosing a rank. For downstream consumers that need a full checkpoint instead of an adapter, `--fold_into <base.safetensors>` folds the merged delta into matching base tensors and writes a checkpoint-shaped safetensors file to `--output`.
+The tool supports `linear`, `ties`, `dare_linear`, and `dare_ties`. By default it writes standard LoRA safetensors by SVD recompression, so `--output_rank` is required when writing a LoRA output file. Use `--preview_spectrum` to inspect singular-value energy before choosing a rank. For downstream consumers that need a full checkpoint instead of an adapter, `--fold_into <base.safetensors>` folds the merged delta into matching base tensors and writes a checkpoint-shaped safetensors file to `--output`. For DoRA adapters, `--base_dit <base.safetensors>` enables base-loaded materialization (SVD recompressed back to standard LoRA — lossy but interoperable with every loader); see `docs/tools.md` for the full DoRA contract.
 
-In v1, the tool intentionally rejects DoRA, LoHa, LoKr, hybrid, and unknown adapter formats during preflight. DoRA merge algebra requires base-model weights and is deferred to a future base-loaded mode.
+LoHa, LoKr, hybrid, and unknown adapter formats are rejected during preflight. DoRA merge algebra requires base-model weights — `--base_dit` provides those for v1.5 #4 standard-LoRA output; full DoRA output (with re-derived magnitudes) is deferred.
 
 ### Supported Architectures
 

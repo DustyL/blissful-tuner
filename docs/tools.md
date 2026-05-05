@@ -123,6 +123,34 @@ fold summary: 108 modules folded; 4 modules pruned; 940 base tensors not delta-m
 
 The output is written atomically via a sibling temp file + `os.replace`, so a failed fold leaves no partial output behind. The output checkpoint metadata includes `ss_merge_output_format=checkpoint`, `ss_merge_base_basename` (basename only — never the absolute path), `ss_merge_base_sha256`, and `ss_merge_modules_resolved` / `ss_merge_modules_folded` / `ss_merge_modules_pruned` / `ss_merge_base_tensors_total` / `ss_merge_base_tensors_modified` counts. LoRA-only metadata fields (`ss_merge_output_rank`, `ss_merge_output_alpha`, `ss_merge_output_use_rslora`, `ss_merge_recompression`) are omitted.
 
+`--base_dit <base.safetensors>` enables **DoRA input materialization** with standard-LoRA output. v1 of the merge CLI rejected DoRA inputs at the loader; with `--base_dit`, DoRA inputs are loaded, materialized correctly via the production runtime DoRA formula (`merged_weight = magnitude × (base + delta) / ||base + delta||`), the resulting delta `merged_weight - base_weight` enters the same merge algebra as standard LoRA inputs, and the output is SVD-recompressed back to a standard LoRA adapter. Lossy (the DoRA magnitude vector is discarded on output) but interoperable with every loader. A future flag could add full DoRA output via magnitude re-derivation, but for now the standard-LoRA output is the only supported shape.
+
+```bash
+./venv314/bin/python tools/merge_loras_algebra.py \
+    --method linear \
+    --input dora_adapter.safetensors 1.0 \
+    --base_dit base_model.safetensors \
+    --output_rank 64 \
+    --output dora_merged_as_lora.safetensors
+```
+
+DoRA mode runs preflight checks at adapter load and at base load. Hard-rejected:
+
+- **DoRA input without `--base_dit`**: rejected at post-load preflight (after adapter introspection — argparse cannot see file contents). Names the offending DoRA input file in the message.
+- **`--base_dit` without DoRA inputs**: rejected at the same preflight. The accepted-but-ignored lens — a misconfigured pipeline surfaces immediately.
+- **Partial-DoRA**: `use_dora_flag=True` with any module missing its `.dora_layer.weight` magnitude. v1.5 #4 refuses to silently fall back to standard-LoRA treatment for the missing modules; mirrors the production runtime check.
+- **Orphan magnitude**: a `.dora_layer.weight` key with no matching `.lora_down.weight` / `.lora_up.weight`. Without this guard the adapter would be tagged DoRA but the magnitude would never participate in module collection.
+- **Bad magnitude shape**: magnitude tensor whose shape doesn't match the row-norm vector size (`up.shape[0]`). Rejected at load with the module name + expected/actual shapes; without this, the malformed magnitude would escape as a raw PyTorch `RuntimeError` mid-pipeline (Python traceback to the user).
+- **Conv2d DoRA**: pre-decided as preflight reject, mirroring the production helper's `NotImplementedError` for Conv2d DoRA. Linear-only support in v1.5 #4.
+- **Forward-index resolution failures**: orphan / ambiguous / non-floating / shape-mismatch base targets — same checks as `--fold_into`, reused via `build_base_lora_index`. Architectures with fused-QKV bases (Z-Image-style) that don't match split-projection LoRAs will reject orphans here, same as fold mode.
+- **fp8 base**: same reject as `--fold_into`, with the error message correctly naming `--base_dit`.
+
+`--base_dit` is mutually exclusive with `--fold_into` (fold mode and DoRA mode are separate surfaces). It is **compatible** with `--output_use_rslora` — DoRA inputs become materialized deltas first, then SVD recompression and rsLoRA scaling apply to the output identically to the standard-LoRA-input path. Mixed standard-LoRA + DoRA inputs in the same `--input` list are supported (decision #5): each adapter contributes its own materialized delta, and the merge algebra treats them uniformly.
+
+The output safetensors contains only standard LoRA factor tensors (`*.lora_down.weight`, `*.lora_up.weight`, `*.alpha`); DoRA marker tensors (`use_dora_flag`, `*.dora_layer.weight`) are dropped. Output metadata adds: `ss_merge_dora_inputs=true`, `ss_merge_dora_output_format=standard_lora`, `ss_merge_base_dit_basename` (basename only — never the absolute path), `ss_merge_base_dit_sha256` (composite hash for split bases, equals `sha256sum` for single-file bases), and a per-input `"format": "lora"|"dora"` field inside the existing `ss_merge_inputs` JSON list. The `ss_merge_rejects_dora` field flips from `"true"` (v1 standard-LoRA-only runs) to `"false"` when any DoRA input is present, since the tool no longer categorically rejects DoRA when `--base_dit` is provided.
+
+Split safetensors bases are supported transparently, same as `--fold_into` — pass any shard and `_load_base_as_stored` expands to the canonical set.
+
 ## LoRA Post-Hoc EMA merging / LoRAのPost-Hoc EMAマージ
 
 The LoRA Post-Hoc EMA (Exponential Moving Average) merging is a technique to combine multiple LoRA checkpoint files into a single, potentially more stable model. This method applies exponential moving average across multiple checkpoints sorted by modification time, with configurable decay rates.

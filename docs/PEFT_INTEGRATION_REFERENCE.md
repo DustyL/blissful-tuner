@@ -338,9 +338,10 @@ this list and are kept here as anchor points for grep searches.
 
 5. **Adapter merge algebra** (TIES, DARE, SVD, magnitude pruning) for
    `lora_post_hoc_ema.py` family.
-   _Status: v1 shipped; v1.5 stay-as-LoRA extensions shipped; `--fold_into`
-   checkpoint output implemented and real-weights validated locally, pending
-   commit split. EMA averaging still exists separately._
+   _Status: v1 shipped; v1.5 #1 / #2 / #3 shipped (prune_threshold,
+   output_use_rslora, fold_into); v1.5 #4 (`--base_dit` for DoRA input
+   materialization) implemented and real-weights validated locally,
+   pending commit split. EMA averaging still exists separately._
    - **PEFT reference**: `/home/dustin/peft/src/peft/utils/merge_utils.py:185`
      (`ties`/`dare`/`task_arithmetic`) — pure tensor algebra, **no PEFT
      runtime dependency**, transcribed into a standalone offline CLI.
@@ -353,8 +354,8 @@ this list and are kept here as anchor points for grep searches.
         delta; output standard LoRA (`alpha / rank`) without
         `use_rslora_flag`.
      5. Reject DoRA, LoHa, LoKr, hybrid, split-dims, and unknown inputs
-        during preflight with actionable errors. DoRA support is deferred
-        because correct delta materialization needs base weights.
+        during preflight with actionable errors. DoRA support deferred
+        until v1.5 #4.
    - **v1.5 output modes**:
      1. `--prune_threshold` skips near-zero materialized deltas before output.
      2. `--output_use_rslora` writes rsLoRA-shaped LoRA output when requested.
@@ -363,6 +364,18 @@ this list and are kept here as anchor points for grep searches.
         base tensors at full rank, the result is written atomically as a full
         base-shaped safetensors file, and LoRA-only recompression metadata is
         omitted.
+     4. `--base_dit <base.safetensors>` enables DoRA input materialization
+        with standard-LoRA output (v1.5 #4). Calls the production runtime
+        DoRA helper `dora_weight_norm_materialized` to compute the
+        direction × magnitude decomposition correctly, returns the resulting
+        delta `merged_weight - base_weight` to the merge algebra, and
+        SVD-recompresses back to a standard LoRA. Lossy (DoRA magnitude
+        vector discarded on output) but interoperable with every loader.
+        Mutually exclusive with `--fold_into`. Compatible with
+        `--output_use_rslora`. Linear-only; Conv2d DoRA mirrors the
+        production helper's `NotImplementedError` as a clean preflight
+        rejection. Full DoRA output (with re-derived magnitudes) deferred
+        to a hypothetical v1.5 #5.
    - **Implemented CLI shape**: `tools/merge_loras_algebra.py` takes repeated
      `--input PATH WEIGHT` pairs plus `--method`, method-specific args, and
      `--output_rank`, then emits a normal blissful-tuner/Kohya-format
