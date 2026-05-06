@@ -216,6 +216,39 @@ PiSSA mutates the base weights at LoRAModule init time and the math is load-bear
 
 **Hotswap vs offline merge asymmetry:** Hotswap is interactive runtime, so missing-hash warnings can be downgraded via `--no-hotswap_strict_base_hash`. Offline merge writes a persisted derived checkpoint, so both missing and mismatched cases raise unconditionally — there is no `--no-allow_pissa_missing_base_hash` flag in v1.
 
+### When NOT to use PiSSA (empirical bounds, 2026-05-06)
+
+PiSSA's correctness contract holds (see safety table above), but a real-weights training experiment narrowed when reaching for it actually helps. The implementation is *correct and available*; it is *empirically dispreferred for this specific configuration class*. Users on different optimizers or different adapter mixes should not infer from this section that PiSSA is broadly worse than kaiming.
+
+**Disrecommended configuration:** `init_lora_weights=pissa*` together with **ProdigyPlusScheduleFree** as the optimizer, when **DoRA (`use_dora=True`) was previously load-bearing in the same pipeline**.
+
+**Evidence (2026-05-05 v10-PiSSA-rank32 vs v9-rank32, FLUX.2-Klein-9B persona LoRA, 10000 steps each, identical dataset/seed/scale/rank):**
+
+- `loss/average` final: **+7.0%** worse on v10 (PiSSA + no DoRA): 0.10529 → 0.11270
+- `masked_loss/target` final: **+24.8%** worse on v10: 0.07968 → 0.09948 (the unsmoothed in-mask reconstruction component, where identity-relevant features live; this gap is much larger than the headline `loss/average` because the in-mask region is where DoRA's per-output-channel magnitude lever has the most leverage)
+- Late-slope `[8001..10000]`: v9 still descending at −0.00081/1k; v10 essentially flat at −0.000029/1k. v9 had headroom; v10 saturated early.
+- Prodigy `lr/d/unet plus` first-final-step: v9 step 88, **v10 step 47** at a final value 4.3% of v9's. The optimizer concluded "geometry near-optimal" *prematurely* under PiSSA's principal-direction init, locking in small-step exploration before the LoRA had room to discover the channel-magnitude structure DoRA would have provided.
+- Qualitative: at adversarial seed+prompt combinations (e.g. formal-event with a seed where the base model leans feminine), v10's likeness LoRA captured facial features but did not stabilize gender-leaning channel priors. v9 corrected the same seed by step 1000 and held; v10 briefly corrected at step 1000 then drifted back to feminine presentation by step 5000+. This was *invisible to `loss/average` averaging* but obvious in cross-prompt-cross-seed sample inspection.
+
+**Why this is narrower than "PiSSA + adaptive optimizers is bad":**
+
+The mechanism evidenced by v10 is specific to **Prodigy's `d`-discovery interaction with PiSSA's principal-direction init**, not to adaptive optimizers in general. AdamW + hand-tuned LR + PiSSA, Adafactor + PiSSA, Lion + PiSSA — these are untested in this codebase and would behave differently. Prodigy's `d` is auto-discovered from gradient norms over recent steps; PiSSA puts initial LoRA gradients in a low-magnitude regime that triggers Prodigy's "near-optimal, freeze `d`" heuristic prematurely. AdamW's adaptivity is per-parameter momentum smoothing — a different mechanism with no direct parallel.
+
+**Why the DoRA-loss component matters separately:**
+
+PiSSA forbids DoRA in v1 (the math doesn't compose without PEFT's `pissa_decompose_dora` utility, deferred to a hypothetical Tier 2 #6d). For pipelines where DoRA is load-bearing — empirically true for likeness-class LoRAs on small datasets per v10's adversarial-seed evidence — adopting PiSSA forces a two-variable swap: PiSSA on, DoRA off. The +24.8% `masked_loss/target` gap is the *net* of (PiSSA-gain − DoRA-loss); since PiSSA's gain was at-best-neutral on early descent (per the d-freeze evidence), the gap is best attributed to the DoRA loss. **This is a hypothesis, not a proven mechanism** — clean attribution requires the PiSSA × DoRA 2×2 that's only possible after `pissa_decompose_dora` ships.
+
+**Practical guidance:**
+
+| Your pipeline | Recommendation |
+|---|---|
+| ProdigyPlusScheduleFree + DoRA-load-bearing likeness LoRA (DLAY-class) | Stay on `kaiming + use_dora=True`. PiSSA is empirically worse here. |
+| Non-Prodigy optimizer (AdamW + hand-tuned LR, etc.) | PiSSA is *not characterized* under your conditions — the v10 evidence does not generalize. Run a small A/B if curious. |
+| You don't use DoRA today | The PiSSA-no-DoRA combination is what v10 tested. The DoRA-loss component of v10's penalty does not apply to you, but the Prodigy-d-freeze component still does (under Prodigy specifically). |
+| Fixed-LR optimizer + small dataset + low rank + short training | This is PiSSA's strongest theoretical case (PEFT paper regime). Untested in this codebase but plausibly useful. |
+
+The PiSSA implementation is not deprecated. It will continue to be supported and the safety contract will be honored. This subsection exists so users don't repeat the v10 experiment unnecessarily on equivalent pipelines.
+
 ---
 
 ## Rank / Alpha Patterns (`rank_pattern` / `alpha_pattern`)
@@ -562,6 +595,9 @@ Best for: Training only double blocks (or vice versa).
 ---
 
 ## Changelog
+
+### 2026-05-06
+- Added empirical-bounds subsection ("When NOT to use PiSSA") to the PiSSA section, recording the v10-PiSSA-rank32 vs v9-rank32 negative-result evidence (FLUX.2-Klein-9B persona LoRA, 10000 steps, ProdigyPlusScheduleFree). Narrows the disrecommendation to the specific configuration class evidenced (Prodigy + DoRA-load-bearing pipelines), explicitly does not generalize to all adaptive optimizers. Implementation remains supported; safety contract unchanged.
 
 ### 2026-05-05
 - Added PiSSA LoRA init (`init_lora_weights=pissa` and `init_lora_weights=pissa_niter_<N>`) with PEFT-parity SVD math, in-place base residualization, ten-failure-mode safety contract (see "PiSSA safety contract"), `ss_base_sha256` hash-coupled validation at hotswap and offline merge time, and fail-fast rejects for incompatible combinations (Conv2d, split_dims, DoRA, WAN dual-expert, `--resume`, fp8 base).

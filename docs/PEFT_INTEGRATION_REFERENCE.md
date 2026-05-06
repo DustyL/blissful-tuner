@@ -384,8 +384,16 @@ this list and are kept here as anchor points for grep searches.
 6. **PiSSA initialization (Tier 2 #6b).**
    _Status: ✅ shipped 2026-05-05 for single-DiT architectures (HV / WAN
    single-expert / HV1.5 / Qwen / Z-Image / FLUX.2 / Kontext / FramePack /
-   K5). WAN dual-expert remains blocked on Tier 2 #6a-2 (per-expert
-   `ss_base_sha256` keys + read-side any-match)._
+   K5). **Empirically bounded as of 2026-05-06**: dispreferred for
+   ProdigyPlusScheduleFree pipelines where DoRA is load-bearing — see
+   `docs/NETWORK_ARGS_REFERENCE.md` "When NOT to use PiSSA" subsection
+   for the v10-PiSSA-rank32 evidence (FLUX.2-Klein-9B persona LoRA,
+   `masked_loss/target` +24.8% vs v9-rank32 baseline; Prodigy `d`
+   freeze step 47 vs 88; qualitative gender-disambiguation regression
+   at adversarial seeds invisible to averaged loss). Implementation is
+   correct and supported; safety contract holds. WAN dual-expert
+   remains blocked on Tier 2 #6a-2 (per-expert `ss_base_sha256` keys
+   + read-side any-match)._
    - **PEFT references**: `/home/dustin/peft/src/peft/tuners/lora/layer.py:360`
      (PiSSA), `:315` (OLoRA). Both are SVD-on-base then split-out
      initialization that *mutates the base DiT weights at init time*.
@@ -426,14 +434,30 @@ this list and are kept here as anchor points for grep searches.
      (WAN, --resume, DoRA, defense-in-depth Conv2d/split_dims/fp8),
      offline merge preflight (no-op for non-PiSSA, multi-LoRA hash
      compute coordination, first-failure-halts).
-   - **Future hooks (not shipped)**:
+   - **Future hooks (not shipped, deprioritization updated 2026-05-06
+     after v10 empirical evidence)**:
      - Tier 2 #6c — PiSSA → standard-LoRA conversion utility
        (`tools/pissa_to_standard_lora.py`). Separate correctness surface
        for publishing PiSSA adapters in kohya/comfy ecosystem.
+       **Deprioritized indefinitely** post-v10: no domestic customer
+       (the validated DLAY/FLUX.2-Klein pipeline does not produce PiSSA
+       adapters worth publishing). Reach for it if external users with
+       different optimizer setups produce PiSSA adapters that benefit
+       from kohya/comfy publishing.
      - Tier 2 #6a-2 — per-expert `ss_base_sha256` for WAN dual-expert.
-       Unblocks PiSSA on WAN dual-expert.
+       Unblocks PiSSA on WAN dual-expert. **Deprioritized indefinitely**
+       post-v10: WAN PiSSA inherits both Prodigy-d-freeze and DoRA-loss
+       components of v10's penalty, making it an even less likely
+       valuable target than single-DiT PiSSA was.
      - Tier 2 #6d — `pissa_decompose_dora` (PEFT utility for combining
-       PiSSA SVD init with DoRA magnitude-direction).
+       PiSSA SVD init with DoRA magnitude-direction). **Conditional,
+       gated on a config-only Prodigy-elimination experiment**
+       (PiSSA + DoRA + non-Prodigy optimizer like AdamW with
+       hand-tuned LR), which would test whether v10's negative result
+       was Prodigy-specific or PiSSA-broadly-bad-here. Build #6d only
+       after that A/B shows positive signal — the implementation cost
+       isn't worth running into the same Prodigy-d-freeze problem
+       through a different pairing.
 
 7. **AdaLoRA rank allocator** for adaptive `--network_dim`.
    _Status: blissful-tuner's `--network_dim` is a fixed scalar; users
@@ -583,6 +607,18 @@ A. **`merge_lora.py` + `--base_weights` + block-swap interaction** in
   split_dims hard-reject (PEFT's reference can't handle 4D; split-SVD
   has no canonical interpretation in v1). See
   `docs/plans/2026-05-05-peft-tier2-6b-pissa.md`.
+
+  **Empirical bounds added 2026-05-06**: real-weights v10-PiSSA-rank32
+  vs v9-rank32 A/B on FLUX.2-Klein-9B persona LoRA showed PiSSA + no-DoRA
+  is +24.8% worse on `masked_loss/target` and produces qualitative
+  gender-disambiguation regressions invisible to averaged loss.
+  Mechanism is specific to ProdigyPlusScheduleFree's `d`-discovery
+  (locked at step 47 vs v9's step 88) interacting with PiSSA's
+  principal-direction init plus the loss of DoRA's per-output-channel
+  magnitude lever. Implementation correct and supported; configuration
+  guidance moved to `docs/NETWORK_ARGS_REFERENCE.md` "When NOT to use
+  PiSSA". `#6c`/`#6a-2`/`#6d` follow-ups deprioritized post-v10 — see
+  the Tier 2 entry above for the per-item reasoning.
 
 ## What is *not* worth integrating
 
