@@ -390,8 +390,9 @@ this list and are kept here as anchor points for grep searches.
    for the v10-PiSSA-rank32 evidence (FLUX.2-Klein-9B persona LoRA,
    `masked_loss/target` +24.8% vs v9-rank32 baseline; Prodigy `d`
    freeze step 47 vs 88; qualitative gender-disambiguation regression
-   at adversarial seeds invisible to averaged loss). Implementation is
-   correct and supported; safety contract holds. WAN dual-expert
+   at adversarial seeds not characterized by averaged loss alone).
+   Implementation is correct and supported; safety contract holds. WAN
+   dual-expert
    remains blocked on Tier 2 #6a-2 (per-expert `ss_base_sha256` keys
    + read-side any-match)._
    - **PEFT references**: `/home/dustin/peft/src/peft/tuners/lora/layer.py:360`
@@ -446,9 +447,10 @@ this list and are kept here as anchor points for grep searches.
        from kohya/comfy publishing.
      - Tier 2 #6a-2 — per-expert `ss_base_sha256` for WAN dual-expert.
        Unblocks PiSSA on WAN dual-expert. **Deprioritized indefinitely**
-       post-v10: WAN PiSSA inherits both Prodigy-d-freeze and DoRA-loss
-       components of v10's penalty, making it an even less likely
-       valuable target than single-DiT PiSSA was.
+       post-v10: WAN PiSSA would inherit both observed v10 components
+       (the ProdigyPlusScheduleFree d-freeze interaction and the
+       DoRA-loss component of v10's penalty), making it an even less
+       likely valuable target than single-DiT PiSSA was.
      - Tier 2 #6d — `pissa_decompose_dora` (PEFT utility for combining
        PiSSA SVD init with DoRA magnitude-direction). **Conditional,
        gated on a config-only Prodigy-elimination experiment**
@@ -611,7 +613,8 @@ A. **`merge_lora.py` + `--base_weights` + block-swap interaction** in
   **Empirical bounds added 2026-05-06**: real-weights v10-PiSSA-rank32
   vs v9-rank32 A/B on FLUX.2-Klein-9B persona LoRA showed PiSSA + no-DoRA
   is +24.8% worse on `masked_loss/target` and produces qualitative
-  gender-disambiguation regressions invisible to averaged loss.
+  gender-disambiguation regressions not characterized by averaged
+  loss alone.
   Mechanism is specific to ProdigyPlusScheduleFree's `d`-discovery
   (locked at step 47 vs v9's step 88) interacting with PiSSA's
   principal-direction init plus the loss of DoRA's per-output-channel
