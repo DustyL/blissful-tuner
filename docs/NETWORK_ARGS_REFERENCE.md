@@ -147,7 +147,7 @@ network_args = ["use_dora=True"]
 
 ## LoRA Init (`init_lora_weights`)
 
-**Option:** `init_lora_weights=kaiming|orthogonal|true` (default: `kaiming`)
+**Option:** `init_lora_weights=kaiming|orthogonal|pissa|pissa_niter_<N>|true` (default: `kaiming`)
 
 ### What it does
 
@@ -158,8 +158,12 @@ Selects the initialization scheme for standard LoRA `lora_down` / `lora_up` weig
 | `kaiming` | Current default: `lora_down` uses Kaiming uniform, `lora_up` starts at zero |
 | `true` | Alias for `kaiming`, matching PEFT's default-style config spelling |
 | `orthogonal` | QR-based PEFT orthogonal init: both matrices start nonzero while `lora_up @ lora_down == 0` |
+| `pissa` | Principal Singular values & Singular vectors Adaptation: SVD the base weight, seed `lora_A` / `lora_B` with the principal-rank-r components, and **residualize the base weight** so the live model produces identical output at step 0 but training updates the principal directions directly. Single-DiT only in v1; see "PiSSA safety contract" below. |
+| `pissa_niter_<N>` | PiSSA with Newton-Schulz approximate SVD via `torch.svd_lowrank(weight, r, niter=N)`. Faster than full SVD for big weights (3072×3072+ attention projections, 4096×16384 MLPs). Niter values follow PEFT convention; example `pissa_niter_5`. The speed/accuracy tradeoff for diffusion DiT weights is not characterized in this codebase yet — values are PEFT-compatible spellings, not tuned blissful-tuner knobs. |
 
 `orthogonal` is recommended mainly for higher ranks (`network_dim >= 16`). It is valid at any even rank, but odd ranks raise because the algorithm splits an orthogonal matrix into even/odd row groups.
+
+`pissa` empirically gives faster convergence than random init at the same rank because the principal-r SVD components are a strong starting point — diffusion DiT weights have heavy-tailed singular value distributions where the top-r captures most of the signal.
 
 ### Technical notes / gotchas
 
@@ -167,16 +171,50 @@ Selects the initialization scheme for standard LoRA `lora_down` / `lora_up` weig
 |-------|--------|
 | **Default compatibility** | Omitted `init_lora_weights` keeps the historical Kaiming+zero behavior. |
 | **Even rank required** | `orthogonal` requires even `network_dim` for Linear targets. Use an even rank or `init_lora_weights=kaiming`. |
-| **Conv2d targets** | Conv2d LoRA modules fall back to Kaiming init with a counted warning. |
-| **split_dims** | QKV split modules apply orthogonal init independently per split. |
-| **Saved weights** | Safetensors metadata records `ss_init_lora_weights=<scheme>`. No tensor flag is needed because init does not change load-time merge math. |
-| **Scope** | `orthogonal` is standard-LoRA-only. It is not applied to LoHa/LoKr/LyCORIS modules. |
+| **Conv2d targets (orthogonal)** | Conv2d LoRA modules fall back to Kaiming init with a counted warning. |
+| **Conv2d targets (PiSSA)** | Conv2d **hard-rejects** for `pissa*` — see "PiSSA safety contract" below for why. |
+| **split_dims (orthogonal)** | QKV split modules apply orthogonal init independently per split. |
+| **split_dims (PiSSA)** | QKV split **hard-rejects** for `pissa*`. |
+| **Saved weights** | Safetensors metadata records `ss_init_lora_weights=<scheme>`. For `pissa*`, also records `ss_base_sha256` (the file hash of the base DiT trained against — see Tier 2 #6a write infrastructure). No tensor flag is needed because init does not change load-time merge math, but PiSSA-tagged LoRAs receive stricter base-hash validation at hotswap and merge time (see "PiSSA safety contract"). |
+| **Scope** | `orthogonal` and `pissa*` are standard-LoRA-only. Neither is applied to LoHa/LoKr/LyCORIS modules. |
+| **Base mutation (PiSSA only)** | PiSSA mutates `org_module.weight.data` in place at LoRAModule init time, replacing the original weight with the residual `W - scale * lora_B @ lora_A`. Forward equivalence at step 0 holds because `residual + scale * lora_B @ lora_A == original`. This in-place mutation is what couples PiSSA to the exact base file used at training time. |
 
-### Example
+### Examples
 
 ```toml
+# Standard kaiming (default)
+network_args = ["init_lora_weights=kaiming"]
+
+# Orthogonal for higher-rank LoRA
 network_args = ["init_lora_weights=orthogonal"]
+
+# PiSSA with full SVD
+network_args = ["init_lora_weights=pissa"]
+
+# PiSSA with Newton-Schulz approximate SVD (faster on big DiT weights)
+network_args = ["init_lora_weights=pissa_niter_5"]
 ```
+
+### PiSSA safety contract
+
+PiSSA mutates the base weights at LoRAModule init time and the math is load-bearingly coupled to the exact base bytes used at training time (residualized base assumption breaks under any other base). The contract closes ten distinct failure modes across training, hotswap, and offline merge surfaces. **Detection is metadata-driven** — `ss_init_lora_weights.startswith("pissa")` is the canonical predicate; a fully metadata-stripped PiSSA-trained safetensors has no detectable PiSSA signal and falls through to the non-PiSSA back-compat path.
+
+| User action | Detection point | Outcome |
+|---|---|---|
+| `init_lora_weights=pissa*` + Conv2d target module | `LoRAModule.__init__` | Hard reject before allocation |
+| `init_lora_weights=pissa*` + `split_dims=...` (QKV split) | `LoRAModule.__init__` | Hard reject before allocation |
+| `init_lora_weights=pissa*` + `use_dora=True` | `validate_pissa_training_args` (training start) AND `LoRAModule.__init__` (defense in depth) | Hard reject before model load |
+| `init_lora_weights=pissa*` + WAN dual-expert (`--dit_high_noise`) | `validate_pissa_training_args` (training start) | Hard reject before model load — blocked on Tier 2 #6a-2 follow-up for per-expert metadata keys |
+| `init_lora_weights=pissa*` + `--resume` (checkpoint resume) | `validate_pissa_training_args` (training start) | Hard reject before model load — re-residualization footgun |
+| `init_lora_weights=pissa*` + fp8 base tensor | `_init_pissa_lora_pair` | TypeError before residual mutation (LoRA module is being constructed by then; not a pre-allocation reject) |
+| **Hotswap** PiSSA-tagged LoRA + matching `ss_base_sha256` | `_check_lora_base_hash(init_pissa=True)` | Silent OK |
+| **Hotswap** PiSSA-tagged LoRA + mismatched `ss_base_sha256` | `_check_lora_base_hash(init_pissa=True)` | Hard reject **always** (math is provably wrong; no `--no-hotswap_strict_base_hash` opt-out for this case) |
+| **Hotswap** PiSSA-tagged LoRA + missing `ss_base_sha256` + `--hotswap_strict_base_hash` (default ON) | `_check_lora_base_hash(init_pissa=True)` | Hard reject with "base-hash metadata appears stripped" |
+| **Hotswap** PiSSA-tagged LoRA + missing `ss_base_sha256` + `--no-hotswap_strict_base_hash` | `_check_lora_base_hash(init_pissa=True)` | Warn with same message, proceed |
+| **Offline merge** (`merge_lora.py`) PiSSA-tagged LoRA + mismatched `ss_base_sha256` | `_pissa_base_hash_preflight` (before `load_transformer`) | Raises always |
+| **Offline merge** PiSSA-tagged LoRA + missing `ss_base_sha256` | `_pissa_base_hash_preflight` (before `load_transformer`) | Raises always — **strict-by-default for offline merge**, no opt-out flag in v1 because the output is a persisted derived checkpoint |
+
+**Hotswap vs offline merge asymmetry:** Hotswap is interactive runtime, so missing-hash warnings can be downgraded via `--no-hotswap_strict_base_hash`. Offline merge writes a persisted derived checkpoint, so both missing and mismatched cases raise unconditionally — there is no `--no-allow_pissa_missing_base_hash` flag in v1.
 
 ---
 
@@ -421,7 +459,7 @@ network_args = ["verbose=True"]
 |--------|------|---------|-------------|
 | `use_rslora` | bool | `False` | RS-LoRA scaling (`alpha/sqrt(r)`) |
 | `use_dora` | bool | `False` | DoRA magnitude decomposition (Linear only) |
-| `init_lora_weights` | str | `kaiming` | LoRA init scheme: `kaiming`, `orthogonal`, or `true` alias |
+| `init_lora_weights` | str | `kaiming` | LoRA init scheme: `kaiming`, `orthogonal`, `pissa`, `pissa_niter_<N>`, or `true` alias |
 | `rank_pattern` | dict | None | Per-module rank overrides matched with `re.fullmatch()` on dotted module names |
 | `alpha_pattern` | dict | None | Per-module alpha overrides using the same matching semantics as `rank_pattern` |
 | `loraplus_lr_ratio` | float | None | LoRA-B learning rate multiplier |
@@ -524,6 +562,9 @@ Best for: Training only double blocks (or vice versa).
 ---
 
 ## Changelog
+
+### 2026-05-05
+- Added PiSSA LoRA init (`init_lora_weights=pissa` and `init_lora_weights=pissa_niter_<N>`) with PEFT-parity SVD math, in-place base residualization, ten-failure-mode safety contract (see "PiSSA safety contract"), `ss_base_sha256` hash-coupled validation at hotswap and offline merge time, and fail-fast rejects for incompatible combinations (Conv2d, split_dims, DoRA, WAN dual-expert, `--resume`, fp8 base).
 
 ### 2026-05-04
 - Added static `rank_pattern` / `alpha_pattern` per-module overrides with fullmatch/first-match semantics and safetensors metadata.

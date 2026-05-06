@@ -381,33 +381,59 @@ this list and are kept here as anchor points for grep searches.
      `--output_rank`, then emits a normal blissful-tuner/Kohya-format
      `.safetensors` with provenance metadata.
 
-6. **PiSSA / OLoRA initialization (deferred from Tier 1).**
-   _Status: ready to start for single-DiT architectures (Tier 2 #6a write
-   infrastructure landed 2026-05-05); WAN dual-expert still blocked on a
-   Tier 2 #6a-2 follow-up._
+6. **PiSSA initialization (Tier 2 #6b).**
+   _Status: ✅ shipped 2026-05-05 for single-DiT architectures (HV / WAN
+   single-expert / HV1.5 / Qwen / Z-Image / FLUX.2 / Kontext / FramePack /
+   K5). WAN dual-expert remains blocked on Tier 2 #6a-2 (per-expert
+   `ss_base_sha256` keys + read-side any-match)._
    - **PEFT references**: `/home/dustin/peft/src/peft/tuners/lora/layer.py:360`
      (PiSSA), `:315` (OLoRA). Both are SVD-on-base then split-out
      initialization that *mutates the base DiT weights at init time*.
-   - **Prerequisite work** status:
-     1. ✅ Persist a base-weight hash in the LoRA safetensors metadata
-        (`ss_base_sha256`) at save time. Shipped 2026-05-05 — see "Already
-        shipped" entry for Tier 2 #6a above. Single-DiT only; WAN
-        dual-expert hash semantics (per-expert keys + any-match validation)
-        deferred to Tier 2 #6a-2 follow-up.
-     2. Promote the hotswap-side check from warn-only to hard-reject when
-        the LoRA metadata declares it was PiSSA-initialized. Same check
-        applicable in `merge_lora.py` and the Tier 0 fast helper. Read
-        infrastructure already exists (`_check_lora_base_hash` in
-        `lora_utils.py`); needs a new `ss_lora_init=pissa` discriminator
-        or a stricter mode of the existing `--hotswap_strict_base_hash`.
-     3. Explicit metadata flag like `ss_lora_init=pissa` so downstream
-        tooling can render warnings or special-case behavior.
-   - **Why this matters now**: with prereq #1 shipped, PiSSA on
-     single-DiT trainers (Qwen, Z-Image, FLUX.2, etc.) can ship behind a
-     hash-checked safety net. A user training PiSSA on
-     `flux2-base.safetensors` and then merging into
-     `flux2-base-finetuned.safetensors` will get a hard reject (or
-     loud warn) instead of silently wrong results.
+   - **Prerequisite status (now satisfied)**:
+     1. ✅ `ss_base_sha256` write at LoRA save time. Tier 2 #6a, shipped
+        2026-05-05. Single-DiT only.
+     2. ✅ Stricter validation when LoRA metadata declares PiSSA.
+        Implemented as `init_pissa: bool = False` keyword-only kwarg on
+        `_check_lora_base_hash`, derived at call sites from
+        `metadata.get("ss_init_lora_weights", "").startswith("pissa")`.
+        Hotswap mismatch raises always; missing follows
+        `--hotswap_strict_base_hash` (default ON). Offline merge raises
+        on both missing and mismatched (no opt-out flag in v1).
+     3. ✅ Explicit metadata discriminator: `ss_init_lora_weights="pissa"`
+        or `ss_init_lora_weights="pissa_niter_<N>"` (reuses existing
+        metadata key from orthogonal init).
+   - **What shipped**: Two PEFT-compatible spellings
+     (`init_lora_weights=pissa` for full SVD,
+     `init_lora_weights=pissa_niter_<N>` for Newton-Schulz approximate).
+     Math line-for-line parity with PEFT's `pissa_init`. Forward
+     equivalence at step 0: `residual + scale * lora_B @ lora_A == original`.
+     Ten-failure-mode safety contract (see
+     `docs/NETWORK_ARGS_REFERENCE.md` "PiSSA safety contract" table for
+     the user-facing matrix).
+   - **Shipped commits**:
+     - `f029740` feat(lora): add PiSSA initialization helper with math parity tests
+     - `8c9634b` feat(lora): wire PiSSA init into LoRAModule with fail-fast rejects
+     - `2dda53b` feat(lora): add init_pissa hash hard-reject contract for hotswap
+     - `10a86ab` fix(lora): reject unsafe PiSSA training combinations early
+     - `54bd135` fix(lora): validate PiSSA base hash before offline merge
+     - (plus this docs commit)
+   - **Test coverage**: 89 CPU tests + 19 subtests across 4 dedicated
+     files (`test_lora_pissa_init.py`, `test_pissa_training_validation.py`,
+     `test_merge_lora_pissa_preflight.py`, plus 8 PiSSA-specific rows in
+     `test_lora_hotswap.py`'s `TestHashValidationPissa`). PEFT math
+     parity, in-place mutation contract, forward equivalence at step 0,
+     hash hard-reject contract (8-row matrix), training-time rejects
+     (WAN, --resume, DoRA, defense-in-depth Conv2d/split_dims/fp8),
+     offline merge preflight (no-op for non-PiSSA, multi-LoRA hash
+     compute coordination, first-failure-halts).
+   - **Future hooks (not shipped)**:
+     - Tier 2 #6c — PiSSA → standard-LoRA conversion utility
+       (`tools/pissa_to_standard_lora.py`). Separate correctness surface
+       for publishing PiSSA adapters in kohya/comfy ecosystem.
+     - Tier 2 #6a-2 — per-expert `ss_base_sha256` for WAN dual-expert.
+       Unblocks PiSSA on WAN dual-expert.
+     - Tier 2 #6d — `pissa_decompose_dora` (PEFT utility for combining
+       PiSSA SVD init with DoRA magnitude-direction).
 
 7. **AdaLoRA rank allocator** for adaptive `--network_dim`.
    _Status: blissful-tuner's `--network_dim` is a fixed scalar; users
@@ -534,6 +560,29 @@ A. **`merge_lora.py` + `--base_weights` + block-swap interaction** in
   follow-up. Tier 2 #6 PiSSA's "prerequisite #1" is now satisfied for
   single-DiT trainers (Qwen / Z-Image / FLUX.2 etc.); WAN PiSSA still
   blocked. See `docs/plans/2026-05-05-peft-tier2-6a-base-hash-write.md`.
+- **Tier 2 #6b PiSSA initialization (single-DiT)** — commits
+  `f029740` / `8c9634b` / `2dda53b` / `10a86ab` / `54bd135` (2026-05-05).
+  PEFT-compatible spellings `init_lora_weights=pissa` (full SVD) and
+  `init_lora_weights=pissa_niter_<N>` (Newton-Schulz approximate) via
+  `--network_args`. Math is line-for-line parity with PEFT's `pissa_init`
+  (peft/.../layer.py:360-393); forward equivalence at step 0 preserved
+  (`residual + scale * lora_B @ lora_A == original`). Closes ten
+  distinct failure modes across training, hotswap, and offline merge —
+  see `docs/NETWORK_ARGS_REFERENCE.md` "PiSSA safety contract" for the
+  user-facing matrix. PiSSA-tagged LoRAs receive stricter
+  `ss_base_sha256` validation: hotswap mismatch raises always (no
+  `--no-hotswap_strict_base_hash` opt-out for PiSSA-tagged), missing
+  follows the strict flag; offline merge raises on both missing and
+  mismatched (strict-by-default for persisted derived checkpoints, no
+  opt-out flag in v1). 89 CPU tests + 19 subtests across 4 dedicated
+  files. Single-DiT only — WAN dual-expert + PiSSA hard-rejects at
+  training start (blocked on Tier 2 #6a-2 per-expert keys follow-up);
+  `--resume` + PiSSA hard-rejects (re-residualization footgun); DoRA
+  + PiSSA hard-rejects (defense in depth; Tier 2 #6d
+  `pissa_decompose_dora` is the future combined item); Conv2d /
+  split_dims hard-reject (PEFT's reference can't handle 4D; split-SVD
+  has no canonical interpretation in v1). See
+  `docs/plans/2026-05-05-peft-tier2-6b-pissa.md`.
 
 ## What is *not* worth integrating
 
