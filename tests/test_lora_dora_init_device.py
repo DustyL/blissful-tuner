@@ -18,7 +18,6 @@ These tests pin that fix in place. The CUDA-specific cases skip cleanly when
 no GPU is available (e.g. CI runners).
 """
 
-import math
 import unittest
 
 import torch

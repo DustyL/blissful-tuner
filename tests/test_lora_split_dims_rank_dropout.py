@@ -74,14 +74,8 @@ class SplitDimsRankDropoutRegression(unittest.TestCase):
         # Adapter parameters must receive a non-zero gradient — guards against
         # a "fix" that silently zeroes the rank_dropout output (or otherwise
         # detaches the adapter path from autograd).
-        any_down_grad = any(
-            p.grad is not None and p.grad.abs().sum().item() > 0
-            for p in lora.lora_down.parameters()
-        )
-        any_up_grad = any(
-            p.grad is not None and p.grad.abs().sum().item() > 0
-            for p in lora.lora_up.parameters()
-        )
+        any_down_grad = any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in lora.lora_down.parameters())
+        any_up_grad = any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in lora.lora_up.parameters())
         self.assertTrue(any_down_grad, "no gradient reached any lora_down parameter")
         self.assertTrue(any_up_grad, "no gradient reached any lora_up parameter")
 

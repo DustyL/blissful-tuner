@@ -611,9 +611,7 @@ def _delta_shape_from_module_info(info: ModuleInfo) -> tuple[int, ...]:
             # Mirror the materializer guard so preflight catches unsupported geometry rather
             # than letting it through to fail mid-pipeline. Same error wording as
             # materialize_module_delta for consistency.
-            raise ValueError(
-                f"{info.name} has unsupported Conv2d LoRA up kernel {tuple(info.up_shape[2:])}; expected 1x1."
-            )
+            raise ValueError(f"{info.name} has unsupported Conv2d LoRA up kernel {tuple(info.up_shape[2:])}; expected 1x1.")
         return (info.up_shape[0], info.down_shape[1], info.down_shape[2], info.down_shape[3])
     raise ValueError(f"{info.name} mixes Linear and Conv2d LoRA tensor shapes, which fold mode cannot resolve.")
 
@@ -876,8 +874,7 @@ def _collect_modules(sd: dict[str, torch.Tensor], path: str) -> dict[str, Module
             raise ValueError(f"{basename} module {module_name} has non-positive rank {rank}.")
         if int(up.shape[1]) != rank:
             raise ValueError(
-                f"{basename} module {module_name} has mismatched rank: "
-                f"down shape {tuple(down.shape)}, up shape {tuple(up.shape)}."
+                f"{basename} module {module_name} has mismatched rank: down shape {tuple(down.shape)}, up shape {tuple(up.shape)}."
             )
         module_use_rslora = use_rslora or _has_true_flag(sd, f"{module_name}.use_rslora_flag")
 
@@ -889,11 +886,7 @@ def _collect_modules(sd: dict[str, torch.Tensor], path: str) -> dict[str, Module
         # magnitude vector ignored). Closes the split-brain detection inconsistency.
         magnitude_key = f"{module_name}.dora_layer.weight"
         has_magnitude = magnitude_key in sd
-        module_is_dora = (
-            global_dora
-            or _has_true_flag(sd, f"{module_name}.use_dora_flag")
-            or has_magnitude
-        )
+        module_is_dora = global_dora or _has_true_flag(sd, f"{module_name}.use_dora_flag") or has_magnitude
         if module_is_dora:
             # Decision #15: partial-DoRA inputs are rejected — silent fallback to standard-LoRA
             # for any module would produce wrong output. Mirrors production check at
@@ -1522,9 +1515,7 @@ def iter_merged_module_deltas(
             else None,
         )
         if not torch.isfinite(merged_delta).all():
-            raise ValueError(
-                f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args."
-            )
+            raise ValueError(f"Non-finite merged delta for module {module_name}; check input LoRA weights and merge method args.")
         # At default --prune_threshold 0.0, this is byte-equivalent to the v1
         # exact-zero check (since |x| <= 0 requires x == 0). Larger thresholds
         # skip near-zero modules — see Tier 2 #5 v1.5 #1 in the plan doc.
@@ -1559,6 +1550,7 @@ def merge_adapters(
         for adapter in adapters:
             if adapter.is_dora:
                 dora_plans[id(adapter)] = resolve_dora_plan(adapter, base_sd)
+
         # Closure over base_sd + dora_plans. Returns the resolved base tensor for
         # DoRA modules; returns None for standard LoRA modules and for adapters
         # not in the DoRA plan dict (mixed standard + DoRA inputs, decision #5).
@@ -1578,9 +1570,7 @@ def merge_adapters(
 
     modules_written = 0
     modules_processed = 0
-    for item in iter_merged_module_deltas(
-        config, adapters, module_callback=module_callback, dora_base_lookup=dora_base_lookup
-    ):
+    for item in iter_merged_module_deltas(config, adapters, module_callback=module_callback, dora_base_lookup=dora_base_lookup):
         modules_processed += 1
         if item.was_pruned:
             continue

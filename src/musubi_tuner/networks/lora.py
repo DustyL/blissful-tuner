@@ -68,8 +68,7 @@ def parse_init_lora_weights_arg(value: Any = None) -> str:
             niter = int(m.group(1))
             if niter <= 0:
                 raise ValueError(
-                    f"init_lora_weights={value!r}: niter must be a positive integer (got {niter}). "
-                    "Example: 'pissa_niter_5'."
+                    f"init_lora_weights={value!r}: niter must be a positive integer (got {niter}). Example: 'pissa_niter_5'."
                 )
             return normalized
     raise ValueError(
@@ -243,9 +242,7 @@ def _init_pissa_lora_pair(
     else:
         m = _PISSA_NITER_RE.match(mode)
         if m is None:
-            raise ValueError(
-                f"PiSSA mode must be 'pissa' or 'pissa_niter_<N>', got {mode!r}."
-            )
+            raise ValueError(f"PiSSA mode must be 'pissa' or 'pissa_niter_<N>', got {mode!r}.")
         niter = int(m.group(1))
         Vr, Sr, Ur = torch.svd_lowrank(weight_fp32, rank, niter=niter)
         Sr = Sr / scaling
@@ -253,7 +250,7 @@ def _init_pissa_lora_pair(
 
     sqrt_sr = torch.sqrt(Sr)
     lora_A = torch.diag(sqrt_sr) @ Uhr  # (rank, in_features)
-    lora_B = Vr @ torch.diag(sqrt_sr)   # (out_features, rank)
+    lora_B = Vr @ torch.diag(sqrt_sr)  # (out_features, rank)
 
     # Residual: original - scaling * (B @ A) so forward(residual) + scale*forward(LoRA) == forward(original)
     residual_fp32 = weight_fp32 - scaling * lora_B @ lora_A

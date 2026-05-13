@@ -53,10 +53,14 @@ def test_flux2_generation_rejects_cute_when_unavailable():
     """Generation must raise ValueError during arg parsing if CuTE is missing."""
     argv = [
         "flux_2_generate_image.py",
-        "--text_encoder", "/fake/te",
-        "--save_path", "/fake/out",
-        "--attn_mode", "cute",
-        "--device", "cuda",
+        "--text_encoder",
+        "/fake/te",
+        "--save_path",
+        "/fake/out",
+        "--attn_mode",
+        "cute",
+        "--device",
+        "cuda",
     ]
 
     with (
@@ -72,11 +76,16 @@ def test_flux2_generation_passes_cute_preflight_when_available():
     """Generation CuTE preflight must not reject when CuTE imports *and* probe passes."""
     argv = [
         "flux_2_generate_image.py",
-        "--text_encoder", "/fake/te",
-        "--save_path", "/fake/out",
-        "--attn_mode", "cute",
-        "--device", "cuda",
-        "--prompt", "test",
+        "--text_encoder",
+        "/fake/te",
+        "--save_path",
+        "/fake/out",
+        "--attn_mode",
+        "cute",
+        "--device",
+        "cuda",
+        "--prompt",
+        "test",
     ]
 
     _preload_probe_cache_ok(needs_backward=False)

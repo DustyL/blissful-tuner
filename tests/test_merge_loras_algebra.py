@@ -274,7 +274,8 @@ class TestAdapterFormatRejection(unittest.TestCase):
             path = _save_sd(
                 Path(tmpdir),
                 "dora.safetensors",
-                _lora_sd() | {
+                _lora_sd()
+                | {
                     "use_dora_flag": torch.tensor(True),
                     "lora_unet_block.dora_layer.weight": torch.zeros(2),
                 },
@@ -314,7 +315,8 @@ class TestAdapterFormatRejection(unittest.TestCase):
             path = _save_sd(
                 Path(tmpdir),
                 "well_formed_dora.safetensors",
-                _lora_sd() | {
+                _lora_sd()
+                | {
                     "use_dora_flag": torch.tensor(True),
                     "lora_unet_block.dora_layer.weight": torch.zeros(2),
                 },
@@ -407,10 +409,13 @@ class TestAdapterFormatRejection(unittest.TestCase):
                 "conv_dora.safetensors",
                 _lora_sd(
                     name="lora_unet_conv",
-                    rank=2, in_dim=3, out_dim=2,
+                    rank=2,
+                    in_dim=3,
+                    out_dim=2,
                     down=torch.zeros(2, 3, 1, 1),
                     up=torch.zeros(2, 2, 1, 1),
-                ) | {
+                )
+                | {
                     "use_dora_flag": torch.tensor(True),
                     "lora_unet_conv.dora_layer.weight": torch.zeros(2),
                 },
@@ -1700,29 +1705,46 @@ class TestBaseDitValidation(unittest.TestCase):
         # Both flags are file-path arguments → mutex is parse-time (no file introspection).
         with self.assertRaisesRegex(ValueError, r"--base_dit and --fold_into are mutually exclusive"):
             _config(
-                "--method", "linear",
-                "--input", "a.safetensors", "1.0",
-                "--base_dit", "base.safetensors",
-                "--fold_into", "fold_base.safetensors",
-                "--output", "out.safetensors",
+                "--method",
+                "linear",
+                "--input",
+                "a.safetensors",
+                "1.0",
+                "--base_dit",
+                "base.safetensors",
+                "--fold_into",
+                "fold_base.safetensors",
+                "--output",
+                "out.safetensors",
             )
 
     def test_base_dit_field_populated_in_config(self) -> None:
         config = _config(
-            "--method", "linear",
-            "--input", "a.safetensors", "1.0",
-            "--base_dit", "/path/to/base.safetensors",
-            "--output", "out.safetensors",
-            "--output_rank", "8",
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--base_dit",
+            "/path/to/base.safetensors",
+            "--output",
+            "out.safetensors",
+            "--output_rank",
+            "8",
         )
         self.assertEqual(config.base_dit, "/path/to/base.safetensors")
 
     def test_base_dit_default_is_none(self) -> None:
         config = _config(
-            "--method", "linear",
-            "--input", "a.safetensors", "1.0",
-            "--output", "out.safetensors",
-            "--output_rank", "8",
+            "--method",
+            "linear",
+            "--input",
+            "a.safetensors",
+            "1.0",
+            "--output",
+            "out.safetensors",
+            "--output_rank",
+            "8",
         )
         self.assertIsNone(config.base_dit)
 
@@ -1734,11 +1756,17 @@ class TestBaseDitValidation(unittest.TestCase):
             standard_lora_path = _save_sd(tmp, "standard.safetensors", _lora_sd())
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
             config = _config(
-                "--method", "linear",
-                "--input", standard_lora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", str(tmp / "out.safetensors"),
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                standard_lora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                str(tmp / "out.safetensors"),
+                "--output_rank",
+                "2",
             )
             with self.assertRaisesRegex(ValueError, r"--base_dit was provided but no input adapter is DoRA"):
                 mla.run(config)
@@ -1753,11 +1781,17 @@ class TestBaseDitValidation(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
             # validate_args succeeds (parse-time): base_dit is just a path string at this layer.
             config = _config(
-                "--method", "linear",
-                "--input", standard_lora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", str(tmp / "out.safetensors"),
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                standard_lora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                str(tmp / "out.safetensors"),
+                "--output_rank",
+                "2",
             )
             # Validation accepts the args; merge_adapters does the post-load preflight reject.
             self.assertEqual(config.base_dit, base_path)
@@ -2188,8 +2222,11 @@ class TestBuildFoldMetadata(unittest.TestCase):
             tmp = Path(tmpdir)
             config, adapters, base_path = self._setup_fold_config(tmp)
             stats = mla.FoldStats(
-                modules_resolved=3, modules_folded=2, modules_pruned=1,
-                base_tensors_total=10, base_tensors_modified=2,
+                modules_resolved=3,
+                modules_folded=2,
+                modules_pruned=1,
+                base_tensors_total=10,
+                base_tensors_modified=2,
             )
             meta = mla.build_fold_metadata(config, adapters, base_path, stats)
 
@@ -2233,8 +2270,11 @@ class TestBuildFoldMetadata(unittest.TestCase):
             tmp = Path(tmpdir)
             config, adapters, base_path = self._setup_fold_config(tmp)
             stats = mla.FoldStats(
-                modules_resolved=42, modules_folded=30, modules_pruned=12,
-                base_tensors_total=100, base_tensors_modified=30,
+                modules_resolved=42,
+                modules_folded=30,
+                modules_pruned=12,
+                base_tensors_total=100,
+                base_tensors_modified=30,
             )
             meta = mla.build_fold_metadata(config, adapters, base_path, stats)
             self.assertEqual(meta["ss_merge_modules_resolved"], "42")
@@ -2249,34 +2289,40 @@ class TestBuildFoldMetadata(unittest.TestCase):
         with self.subTest("modules_resolved != modules_folded + modules_pruned"):
             with self.assertRaisesRegex(ValueError, r"modules_resolved.*must equal"):
                 mla.FoldStats(
-                    modules_resolved=5, modules_folded=2, modules_pruned=2,
-                    base_tensors_total=10, base_tensors_modified=2,
+                    modules_resolved=5,
+                    modules_folded=2,
+                    modules_pruned=2,
+                    base_tensors_total=10,
+                    base_tensors_modified=2,
                 )
         with self.subTest("base_tensors_modified != modules_folded"):
             with self.assertRaisesRegex(ValueError, r"base_tensors_modified.*must equal"):
                 mla.FoldStats(
-                    modules_resolved=4, modules_folded=2, modules_pruned=2,
-                    base_tensors_total=10, base_tensors_modified=3,
+                    modules_resolved=4,
+                    modules_folded=2,
+                    modules_pruned=2,
+                    base_tensors_total=10,
+                    base_tensors_modified=3,
                 )
         with self.subTest("base_tensors_modified > base_tensors_total"):
             with self.assertRaisesRegex(ValueError, r"must not exceed"):
                 mla.FoldStats(
-                    modules_resolved=4, modules_folded=4, modules_pruned=0,
-                    base_tensors_total=3, base_tensors_modified=4,
+                    modules_resolved=4,
+                    modules_folded=4,
+                    modules_pruned=0,
+                    base_tensors_total=3,
+                    base_tensors_modified=4,
                 )
 
     def test_fold_stats_accepts_valid_boundary_cases(self) -> None:
         # All zero (no modules processed at all).
         mla.FoldStats(0, 0, 0, 0, 0)
         # All folded, none pruned, modified == total.
-        mla.FoldStats(modules_resolved=5, modules_folded=5, modules_pruned=0,
-                      base_tensors_total=5, base_tensors_modified=5)
+        mla.FoldStats(modules_resolved=5, modules_folded=5, modules_pruned=0, base_tensors_total=5, base_tensors_modified=5)
         # All pruned, none folded; modified == 0 < total.
-        mla.FoldStats(modules_resolved=5, modules_folded=0, modules_pruned=5,
-                      base_tensors_total=10, base_tensors_modified=0)
+        mla.FoldStats(modules_resolved=5, modules_folded=0, modules_pruned=5, base_tensors_total=10, base_tensors_modified=0)
         # Asymmetric: more total tensors than modules (the realistic case).
-        mla.FoldStats(modules_resolved=42, modules_folded=30, modules_pruned=12,
-                      base_tensors_total=100, base_tensors_modified=30)
+        mla.FoldStats(modules_resolved=42, modules_folded=30, modules_pruned=12, base_tensors_total=100, base_tensors_modified=30)
 
     def test_fold_metadata_records_composite_base_hash_for_split_input(self) -> None:
         # Split base: the recorded hash must be the composite-of-shards, not the
@@ -2391,9 +2437,9 @@ class TestFoldPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             base_sd = {
-                "block.weight": torch.zeros(2, 3, dtype=torch.bfloat16),       # touched
-                "norm.weight": torch.ones(2, dtype=torch.float16),             # untouched, floating
-                "step_count": torch.zeros(1, dtype=torch.int64),               # untouched, non-floating
+                "block.weight": torch.zeros(2, 3, dtype=torch.bfloat16),  # touched
+                "norm.weight": torch.ones(2, dtype=torch.float16),  # untouched, floating
+                "step_count": torch.zeros(1, dtype=torch.int64),  # untouched, non-floating
             }
             result = self._run_fold(lora_sd=_lora_sd(name="lora_unet_block"), base_sd=base_sd, tmp=tmp)
 
@@ -2450,7 +2496,9 @@ class TestFoldPipeline(unittest.TestCase):
             # alpha defaults to rank, so scale = 1. With up=2e38, down=1.0 → delta = 2e38.
             lora_sd = _lora_sd(
                 name="lora_unet_block",
-                rank=1, in_dim=2, out_dim=2,
+                rank=1,
+                in_dim=2,
+                out_dim=2,
                 up=torch.full((2, 1), 2e38, dtype=torch.float32),
                 down=torch.full((1, 2), 1.0, dtype=torch.float32),
             )
@@ -2459,8 +2507,15 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", base_sd)
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, r"non-finite folded tensor for module"):
@@ -2480,9 +2535,17 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", base_sd)
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
-                "--output_dtype", "fp16",
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
+                "--output_dtype",
+                "fp16",
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, r"non-finite folded tensor after cast to torch\.float16"):
@@ -2495,9 +2558,9 @@ class TestFoldPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             base_sd = {
-                "block.weight": torch.zeros(2, 3),         # touched
-                "untouched_a.weight": torch.ones(4),       # untouched, weight-suffixed
-                "untouched_b": torch.tensor([42.0]),       # untouched, no .weight suffix
+                "block.weight": torch.zeros(2, 3),  # touched
+                "untouched_a.weight": torch.ones(4),  # untouched, weight-suffixed
+                "untouched_b": torch.tensor([42.0]),  # untouched, no .weight suffix
                 "untouched_int": torch.tensor([1, 2], dtype=torch.int32),
             }
             result = self._run_fold(
@@ -2518,8 +2581,15 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", base_sd)
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
             )
             captured = io.StringIO()
             with contextlib.redirect_stdout(captured):
@@ -2547,8 +2617,15 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
             )
 
             with patch("builtins.print") as mock_print:
@@ -2577,8 +2654,15 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", base_sd)
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 result = mla.fold_adapters_into_base(config)
@@ -2605,8 +2689,15 @@ class TestFoldPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3)})
             out_path = str(tmp / "folded.safetensors")
             config = _config(
-                "--method", "linear", "--input", lora_path, "1.0",
-                "--fold_into", base_path, "--output", out_path,
+                "--method",
+                "linear",
+                "--input",
+                lora_path,
+                "1.0",
+                "--fold_into",
+                base_path,
+                "--output",
+                out_path,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 result = mla.run(config)
@@ -2655,13 +2746,16 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             sd = _dora_lora_sd(
                 name="lora_unet_test",
-                rank=rank, in_dim=in_dim, out_dim=out_dim,
-                alpha=alpha, down=down, up=up, magnitude=magnitude,
+                rank=rank,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                alpha=alpha,
+                down=down,
+                up=up,
+                magnitude=magnitude,
             )
             adapter = mla.load_adapter(_save_sd(Path(tmpdir), "dora.safetensors", sd), 1.0)
-            actual_delta = mla.materialize_module_delta(
-                adapter, "lora_unet_test", dora_base_tensor=base_weight
-            )
+            actual_delta = mla.materialize_module_delta(adapter, "lora_unet_test", dora_base_tensor=base_weight)
 
         self.assertIsNotNone(actual_delta)
         self.assertTrue(
@@ -2714,12 +2808,20 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", standard_path, "1.0",
-                "--input", dora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                standard_path,
+                "1.0",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
             )
             result = mla.run(config)
 
@@ -2741,11 +2843,17 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", dora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
             )
             mla.run(config)
 
@@ -2765,11 +2873,17 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", dora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
             )
             mla.run(config)
 
@@ -2796,11 +2910,17 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             _write_split_shard(tmp, "base", 2, 2, {"other.weight": torch.zeros(4, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", dora_path, "1.0",
-                "--base_dit", shard_1,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                shard_1,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
             )
             mla.run(config)
 
@@ -2823,11 +2943,17 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", dora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
             )
             mla.run(config)
 
@@ -2861,11 +2987,17 @@ class TestBaseDitDoraPipeline(unittest.TestCase):
             base_path = _save_sd(tmp, "base.safetensors", {"block.weight": torch.zeros(2, 3, dtype=torch.float32)})
             out_path = str(tmp / "merged.safetensors")
             config = _config(
-                "--method", "linear",
-                "--input", dora_path, "1.0",
-                "--base_dit", base_path,
-                "--output", out_path,
-                "--output_rank", "2",
+                "--method",
+                "linear",
+                "--input",
+                dora_path,
+                "1.0",
+                "--base_dit",
+                base_path,
+                "--output",
+                out_path,
+                "--output_rank",
+                "2",
                 "--output_use_rslora",
             )
             mla.run(config)

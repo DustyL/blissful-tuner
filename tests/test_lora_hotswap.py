@@ -327,16 +327,16 @@ class TestHashValidationPissa(unittest.TestCase):
         # PiSSA modes -> True
         for value in ("pissa", "pissa_niter_5", "pissa_niter_20"):
             with self.subTest(init=value):
-                derived = bool({"ss_init_lora_weights": value}) and {
-                    "ss_init_lora_weights": value
-                }.get("ss_init_lora_weights", "").startswith("pissa")
+                derived = bool({"ss_init_lora_weights": value}) and {"ss_init_lora_weights": value}.get(
+                    "ss_init_lora_weights", ""
+                ).startswith("pissa")
                 self.assertTrue(derived)
         # Non-PiSSA modes -> False
         for value in ("kaiming", "orthogonal", ""):
             with self.subTest(init=value):
-                derived = bool({"ss_init_lora_weights": value}) and {
-                    "ss_init_lora_weights": value
-                }.get("ss_init_lora_weights", "").startswith("pissa")
+                derived = bool({"ss_init_lora_weights": value}) and {"ss_init_lora_weights": value}.get(
+                    "ss_init_lora_weights", ""
+                ).startswith("pissa")
                 self.assertFalse(derived)
         # Missing metadata key -> False (init_pissa=False, fall through to
         # back-compat path)

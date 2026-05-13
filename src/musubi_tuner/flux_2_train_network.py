@@ -516,10 +516,7 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "--pad_text_seq_len_multiple",
         type=int,
         default=None,
-        help=(
-            "Round text sequence length to this multiple for compile graph stability "
-            "(default: 32 when --compile, 1 otherwise)."
-        ),
+        help=("Round text sequence length to this multiple for compile graph stability (default: 32 when --compile, 1 otherwise)."),
     )
     flux2_utils.add_model_version_args(parser)
     return parser

@@ -135,7 +135,9 @@ class TestPissaMathParityVsPeft(unittest.TestCase):
         peft_A, peft_B, peft_residual = _peft_pissa_reference(base, rank, scaling, "pissa")
 
         # Reconstruction check: helper output reconstructs the same original weight
-        bt_reconstructed = bt_residual.to(torch.float32) + scaling * lora_up.weight.to(torch.float32) @ lora_down.weight.to(torch.float32)
+        bt_reconstructed = bt_residual.to(torch.float32) + scaling * lora_up.weight.to(torch.float32) @ lora_down.weight.to(
+            torch.float32
+        )
         peft_reconstructed = peft_residual + scaling * peft_B @ peft_A
 
         self.assertTrue(torch.allclose(bt_reconstructed, base.to(torch.float32), rtol=1e-5, atol=1e-5))
@@ -184,7 +186,9 @@ class TestPissaMathParityVsPeft(unittest.TestCase):
         torch.manual_seed(7)
         peft_A, peft_B, peft_residual = _peft_pissa_reference(base, rank, scaling, "pissa_niter_5")
 
-        bt_reconstructed = bt_residual.to(torch.float32) + scaling * lora_up.weight.to(torch.float32) @ lora_down.weight.to(torch.float32)
+        bt_reconstructed = bt_residual.to(torch.float32) + scaling * lora_up.weight.to(torch.float32) @ lora_down.weight.to(
+            torch.float32
+        )
 
         # niter=5 reconstruction is approximate — wider tolerance
         self.assertTrue(torch.allclose(bt_reconstructed, base.to(torch.float32), rtol=1e-3, atol=1e-3))
@@ -282,7 +286,7 @@ class TestPissaForwardEquivalenceAtStepZero(unittest.TestCase):
         torch.manual_seed(13)
         in_dim, out_dim, rank = 16, 8, 4
         alpha = 4.0
-        rslora_scaling = alpha / (rank ** 0.5)  # rsLoRA scale
+        rslora_scaling = alpha / (rank**0.5)  # rsLoRA scale
         base = _make_base_weight(in_dim=in_dim, out_dim=out_dim, seed=33)
         x = torch.randn(2, in_dim, dtype=torch.float32)
         original_out = x @ base.t()
@@ -399,7 +403,7 @@ class TestAlphaScaleBackCompatAfterMove(unittest.TestCase):
     def test_alpha_explicit_with_rslora(self) -> None:
         m = self._build(alpha=4.0, use_rslora=True, lora_dim=4)
         self.assertAlmostEqual(m.alpha.item(), 4.0)
-        self.assertAlmostEqual(m.scale, 4.0 / (4 ** 0.5))  # alpha / sqrt(r)
+        self.assertAlmostEqual(m.scale, 4.0 / (4**0.5))  # alpha / sqrt(r)
 
     def test_alpha_none_no_rslora_collapses_to_unit_scale(self) -> None:
         m = self._build(alpha=None, use_rslora=False, lora_dim=4)
@@ -413,12 +417,12 @@ class TestAlphaScaleBackCompatAfterMove(unittest.TestCase):
 
     def test_alpha_none_with_rslora_collapses_to_unit_scale(self) -> None:
         m = self._build(alpha=None, use_rslora=True, lora_dim=4)
-        self.assertAlmostEqual(m.alpha.item(), 4.0 ** 0.5)  # set to sqrt(r)
+        self.assertAlmostEqual(m.alpha.item(), 4.0**0.5)  # set to sqrt(r)
         self.assertAlmostEqual(m.scale, 1.0)
 
     def test_alpha_zero_with_rslora_collapses_to_unit_scale(self) -> None:
         m = self._build(alpha=0, use_rslora=True, lora_dim=4)
-        self.assertAlmostEqual(m.alpha.item(), 4.0 ** 0.5)
+        self.assertAlmostEqual(m.alpha.item(), 4.0**0.5)
         self.assertAlmostEqual(m.scale, 1.0)
 
     def test_alpha_tensor_input_unwraps(self) -> None:
@@ -502,7 +506,7 @@ class TestLoRAModulePissaWiring(unittest.TestCase):
         base, module = self._make_module(init="pissa", lora_dim=4, alpha=4.0, use_rslora=True, in_dim=8, out_dim=4)
 
         # Scale should be rsLoRA-shaped
-        self.assertAlmostEqual(module.scale, 4.0 / (4 ** 0.5))
+        self.assertAlmostEqual(module.scale, 4.0 / (4**0.5))
 
         residual = base.weight.detach().to(torch.float32)
         lora_A = module.lora_down.weight.detach().to(torch.float32)
