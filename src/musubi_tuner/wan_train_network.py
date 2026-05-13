@@ -552,6 +552,13 @@ class WanNetworkTrainer(NetworkTrainer):
         # if args.force_v2_1_time_embedding:
         #    model.set_time_embedding_v2_1(True)
 
+        # Compact time embedding: [B, 1, dim] instead of [B, seq_len, dim] for uniform timesteps.
+        # Saves multi-GiB VRAM for WAN 2.2 T2V. Persists across weight swaps (high/low noise experts).
+        compact = not getattr(args, "no_compact_time_embedding", False)
+        model.compact_time_embedding = compact
+        if model.model_version == "2.2" and compact:
+            logger.info("WAN 2.2: Compact time embedding enabled (saves VRAM for uniform timesteps)")
+
         # TP-03: Post-FP8 validation — verify norm/modulation params were NOT quantized.
         # FP8 exclude keys use substring matching ("norm" in key), which should cover WanRMSNorm
         # and WanLayerNorm. This check is a safety net against model changes that rename layers.
@@ -904,6 +911,18 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         "--simple_modulation",
         action="store_true",
         help="Use Wan 2.1 style modulation even for Wan 2.2 to save lots of VRAM. With this and --lazy_loading, 2.2 should use same VRAM as 2.1 ceteris paribus",
+    )
+    parser.add_argument(
+        "--no_compact_time_embedding",
+        action="store_true",
+        default=False,
+        help="Trainer-side opt-out for compact time embedding (WAN 2.2). By default, when the timestep "
+        "is uniform across all tokens (the common case in T2V training), the time embedding uses a "
+        "compact [B, 1, dim] representation that broadcasts, saving multi-GiB of VRAM. Use this flag "
+        "to force full [B, seq_len, dim] expansion during training (original behavior). Note: inference "
+        "paths always run with compact mode on — there is no matching CLI flag for generation scripts, "
+        "since the two modes produce numerically identical outputs (broadcasting only). For an even "
+        "more aggressive VRAM optimization, see --simple_modulation.",
     )
     parser.add_argument(
         "--lower_precision_attention",
