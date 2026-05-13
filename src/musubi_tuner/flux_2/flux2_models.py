@@ -871,7 +871,12 @@ class SingleStreamBlock(nn.Module):
     def _forward(self, x: Tensor, pe: Tensor, mod: tuple[Tensor, Tensor], attn_params: AttentionParams) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
         del mod
-        x_mod = (1 + mod_scale) * self.pre_norm(x) + mod_shift
+        # pre_norm returns a fresh tensor not aliased elsewhere, so mutating
+        # it in-place is autograd-safe (LayerNorm backward needs the input
+        # `x`, not the normalized output). Avoids two intermediate
+        # allocations vs `(1 + mod_scale) * self.pre_norm(x) + mod_shift`.
+        x_mod = self.pre_norm(x)
+        x_mod.mul_(1 + mod_scale).add_(mod_shift)
         del mod_scale, mod_shift
 
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim * self.mlp_mult_factor], dim=-1)
@@ -958,8 +963,12 @@ class DoubleStreamBlock(nn.Module):
         del img_mod1, img_mod2, txt_mod1, txt_mod2
 
         # prepare image for attention
+        # In-place on the fresh LayerNorm output is autograd-safe (LayerNorm
+        # backward needs the input, not the normalized output). Residual
+        # streams `img` and `txt` are NOT mutated in place — those flow into
+        # downstream autograd-saved buffers.
         img_modulated = self.img_norm1(img)
-        img_modulated = (1 + img_mod1_scale) * img_modulated + img_mod1_shift
+        img_modulated.mul_(1 + img_mod1_scale).add_(img_mod1_shift)
         del img_mod1_scale, img_mod1_shift
 
         img_qkv = self.img_attn.qkv(img_modulated)
@@ -970,7 +979,7 @@ class DoubleStreamBlock(nn.Module):
 
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1_scale) * txt_modulated + txt_mod1_shift
+        txt_modulated.mul_(1 + txt_mod1_scale).add_(txt_mod1_shift)
         del txt_mod1_scale, txt_mod1_shift
         txt_qkv = self.txt_attn.qkv(txt_modulated)
         del txt_modulated
@@ -995,17 +1004,27 @@ class DoubleStreamBlock(nn.Module):
         txt_attn, img_attn = attn[:, :txt_len], attn[:, txt_len:]
         del attn
 
-        # calculate the img blocks
+        # calculate the img blocks. The residual update `img = img + ...`
+        # rebinds the local name (allocates a new tensor) — it is NOT
+        # img.add_(...), which would mutate the residual stream in-place
+        # and break autograd's saved-tensor invariants. The in-place ops
+        # below are only on fresh norm outputs (img_temp / txt_temp).
         img = img + img_mod1_gate * self.img_attn.proj(img_attn)
         del img_mod1_gate, img_attn
-        img = img + img_mod2_gate * self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
-        del img_mod2_gate, img_mod2_scale, img_mod2_shift
+        img_temp = self.img_norm2(img)
+        img_temp.mul_(1 + img_mod2_scale).add_(img_mod2_shift)
+        del img_mod2_scale, img_mod2_shift
+        img = img + img_mod2_gate * self.img_mlp(img_temp)
+        del img_mod2_gate, img_temp
 
         # calculate the txt blocks
         txt = txt + txt_mod1_gate * self.txt_attn.proj(txt_attn)
         del txt_mod1_gate, txt_attn
-        txt = txt + txt_mod2_gate * self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
-        del txt_mod2_gate, txt_mod2_scale, txt_mod2_shift
+        txt_temp = self.txt_norm2(txt)
+        txt_temp.mul_(1 + txt_mod2_scale).add_(txt_mod2_shift)
+        del txt_mod2_scale, txt_mod2_shift
+        txt = txt + txt_mod2_gate * self.txt_mlp(txt_temp)
+        del txt_mod2_gate, txt_temp
         return img, txt
 
     def forward(
