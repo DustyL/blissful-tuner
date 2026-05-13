@@ -1163,8 +1163,11 @@ def attention(qkv_list: list[Tensor], pe: Tensor, attn_params: AttentionParams) 
     q, k, v = qkv_list
     del qkv_list
 
-    # Apply rotary position embeddings
-    q, k = apply_rope(q, k, pe)
+    # Apply rotary position embeddings per-tensor. Sequencing q then k means
+    # k's float-cast and rope-output intermediates aren't live simultaneously
+    # with q's — peak rope memory halves.
+    q = apply_rope(q, pe)
+    k = apply_rope(k, pe)
 
     # Transpose from (B, H, L, D) to (B, L, H, D) for unified attention
     q = q.transpose(1, 2)
@@ -1188,9 +1191,18 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     return out.float()
 
 
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+def apply_rope(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    """Apply rotary positional embeddings to a single tensor.
+
+    Splitting the prior `apply_rope(xq, xk, pe)` into two calls (one per
+    tensor) reduces peak memory: q's intermediates are freed before k is
+    processed, instead of being held live in parallel.
+
+    addcmul_ fuses the second freqs * x + accumulator into one in-place op
+    on `x_out`, which is freshly allocated by torch.mul above and not
+    aliased — safe to mutate.
+    """
+    x_ = x.float().reshape(*x.shape[:-1], -1, 1, 2)
+    x_out = torch.mul(freqs_cis[..., 0], x_[..., 0])
+    x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
+    return x_out.reshape(*x.shape).type_as(x)
