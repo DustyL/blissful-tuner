@@ -23,6 +23,9 @@ from musubi_tuner.flux_2 import flux2_models
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 LIGER_IMPORTABLE = flux2_models._LIGER_AVAILABLE
+# Liger CUDA tests trigger Triton JIT + GPU kernels. Per the repo's local-safe
+# policy, default pytest runs should not silently fire those. Opt-in via env var.
+CUDA_TESTS_ENABLED = os.environ.get("BLISSFUL_RUN_CUDA_TESTS", "0") == "1"
 
 
 def _reload_with_env(env_value: str) -> object:
@@ -100,7 +103,10 @@ class SiLUActivationFallbackParity(unittest.TestCase):
         self.assertTrue(torch.equal(actual, reference))
 
 
-@unittest.skipUnless(CUDA_AVAILABLE and LIGER_IMPORTABLE, "Liger active path requires CUDA + liger-kernel")
+@unittest.skipUnless(
+    CUDA_AVAILABLE and LIGER_IMPORTABLE and CUDA_TESTS_ENABLED,
+    "Liger active path requires CUDA + liger-kernel + BLISSFUL_RUN_CUDA_TESTS=1",
+)
 class LigerActiveNumericalParity(unittest.TestCase):
     """Compare the Liger-active forward against the fallback forward.
     Tolerance is loose-ish because Liger uses fused Triton kernels with
