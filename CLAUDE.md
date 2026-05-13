@@ -98,7 +98,7 @@ If torch ever does need to be rebuilt: `bash ~/pytorch/daily_build.sh ~/blissful
 
 ### Testing
 ```bash
-# Run all tests (58 test files)
+# Run all tests (use `find tests -maxdepth 1 -name 'test_*.py' | wc -l` for current count)
 pytest tests/
 
 # Run a specific test file
@@ -230,7 +230,7 @@ blissful-tuner/
 │   ├── apply_instance_mask_to_weighted_mask.py # Multiply weighted × instance masks
 │   ├── verify_flux2_architecture.py           # FLUX.2 architecture verification
 │   └── summarize_tensorboard_run.py           # TensorBoard scalar run summarizer
-├── tests/                      # Unit tests (pytest, 58 test files)
+├── tests/                      # Unit tests (pytest)
 ├── configs/                    # Training configs (DLAY, OLVA, Z-Image, Qwen examples)
 ├── docs/                       # Architecture guides, training references
 └── *.py                        # Root-level thin wrapper scripts (45 files)
@@ -447,6 +447,58 @@ Additional network utilities in `networks/`:
 - `convert_hunyuan_video_1_5_lora_to_comfy.py` — HV1.5 LoRA → ComfyUI converter
 - `convert_z_image_lora_to_comfy.py` — Z-Image LoRA → ComfyUI converter
 
+### LoRA Implementation Invariants
+
+The LoRA system wraps target modules by replacing `org_module.forward` in
+`LoRAModule.apply_to()` (`src/musubi_tuner/networks/lora.py`). Optimizations
+that touch LoRA-targeted blocks must preserve these invariants:
+
+- **Call target modules, do not read their raw weights.** Use `self.linear1(x)`
+  / `self.img_attn.qkv(x)` rather than `F.linear(x, self.linear1.weight)`. Raw
+  weight calls bypass the monkey-patched forward — adapters still allocate VRAM
+  and save into checkpoints but contribute nothing and receive no gradient.
+  Guarded by `tests/test_lora_target_coverage.py` and
+  `tests/test_flux2_lora_target_coverage.py`.
+
+- **Preserve DoRA's delta path.** DoRA forward is `org_forwarded + _dora_delta(...)`,
+  not the simple `org + lora_up(lora_down(x)) * scale` formula. Linear fast paths
+  such as residual `addmm_` must be gated away from `self.use_dora`. Guarded by
+  `tests/test_lora_dora_delta_path.py` (spies on `_dora_delta` invocation).
+
+- **Do not assume every LoRA target is Linear.** Conv2d LoRA weights are 4D
+  `(out_ch, in_ch, kH, kW)` — Linear-only patterns like `weight.t()` raise on
+  Conv2d. Guarded by `tests/test_lora_conv2d_forward.py`.
+
+- **Treat in-place mutation as autograd-sensitive.** Fresh local temporaries
+  (e.g. LayerNorm outputs in FLUX.2 blocks) are safer mutation candidates;
+  residual-stream tensors (`img`, `txt`) should not be mutated in-place unless
+  a backward/anomaly test proves it. Guarded by
+  `tests/test_flux2_block_backward_anomaly.py`.
+
+To validate all four invariants at once:
+
+```bash
+./venv314/bin/python -m pytest -q \
+  tests/test_lora_split_dims_rank_dropout.py \
+  tests/test_lora_conv2d_forward.py \
+  tests/test_lora_dora_delta_path.py \
+  tests/test_lora_target_coverage.py \
+  tests/test_flux2_lora_target_coverage.py \
+  tests/test_flux2_block_backward_anomaly.py \
+  tests/test_flux2_compile_smoke.py \
+  tests/test_flux2_integration_smoke.py
+```
+
+### FLUX.2 Test Authoring Note
+
+When building tiny FLUX.2 models in tests, construct `Flux2Params(...)` directly
+with explicit small values. Do **not** subclass `Flux2Params` unless the subclass
+is also decorated with `@dataclass`; otherwise the inherited generated `__init__`
+silently ignores the new class attributes and instantiates a full-sized model —
+class instantiation succeeds, then `Flux2(params, ...)` allocates 80+ GB of CPU
+RAM and OOMs the host. See `tests/test_flux2_integration_smoke.py` for the
+canonical direct-kwargs pattern with pre-allocation guard assertions.
+
 ### Memory Optimization Flags
 
 ```bash
@@ -521,7 +573,7 @@ The mask loss system (`src/musubi_tuner/modules/mask_loss.py`) is a key differen
 - **HunyuanVideo caching doesn't write mask_weights**: The HV training loop can consume mask_weights, but `hv_cache_latents.py` doesn't produce them.
 - **FLUX.1 Kontext and FramePack**: No mask support at all.
 
-### Key Test Files (58 total in tests/)
+### Key Test Files
 - `tests/test_mask_loss.py` — Core math (gamma, min_weight, blur, prior, normalization, edge cases)
 - `tests/test_wan_mask_loss_integration.py` — WAN-specific shapes and prior preservation integration
 - `tests/test_wan_mask_spatial_validation.py` — Spatial dimension validation during caching
@@ -531,6 +583,35 @@ The mask loss system (`src/musubi_tuner/modules/mask_loss.py`) is a key differen
 - `tests/test_prior_scheduling.py` — Timestep-adaptive prior weight scheduling
 - `tests/test_loss_utils.py` — MSE/Huber loss computation
 - `tests/test_muon_optimizer.py` — Muon optimizer integration
+
+## Performance Investigation Pattern
+
+For performance-claimed branches, prefer an empirical A/B gate against a
+production-shaped workload before merging. Synthetic micro-smokes are useful for
+correctness, but they can mispredict real FLUX.2 Klein behavior under
+`compile=true`, DoRA, bf16, gradient checkpointing, mask loss, and prior
+preservation.
+
+Local A/B artifacts may live under `/home/dustin/output/ab_gate/`:
+- `RUNBOOK.md` for per-condition commands
+- `launch_condition.sh` for a detached training launcher with `systemd-run --user --scope` memory cap
+- `configs/` for short-run TOMLs derived from a production config
+- `analyze.py` for TensorBoard wall-time delta and loss-parity comparison
+- per-condition stdout, TensorBoard logs, and GPU sample CSVs
+
+Use a 3-condition matrix when relevant: `main` baseline, branch with optional
+feature disabled, branch with optional feature enabled. Keep run length short but
+past optimizer/compile warmup; the FLUX.2 Klein v8 gate used 300 steps and
+measured steps 201-300 / 251-300.
+
+**Recorded results:**
+
+- **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
+  was ~19% slower on Klein 9B with `compile=true`; safe-subset perf changes
+  (in-place modulation, per-tensor `apply_rope`, deferred `single_block_mod`)
+  were neutral. Revisit only if the production path changes materially — e.g.
+  `compile=false`, a different Torch / Inductor stack, or a different
+  model/kernel mix. Receipts in PR #4 (merged) + the local ab_gate artifacts.
 
 ## Blissful Logger
 
