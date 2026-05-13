@@ -415,18 +415,23 @@ def compute_density_for_timestep_sampling(
 
 
 def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
+    """Look up sigma values for given timesteps via nearest-neighbor index.
+
+    Handles both discrete-timestep samplers (where timesteps exactly match
+    noise_scheduler.timesteps) and continuous-timestep samplers like
+    flux2_shift (where timesteps are floats that don't exactly match the
+    scheduler's integer grid). For exact-match inputs the nearest-neighbor
+    lookup returns the same index that an equality test would (distance 0
+    is the minimum), so this is a strict superset of the prior exact-match
+    path. Error bound for non-exact inputs is half a timestep granularity —
+    negligible for the smooth weighting curves (sigma_sqrt, cosmap,
+    structure_bell) that consume these sigmas.
+    """
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
 
-    # if sum([(schedule_timesteps == t) for t in timesteps]) < len(timesteps):
-    if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
-        # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
-        # round to nearest timestep
-        logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
-        step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
-    else:
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
 
     sigma = sigmas[step_indices].flatten()
     while len(sigma.shape) < n_dim:

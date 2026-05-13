@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from musubi_tuner.hv_train_network import compute_loss_weighting_for_sd3
+from musubi_tuner.hv_train_network import compute_loss_weighting_for_sd3, get_sigmas
 
 
 class _DummyScheduler:
@@ -42,6 +42,38 @@ class TestLossWeightingNDIM(unittest.TestCase):
         loss = torch.ones((2, 3, 1, 8, 8), dtype=torch.float32)
         out = loss * weighting
         self.assertEqual(out.shape, loss.shape)
+
+
+class TestGetSigmasContinuousTimesteps(unittest.TestCase):
+    """Regression test for get_sigmas() with continuous (non-exact-match) timesteps.
+
+    Continuous-timestep samplers like flux2_shift produce floats that don't exact-match
+    the integer schedule. After unifying both code paths on nearest-neighbor lookup,
+    these must resolve to the closest scheduler index, not error or silently drop entries.
+    """
+
+    def test_float_timesteps_resolve_to_nearest_index(self):
+        sched = _DummyScheduler()  # timesteps [0,1,2,3] -> sigmas [1.0, 0.5, 0.25, 0.0]
+        # 0.4 -> nearest 0 -> 1.0; 1.7 -> nearest 2 -> 0.25; 2.9 -> nearest 3 -> 0.0
+        timesteps = torch.tensor([0.4, 1.7, 2.9], dtype=torch.float32)
+
+        sigma = get_sigmas(sched, timesteps, device="cpu", n_dim=1)
+
+        self.assertEqual(sigma.shape, (3,))
+        self.assertAlmostEqual(sigma[0].item(), 1.0, places=6)
+        self.assertAlmostEqual(sigma[1].item(), 0.25, places=6)
+        self.assertAlmostEqual(sigma[2].item(), 0.0, places=6)
+
+    def test_exact_match_integer_timesteps_still_resolve_correctly(self):
+        """Strict-superset guarantee: exact matches must keep returning the exact index."""
+        sched = _DummyScheduler()
+        timesteps = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        sigma = get_sigmas(sched, timesteps, device="cpu", n_dim=1)
+
+        self.assertEqual(sigma.shape, (4,))
+        for idx, expected in enumerate([1.0, 0.5, 0.25, 0.0]):
+            self.assertAlmostEqual(sigma[idx].item(), expected, places=6)
 
 
 if __name__ == "__main__":
