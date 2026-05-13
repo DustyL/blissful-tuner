@@ -69,9 +69,9 @@ def prepare_metadata(args: argparse.Namespace, seed_override: Optional[Any] = No
     if hasattr(args, "task"):  # Use task arg present for Wan/K5 to suss out model version
         if args.task.lower() in ["t2v-a14b", "i2v-a14b"]:
             metadata["bt_model_type"] = "Wan 2.2"
-        elif "k5-pro" in args.task.lower():
+        elif args.task.lower().startswith("k5-pro"):
             metadata["bt_model_type"] = "Kandinsky 5 Pro"
-        elif "k5-lite" in args.task.lower():
+        elif args.task.lower().startswith("k5-lite"):
             metadata["bt_model_type"] = "Kandinsky 5 Lite"
         else:
             metadata["bt_model_type"] = "Wan 2.1"

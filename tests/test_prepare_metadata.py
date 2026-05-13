@@ -34,5 +34,41 @@ class TestPrepareMetadataLoRAMultipliers(unittest.TestCase):
         self.assertEqual(metadata["bt_model_type"], "Wan 2.2")
 
 
+class TestPrepareMetadataKandinsky5Detection(unittest.TestCase):
+    """Lock down the K5 task -> bt_model_type dispatch added alongside the prefix refactor.
+
+    The reviewer's concern with the original substring check was that future K5 task
+    names containing `k5-pro`/`k5-lite` *anywhere* in the string would match. Using
+    str.startswith() encodes the invariant tightly, and these tests assert both the
+    direct cases and totality over the current TASK_CONFIGS registry.
+    """
+
+    def test_k5_pro_task_classified_as_kandinsky_5_pro(self):
+        args = argparse.Namespace(seed=42, task="k5-pro-t2v-5s-sd")
+        metadata = prepare_metadata(args)
+        self.assertEqual(metadata["bt_model_type"], "Kandinsky 5 Pro")
+
+    def test_k5_lite_task_classified_as_kandinsky_5_lite(self):
+        args = argparse.Namespace(seed=42, task="k5-lite-t2v-5s-distil-sd")
+        metadata = prepare_metadata(args)
+        self.assertEqual(metadata["bt_model_type"], "Kandinsky 5 Lite")
+
+    def test_all_kandinsky5_task_configs_classified(self):
+        """Totality check: every TASK_CONFIGS key must resolve to a K5 model type,
+        not the Wan 2.1 fallback. Regresses if a new K5 task name slips a prefix."""
+        from musubi_tuner.kandinsky5.configs import TASK_CONFIGS
+
+        for task_name in TASK_CONFIGS:
+            with self.subTest(task=task_name):
+                args = argparse.Namespace(seed=42, task=task_name)
+                metadata = prepare_metadata(args)
+                self.assertIn(
+                    metadata["bt_model_type"],
+                    ("Kandinsky 5 Pro", "Kandinsky 5 Lite"),
+                    f"task {task_name!r} classified as {metadata['bt_model_type']!r}, "
+                    "expected 'Kandinsky 5 Pro' or 'Kandinsky 5 Lite'",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
