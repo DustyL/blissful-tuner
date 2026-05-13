@@ -916,11 +916,13 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         "--no_compact_time_embedding",
         action="store_true",
         default=False,
-        help="Disable compact time embedding for WAN 2.2. By default, when the timestep is uniform "
-        "across all tokens (the common case in T2V training), the time embedding uses a compact "
-        "[B, 1, dim] representation that broadcasts, saving multi-GiB of VRAM. Use this flag "
-        "to force full [B, seq_len, dim] expansion (original behavior). For an even more aggressive "
-        "VRAM optimization, see --simple_modulation.",
+        help="Trainer-side opt-out for compact time embedding (WAN 2.2). By default, when the timestep "
+        "is uniform across all tokens (the common case in T2V training), the time embedding uses a "
+        "compact [B, 1, dim] representation that broadcasts, saving multi-GiB of VRAM. Use this flag "
+        "to force full [B, seq_len, dim] expansion during training (original behavior). Note: inference "
+        "paths always run with compact mode on — there is no matching CLI flag for generation scripts, "
+        "since the two modes produce numerically identical outputs (broadcasting only). For an even "
+        "more aggressive VRAM optimization, see --simple_modulation.",
     )
     parser.add_argument(
         "--lower_precision_attention",
