@@ -35,7 +35,8 @@ from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 import importlib.util as _importlib_util
 
 _LIGER_AVAILABLE = _importlib_util.find_spec("liger_kernel") is not None
-_LIGER_ENABLED = _LIGER_AVAILABLE and os.environ.get("BLISSFUL_USE_LIGER_FLUX2", "0") == "1"
+_LIGER_REQUESTED = os.environ.get("BLISSFUL_USE_LIGER_FLUX2", "0") == "1"
+_LIGER_ENABLED = _LIGER_AVAILABLE and _LIGER_REQUESTED
 
 if _LIGER_ENABLED:
     try:
@@ -56,6 +57,16 @@ if _LIGER_ENABLED:
             _e,
         )
 else:
+    # Warn separately for "requested but not installed" so an A/B benchmark
+    # doesn't silently time the fallback path while the operator believes
+    # Liger is active. The ImportError branch above covers "installed but
+    # broken at import"; this covers "package absent entirely."
+    if _LIGER_REQUESTED and not _LIGER_AVAILABLE:
+        logging.getLogger(__name__).warning(
+            "BLISSFUL_USE_LIGER_FLUX2=1 was set but liger-kernel is not installed. "
+            "Falling back to PyTorch path. Run `pip install liger-kernel` to enable "
+            "the optimization."
+        )
     LigerRMSNormFunction = None  # type: ignore[assignment]
     LigerSiLUMulFunction = None  # type: ignore[assignment]
 
