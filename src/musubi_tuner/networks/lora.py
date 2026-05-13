@@ -613,9 +613,14 @@ class LoRAModule(torch.nn.Module):
             if self.rank_dropout is not None and self.training:
                 masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
                 for i in range(len(lxs)):
-                    if len(lx.size()) == 3:
+                    # `lx` from the comprehension above doesn't leak into this scope in Py3,
+                    # so we must consult lxs[i] directly. Use .dim() (returns int) — the prior
+                    # `len(lx.size()) == 3` form raised UnboundLocalError, and `len(lxs[i].dim())`
+                    # would raise TypeError because dim() is an int.
+                    ndim = lxs[i].dim()
+                    if ndim == 3:
                         masks[i] = masks[i].unsqueeze(1)
-                    elif len(lx.size()) == 4:
+                    elif ndim == 4:
                         masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
                     lxs[i] = lxs[i] * masks[i]
 
