@@ -21,27 +21,43 @@ from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 # tests/test_flux2_liger_*.py if Triton's API drifts (this box rebuilds torch
 # + triton daily, so silent regressions are a real risk).
 #
-# Gate is opt-in via env var so a baseline FLUX.2 run is reproducible without
-# requiring users to uninstall the package: setting BLISSFUL_USE_LIGER_FLUX2=1
-# at process start switches the FLUX.2 RMSNorm and SiLUActivation to Liger
-# kernels. RMSNorm's saved parameter is still `scale` (Liger's underlying
-# function takes the weight as an argument, so we never need to rename).
-try:
-    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
-    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+# Two-stage gate keeps the import path inert when not requested:
+#   _LIGER_AVAILABLE — "is liger-kernel installable?" Probed via find_spec, which
+#     reads package metadata WITHOUT executing the package. Tests use this flag
+#     to decide whether to skip Liger coverage. A broken future liger-kernel /
+#     triton import cannot affect FLUX.2 import in the default (gate-off) path.
+#   _LIGER_ENABLED — "should we actively use it?" Requires
+#     BLISSFUL_USE_LIGER_FLUX2=1 AND _LIGER_AVAILABLE. The liger_kernel module is
+#     only actually imported when this is true.
+#
+# RMSNorm's saved parameter remains `scale` (Liger's underlying function takes
+# the weight as an argument, so we never need to rename).
+import importlib.util as _importlib_util
 
-    _LIGER_AVAILABLE = True
-except ImportError:
+_LIGER_AVAILABLE = _importlib_util.find_spec("liger_kernel") is not None
+_LIGER_ENABLED = _LIGER_AVAILABLE and os.environ.get("BLISSFUL_USE_LIGER_FLUX2", "0") == "1"
+
+if _LIGER_ENABLED:
+    try:
+        from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+        logging.getLogger(__name__).info(
+            "BLISSFUL_USE_LIGER_FLUX2=1 — FLUX.2 RMSNorm and SiLU-gated MLP will use "
+            "Liger fused Triton kernels (CUDA-only)."
+        )
+    except ImportError as _e:
+        LigerRMSNormFunction = None  # type: ignore[assignment]
+        LigerSiLUMulFunction = None  # type: ignore[assignment]
+        _LIGER_ENABLED = False
+        logging.getLogger(__name__).warning(
+            "BLISSFUL_USE_LIGER_FLUX2=1 was set but liger_kernel import failed (%s). "
+            "Falling back to PyTorch path.",
+            _e,
+        )
+else:
     LigerRMSNormFunction = None  # type: ignore[assignment]
     LigerSiLUMulFunction = None  # type: ignore[assignment]
-    _LIGER_AVAILABLE = False
-
-_LIGER_ENABLED = _LIGER_AVAILABLE and os.environ.get("BLISSFUL_USE_LIGER_FLUX2", "0") == "1"
-if _LIGER_ENABLED:
-    logging.getLogger(__name__).info(
-        "BLISSFUL_USE_LIGER_FLUX2=1 and liger_kernel imported — FLUX.2 RMSNorm and "
-        "SiLU-gated MLP will use Liger fused Triton kernels. CUDA-only."
-    )
 
 # import logging
 # logger = logging.getLogger(__name__)
@@ -791,6 +807,17 @@ class SiLUActivation(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x1, x2 = x.chunk(2, dim=-1)
         if _LIGER_ENABLED:
+            # Liger Triton kernels are CUDA-only. A CPU smoke run with
+            # BLISSFUL_USE_LIGER_FLUX2=1 (or a future offload path that
+            # ships CPU tensors through this module) would otherwise crash
+            # inside Triton with an opaque "Pointer argument cannot be
+            # accessed from Triton" error. Raise a crisp error instead.
+            if x1.device.type != "cuda":
+                raise RuntimeError(
+                    f"BLISSFUL_USE_LIGER_FLUX2=1 active but SiLUActivation input is on "
+                    f"device {x1.device.type!r} — Liger fused kernels require CUDA tensors. "
+                    "Move the model to CUDA or unset BLISSFUL_USE_LIGER_FLUX2."
+                )
             return LigerSiLUMulFunction.apply(x1, x2)
         return torch.nn.functional.silu(x1) * x2
 
@@ -1126,6 +1153,13 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: Tensor):
         if _LIGER_ENABLED:
+            # See SiLUActivation.forward for why this guard exists.
+            if x.device.type != "cuda":
+                raise RuntimeError(
+                    f"BLISSFUL_USE_LIGER_FLUX2=1 active but RMSNorm input is on "
+                    f"device {x.device.type!r} — Liger fused kernels require CUDA tensors. "
+                    "Move the model to CUDA or unset BLISSFUL_USE_LIGER_FLUX2."
+                )
             # LigerRMSNormFunction takes the weight as an argument, so we pass
             # `self.scale` directly — no parameter rename, checkpoint round-trip
             # stays on the `scale` key. Llama casting matches the fallback's
