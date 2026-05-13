@@ -33,7 +33,7 @@ import unittest
 import torch
 
 from musubi_tuner.flux_2 import flux2_models
-from musubi_tuner.flux_2.flux2_models import DoubleStreamBlock, Flux2, Flux2Params, rope
+from musubi_tuner.flux_2.flux2_models import Flux2, Flux2Params, rope
 from musubi_tuner.modules.attention import AttentionParams
 
 
