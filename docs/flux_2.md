@@ -187,6 +187,19 @@ FLUX.2の学習は専用のスクリプト`flux_2_train_network.py`を使用し�
 
 </details>
 
+### Optional: Liger fused kernels
+
+FLUX.2's `RMSNorm` and `SiLUActivation` can route through [liger-kernel](https://github.com/linkedin/Liger-Kernel)'s fused Triton kernels for a faster step on Blackwell+ GPUs. Off by default; enable per-run with an env var:
+
+```bash
+BLISSFUL_USE_LIGER_FLUX2=1 accelerate launch ... flux_2_train_network.py ...
+```
+
+- **Install:** `pip install liger-kernel` (CUDA-only — Triton kernels). Tested against `liger-kernel==0.8.0`. Newer versions should work, but `tests/test_flux2_liger.py` is the canary if Triton's API drifts under daily torch rebuilds.
+- **Parameter contract preserved:** the saved checkpoint key is still `scale` for `RMSNorm` (we call `LigerRMSNormFunction.apply(x, scale, ...)` directly with our parameter as the weight argument — no rename). Existing FLUX.2-Klein checkpoints load unchanged regardless of whether the gate is on at load time.
+- **What it accelerates:** RMSNorm (Q/K norms, dozens per FLUX.2 forward) and the SiLU-gated MLP activation in single/double blocks. Expected wins are mostly step-time, with secondary memory benefits from fused kernels not materializing intermediates.
+- **Reproducibility:** the gate is opt-in so a baseline FLUX.2 run is reproducible without uninstalling liger-kernel. A one-time `INFO` log fires at module import when the gate is active, so it's clear from logs which path the run took.
+
 ## Inference / 推論
 
 Inference uses a dedicated script `flux_2_generate_image.py`.

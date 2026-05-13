@@ -1,6 +1,8 @@
 # # copy from FLUX repo: https://github.com/black-forest-labs/flux
 # # license: Apache-2.0 License
+import logging
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -13,6 +15,33 @@ from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.modules.attention import attention as unified_attention
 
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+
+# Optional Liger fused kernels (RMSNorm + SiLU-gated MLP). CUDA-only via Triton.
+# Tested against liger-kernel==0.8.0; newer versions should work but verify
+# tests/test_flux2_liger_*.py if Triton's API drifts (this box rebuilds torch
+# + triton daily, so silent regressions are a real risk).
+#
+# Gate is opt-in via env var so a baseline FLUX.2 run is reproducible without
+# requiring users to uninstall the package: setting BLISSFUL_USE_LIGER_FLUX2=1
+# at process start switches the FLUX.2 RMSNorm and SiLUActivation to Liger
+# kernels. RMSNorm's saved parameter is still `scale` (Liger's underlying
+# function takes the weight as an argument, so we never need to rename).
+try:
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+    _LIGER_AVAILABLE = True
+except ImportError:
+    LigerRMSNormFunction = None  # type: ignore[assignment]
+    LigerSiLUMulFunction = None  # type: ignore[assignment]
+    _LIGER_AVAILABLE = False
+
+_LIGER_ENABLED = _LIGER_AVAILABLE and os.environ.get("BLISSFUL_USE_LIGER_FLUX2", "0") == "1"
+if _LIGER_ENABLED:
+    logging.getLogger(__name__).info(
+        "BLISSFUL_USE_LIGER_FLUX2=1 and liger_kernel imported — FLUX.2 RMSNorm and "
+        "SiLU-gated MLP will use Liger fused Triton kernels. CUDA-only."
+    )
 
 # import logging
 # logger = logging.getLogger(__name__)
@@ -754,13 +783,11 @@ class SelfAttention(nn.Module):
 
 
 class SiLUActivation(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gate_fn = nn.SiLU()
-
     def forward(self, x: Tensor) -> Tensor:
         x1, x2 = x.chunk(2, dim=-1)
-        return self.gate_fn(x1) * x2
+        if _LIGER_ENABLED:
+            return LigerSiLUMulFunction.apply(x1, x2)
+        return torch.nn.functional.silu(x1) * x2
 
 
 class Modulation(nn.Module):
@@ -1068,14 +1095,21 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor):
+        if _LIGER_ENABLED:
+            # LigerRMSNormFunction takes the weight as an argument, so we pass
+            # `self.scale` directly — no parameter rename, checkpoint round-trip
+            # stays on the `scale` key. Llama casting matches the fallback's
+            # "compute in fp32, scale parameter applied last" pattern.
+            return LigerRMSNormFunction.apply(x, self.scale, self.eps, 0.0, "llama", True, None)
         x_dtype = x.dtype
         x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         return (x * rrms).to(dtype=x_dtype) * self.scale
 
 
