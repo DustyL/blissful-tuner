@@ -723,7 +723,10 @@ class Flux2(nn.Module):
 
         double_block_mod_img = self.double_stream_modulation_img(vec)
         double_block_mod_txt = self.double_stream_modulation_txt(vec)
-        single_block_mod, _ = self.single_stream_modulation(vec)
+        # single_block_mod is computed lazily just before the single-block
+        # loop below — it's not used during the double-block pass, and
+        # holding it live across ~30-48 double blocks (depending on model
+        # depth) wastes a modulation-tensor-sized chunk of VRAM at peak.
 
         img = self.img_in(x)
         del x
@@ -751,6 +754,8 @@ class Flux2(nn.Module):
         del txt
         pe = torch.cat((pe_ctx, pe_x), dim=2)
         del pe_ctx, pe_x
+
+        single_block_mod, _ = self.single_stream_modulation(vec)
 
         for block_idx, block in enumerate(self.single_blocks):
             if self.blocks_to_swap:
