@@ -2968,6 +2968,15 @@ class NetworkTrainer:
                                 logs["prior/w_prior_max"] = float(w.max().item())
                             else:
                                 logs["prior/w_prior_mean"] = float(prior_weight)
+
+                    # Dynamo cache-entry telemetry — live curve of recompile growth under --compile.
+                    # Empty (count=0) when --compile is off or the API is unavailable, so the
+                    # scalar simply does not appear in TensorBoard in those cases.
+                    if bool(getattr(args, "compile", False)):
+                        cache_count = model_utils.count_dynamo_cache_entries(transformer)
+                        if cache_count > 0:
+                            logs["dynamo/cache_entries"] = float(cache_count)
+
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
