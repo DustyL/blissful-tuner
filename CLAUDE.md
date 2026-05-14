@@ -275,6 +275,8 @@ blissful-tuner/
 - **T5 Only**: CLIP not required (unlike WAN 2.1)
 - **Tasks**: `t2v-A14B` (T2V) or `i2v-A14B` (I2V)
 - **Flow Matching**: `--timestep_sampling shift`, `--discrete_flow_shift 12.0` for T2V
+- **Compact Time Embedding**: Default-on optimization that keeps `e`/`e0` at `[B, 1, dim]` / `[B, 1, 6, dim]` instead of expanding to `[B, seq_len, dim]` / `[B, seq_len, 6, dim]` when `t.dim() == 1` (uniform timestep, T2V case). Broadcasting in `WanAttentionBlock.get_modulation()` / `Head.forward()` produces numerically identical outputs (`atol=0`). Saves multi-GiB VRAM at training; I2V/TI2V per-token-timestep paths (`expand_timesteps`, `t.dim() == 2`) auto-bypass. Disable with `--no_compact_time_embedding`. See `docs/wan.md` and `tests/test_wan_compact_time_embedding.py`.
+- **RoPE Frequency Cache**: `WanModel.freqs_fhw` is capped at `_FREQS_CACHE_MAX_SIZE = 512` with FIFO eviction (one-shot `logger.warning` on first eviction). Prevents unbounded growth in multi-bucket / multi-resolution training runs.
 
 ### Kandinsky 5 Specifics
 
@@ -502,13 +504,15 @@ canonical direct-kwargs pattern with pre-allocation guard assertions.
 ### Memory Optimization Flags
 
 ```bash
---blocks_to_swap N        # Swap N blocks to CPU (max 39 for 14B)
---fp8_base                # FP8 precision for DiT
---fp8_t5                  # FP8 for T5 encoder
---gradient_checkpointing  # Enable gradient checkpointing
---offload_inactive_dit    # Offload inactive model (WAN 2.2)
---rope_func comfy         # VRAM-efficient rope (good with --compile)
---prefer_lycoris          # Use LyCORIS backend for LoRA merging (inference)
+--blocks_to_swap N            # Swap N blocks to CPU (max 39 for 14B)
+--fp8_base                    # FP8 precision for DiT
+--fp8_t5                      # FP8 for T5 encoder
+--gradient_checkpointing      # Enable gradient checkpointing
+--offload_inactive_dit        # Offload inactive model (WAN 2.2)
+--rope_func comfy             # VRAM-efficient rope (good with --compile)
+--no_compact_time_embedding   # WAN 2.2: disable compact time embedding (default: enabled; saves multi-GiB at T2V training, no-op for I2V)
+--force_v2_1_time_embedding   # WAN 2.2: revert to Wan2.1-style modulation entirely (more aggressive than compact)
+--prefer_lycoris              # Use LyCORIS backend for LoRA merging (inference)
 ```
 
 ### Muon Optimizer

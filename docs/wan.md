@@ -230,6 +230,8 @@ For Wan2.2 models, `--discrete_flow_shift` may need to be adjusted based on I2V 
 
 `--force_v2_1_time_embedding` uses the same shape of time embedding as Wan2.1. This can reduce VRAM usage during inference and training (the larger the resolution and number of frames, the greater the reduction). Although this is different from the official implementation of Wan2.2, it seems that there is no effect on inference or training within the range that has been confirmed.
 
+`--no_compact_time_embedding` disables the **compact time embedding** optimization (Wan2.2, default: enabled). With the default, when the timestep is uniform across all tokens (the common T2V training case, `t.dim() == 1`), the time embedding is kept at `[B, 1, dim]` and broadcasts in downstream modulation/attention rather than being expanded to `[B, seq_len, dim]`. This saves multi-GiB of VRAM with numerically identical outputs (the broadcast and expansion paths are exact-equal, `atol=0`). Per-token timestep paths (I2V/TI2V via `expand_timesteps`, `t.dim() == 2`) automatically fall through to the original full-expansion path regardless of this flag, so I2V training is unaffected. Use this flag only when you want to A/B compare against the pre-optimization baseline or reproduce older behavior. Inference scripts run with compact mode unconditionally — there is no matching CLI flag for `wan_generate_video.py` since the modes are equivalent. For a more aggressive memory reduction that reverts to Wan2.1-style modulation entirely, see `--force_v2_1_time_embedding` (above).
+
 Don't forget to specify `--network_module networks.lora_wan`.
 
 Other options are mostly the same as `hv_train_network.py`. See [HunyuanVideo documentation](./hunyuan_video.md#training--学習) and `--help` for details.
@@ -269,6 +271,8 @@ Wan2.2モデルの場合、高ノイズ用モデルまたは低ノイズ用モ�
 Wan2.2の場合、I2VとT2Vで`--discrete_flow_shift`を調整する必要があるかもしれません。公式実装によると、推論時のシフト値はT2Vで12.0、I2Vで5.0です。学習時のシフト値は推論時度必ずしも合わせる必要はありませんが、参考になるかもしれません。
 
 `--force_v2_1_time_embedding` を指定すると、Wan2.1と同じ形状の時間埋め込みを使用します。これにより推論中、学習中のVRAM使用量を削減できます（解像度やフレーム数が大きいほど削減量も大きくなります）。Wan2.2の公式実装とは異なりますが、確認した範囲では推論、学習共に影響はないようです。
+
+`--no_compact_time_embedding` を指定すると、**コンパクト時間埋め込み**の最適化（Wan2.2、デフォルト：有効）を無効にできます。デフォルトでは、タイムステップが全トークンで一様な場合（T2V学習の一般的なケース、`t.dim() == 1`）、時間埋め込みは `[B, 1, dim]` のまま保持され、ダウンストリームのモジュレーション／アテンションでブロードキャストされます（`[B, seq_len, dim]` への展開ではなく）。これにより数値的に同一の出力を維持しつつ（ブロードキャストパスと展開パスは厳密に等価、`atol=0`）、VRAMを大幅に削減できます。トークンごとに異なるタイムステップを使うパス（`expand_timesteps`を伴うI2V／TI2V、`t.dim() == 2`）は、このフラグに関わらず元の完全展開パスに自動的にフォールスルーされるため、I2V学習には影響しません。このフラグは、最適化前のベースラインとのA/Bテストや旧来の挙動を再現したい場合のみ使用してください。推論スクリプトは無条件にコンパクトモードで動作します（モードが等価なため `wan_generate_video.py` に対応するCLIフラグはありません）。さらに積極的なVRAM削減（Wan2.1スタイルのモジュレーションへの完全切替）には上記の `--force_v2_1_time_embedding` を参照してください。
 
 `--network_module` に `networks.lora_wan` を指定することを忘れないでください。
 

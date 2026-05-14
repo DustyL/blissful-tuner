@@ -1244,6 +1244,36 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 \
 | **blocks_to_swap** | 0-39 | Memory optimization |
 | **gradient_checkpointing** | True | Recommended |
 
+### Memory Optimizations
+
+Two memory optimizations specific to the Blissful Tuner WAN 2.2 codepaths, layered from least to most aggressive:
+
+| Optimization | Flag (to disable / opt out) | Default | Numerical effect |
+|---|---|---|---|
+| **Compact time embedding** | `--no_compact_time_embedding` | enabled | None (exact-equal under broadcast, `atol=0`) |
+| **Wan2.1-style modulation** | `--force_v2_1_time_embedding` (alias of `--simple_modulation`) | disabled | Different modulation shape — comparable in practice but not bit-identical |
+
+#### Compact Time Embedding
+
+When the timestep is uniform across all tokens (`t.dim() == 1`, the T2V training case), `WanModel.get_time_embedding()` keeps the time embedding at `[B, 1, dim]` and the modulation projection at `[B, 1, 6, dim]` instead of expanding to `[B, seq_len, dim]` / `[B, seq_len, 6, dim]`. Broadcasting in `WanAttentionBlock.get_modulation()` and `Head.forward()` produces numerically identical outputs — the two paths differ only in allocated tensor size.
+
+For WAN 2.2 14B at fp32, the savings are multi-GiB per forward pass (scaling with `seq_len`, which scales with resolution × frames). Default enabled. The per-token timestep path used by I2V/TI2V via `expand_timesteps` produces `t.dim() == 2` and bypasses the compact branch entirely, so the gating is transparent across task families.
+
+`WanModel.compact_time_embedding` is exposed as an instance attribute initialized to `True` in `__init__`. Inference scripts run with compact mode unconditionally — no CLI opt-out is wired into `wan_generate_video.py` since the two modes are numerically equivalent and the smaller allocations are pure upside.
+
+Locked down by `tests/test_wan_compact_time_embedding.py`:
+- `[B, 1, dim]` / `[B, 1, 6, dim]` shape contract when `t.dim() == 1`
+- Compact vs full path equivalence under broadcast (`rtol=0, atol=0`)
+- I2V gate: `t.dim() == 2` bypasses compact even when the attribute is `True`
+
+#### RoPE Frequency Cache (FIFO eviction)
+
+`WanModel.freqs_fhw` caches the computed RoPE frequency tensor for each unique `(F, H', W')` grid-size tuple seen during patch embedding. Without a cap this dict grows unboundedly across long multi-bucket training runs (one entry per resolution × frame-count combination, plus any `f_indices` variation expanding the keyspace).
+
+The cache is capped at `WanModel._FREQS_CACHE_MAX_SIZE = 512` with oldest-first FIFO eviction. A one-shot `logger.warning` fires on first eviction (sets `self._freqs_eviction_warned = True`) — useful as a diagnostic for "is my bucket diversity unusually high or has `f_indices` exploded the keyspace?". Subsequent evictions stay silent to avoid log spam.
+
+Locked down by `tests/test_wan_compact_time_embedding.py::TestWanRoPEFreqsCacheEviction`: inserting `MAX_SIZE + 1` distinct grid-size keys (with `_FREQS_CACHE_MAX_SIZE` monkey-patched down to 3 for test speed) caps the dict, evicts the first-inserted key, and sets `_freqs_eviction_warned`.
+
 ---
 
 ## Version History
