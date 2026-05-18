@@ -620,6 +620,21 @@ class NetworkTrainer:
             "`set_enabled(False)` or `set_multiplier(0)`, but neither method exists on this network object."
         )
 
+    def restore_block_swap_after_no_grad_forward(self, accelerator: Accelerator, transformer: torch.nn.Module):
+        """Restore training block-swap layout after teacher/no-grad forwards.
+
+        Training block swap moves early blocks to CPU during forward and relies on
+        backward hooks to move them back before the next forward. Prior teacher
+        passes run under no_grad(), so those hooks never fire.
+        """
+        if getattr(self, "blocks_to_swap", 0) <= 0:
+            return
+
+        unwrapped_transformer = accelerator.unwrap_model(transformer)
+        prepare_block_swap = getattr(unwrapped_transformer, "prepare_block_swap_before_forward", None)
+        if prepare_block_swap is not None:
+            prepare_block_swap()
+
     def get_optimizer(
         self,
         args: argparse.Namespace,
@@ -1402,39 +1417,41 @@ class NetworkTrainer:
         rng_state = torch.get_rng_state()
         cuda_rng_state = None
         try:
-            cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-        except Exception:
-            pass
+            try:
+                cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            except Exception:
+                pass
 
-        if distributed_state.num_processes <= 1:
-            # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    self.sample_image_inference(
-                        accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                    )
-                    clean_memory_on_device(accelerator.device)
-        else:
-            # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
-            # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
-            per_process_params = []  # list of lists
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
-
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    for sample_parameter in sample_parameter_lists[0]:
+            if distributed_state.num_processes <= 1:
+                # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
+                with torch.no_grad(), accelerator.autocast():
+                    for sample_parameter in sample_parameters:
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                         )
                         clean_memory_on_device(accelerator.device)
+            else:
+                # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
+                # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
+                per_process_params = []  # list of lists
+                for i in range(distributed_state.num_processes):
+                    per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
 
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
-
-        transformer.switch_block_swap_for_training()
-        clean_memory_on_device(accelerator.device)
+                with torch.no_grad():
+                    with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                        for sample_parameter in sample_parameter_lists[0]:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                            clean_memory_on_device(accelerator.device)
+        finally:
+            try:
+                torch.set_rng_state(rng_state)
+                if cuda_rng_state is not None:
+                    torch.cuda.set_rng_state(cuda_rng_state)
+            finally:
+                transformer.switch_block_swap_for_training()
+                clean_memory_on_device(accelerator.device)
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
         """architecture independent sample images"""
@@ -2773,6 +2790,7 @@ class NetworkTrainer:
                                         timesteps,
                                         network_dtype,
                                     )
+                                self.restore_block_swap_after_no_grad_forward(accelerator, transformer)
                             prior_pred = prior_pred_raw.detach()
                         finally:
                             if prior_teacher_eval and transformer_was_training:

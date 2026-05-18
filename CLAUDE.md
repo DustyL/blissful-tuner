@@ -515,6 +515,70 @@ canonical direct-kwargs pattern with pre-allocation guard assertions.
 --prefer_lycoris              # Use LyCORIS backend for LoRA merging (inference)
 ```
 
+### Block Swap Invariants
+
+Training block swap migrates early transformer blocks to CPU during forward
+and **relies on backward hooks to return them to GPU before the next forward**.
+Any code path that runs a forward pass under `torch.no_grad()` skips the
+backward hooks entirely, leaving blocks stuck on CPU. The next training forward
+then hits `F.linear(input_cuda, weight_cpu, ...)` and raises:
+`RuntimeError: Expected all tensors to be on the same device, but got mat2 is
+on cpu, different from other tensors on cuda:0`.
+
+The crash surfaces in `lora.py:560` because the LoRA wrapper is the first
+caller of the original Linear's `forward`, but the LoRA wrapper is not the
+bug — it's just the topmost place a CPU `weight` gets touched.
+
+Two restore mechanisms exist; new no-grad forward paths must use one:
+
+- **`NetworkTrainer.restore_block_swap_after_no_grad_forward(accelerator, transformer)`**
+  (`hv_train_network.py:623`) — for the prior-teacher no-grad forward.
+  Called at `hv_train_network.py:2791` after the teacher `call_dit(...)`
+  but before the student `call_dit(...)`. Internally calls
+  `prepare_block_swap_before_forward()` on the unwrapped transformer when
+  `blocks_to_swap > 0`. No-op when block swap is disabled.
+
+- **`transformer.switch_block_swap_for_inference()` / `..._for_training()`**
+  pair (`hv_train_network.py:1410` / `:1451`) — for sample generation.
+  `sample_images()` wraps the no-grad sampling loop in a `try:` with a
+  nested `finally:` that runs both RNG restore and `..._for_training()`,
+  so block-swap layout is restored even if RNG restoration or sampling
+  itself raises.
+
+EMA teacher operations (`LoRAEmaTeacher.update()`, `LoRAEmaTeacher.apply_to()`
+in `modules/lora_ema_teacher.py`) iterate `network.named_parameters()` where
+`network` is the **LoRA adapter network**, not the base transformer. They
+never touch transformer parameters and therefore cannot disturb block-swap
+state. This is true by construction, not by luck.
+
+Guarded by:
+- `tests/test_block_swap_prior_restore.py` — 7 tests covering the helper's
+  safety guard, prior teacher no-grad restore, sample-mode switch round-trip,
+  EMA non-interference, exception-path cleanup in `sample_images()`, and
+  combined EMA + LoRA(DoRA) + block swap + restore + student backward.
+- `tests/manual/test_flux2_block_swap_smoke.py` — real-checkpoint smoke
+  (gated behind `--run-manual`) that loads FLUX.2 Klein-9B, enables block
+  swap, applies DoRA LoRA, optionally compiles each block, runs an EMA
+  prior teacher forward under `no_grad()`, verifies block 0 lands on CPU
+  (bug present), calls the restore, verifies block 0 returns to CUDA, then
+  runs a student forward+backward to confirm gradients flow.
+
+```bash
+# Replay the manual smoke against your local checkpoint:
+./venv314/bin/python -m pytest -q tests/manual/test_flux2_block_swap_smoke.py \
+  --run-manual \
+  --model-path /home/dustin/Training_Models_FLUX_2_and_Klein/FLUX2-Klein-Base-9B.safetensors \
+  --model-version klein-base-9b \
+  --blocks-to-swap 4 \
+  --compile-blocks
+```
+
+When adding a new `torch.no_grad()` forward through a block-swapped
+transformer (validation, custom teacher, evaluation pass, etc.), pair it
+with either the prior-teacher restore helper or the sample-mode switch
+pair. Failure to do so will reproduce the FLUX.2 Klein 9B + DoRA + compile
+crash discovered on 2026-05-16.
+
 ### Muon Optimizer
 
 `src/musubi_tuner/optimizers/muon.py` provides a Muon optimizer with Newton-Schulz orthogonalization. `muon_util.py` contains `MODEL_LAYER_PATTERNS` — a per-architecture registry mapping LoRA module names to Muon-eligible parameters. Falls back to internal implementation if `muon` package is not installed.
