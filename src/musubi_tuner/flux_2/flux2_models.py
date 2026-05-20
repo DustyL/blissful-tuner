@@ -839,22 +839,42 @@ class SingleStreamBlock(nn.Module):
     def _forward(self, x: Tensor, pe: Tensor, mod: tuple[Tensor, Tensor], attn_params: AttentionParams) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
         del mod
-        x_mod = (1 + mod_scale) * self.pre_norm(x) + mod_shift
+        # x_mod is a fresh LayerNorm(elementwise_affine=False) output. That LayerNorm's
+        # backward does not save the output tensor, so in-place arithmetic here is
+        # autograd-safe (and saves ~150 MB at Klein 9B production shapes).
+        x_mod = self.pre_norm(x)
+        x_mod.mul_(1 + mod_scale).add_(mod_shift)
         del mod_scale, mod_shift
 
-        qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim * self.mlp_mult_factor], dim=-1)
+        # CRITICAL: call self.linear1 as a whole — its forward is monkey-patched by LoRAModule.
+        # Slicing self.linear1.weight to do per-tensor F.linear calls bypasses the adapter
+        # (LoRA Invariant #1). Splitting the *output* tensor preserves the LoRA path.
+        qkv, mlp = torch.split(
+            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim * self.mlp_mult_factor], dim=-1
+        )
+        del x_mod
 
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         del qkv
-        q, k = self.norm(q, k, v)
 
-        qkv_list = [q, k, v]
+        # Per-tensor norm + cast + RoPE: keeps peak-live fp32 norm intermediates to one at a
+        # time, and lets `pe` be freed after k is processed (before attention + mlp_act allocate).
+        dtype = v.dtype
+        q = self.norm.norm_q(q, dtype)
+        q = apply_rope(q, pe).transpose(1, 2).contiguous()  # B,H,L,D -> B,L,H,D
+
+        k = self.norm.norm_k(k, dtype)
+        k = apply_rope(k, pe).transpose(1, 2).contiguous()
+        del pe
+
+        v = v.transpose(1, 2).contiguous()
+
+        attn = unified_attention([q, k, v], attn_params=attn_params)
         del q, k, v
-        attn = attention(qkv_list, pe, attn_params)
-        del qkv_list, pe
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        del attn, mlp
         return x + mod_gate * output
 
     def forward(self, x: Tensor, pe: Tensor, mod: tuple[Tensor, Tensor], attn_params: AttentionParams) -> Tensor:
@@ -920,60 +940,112 @@ class DoubleStreamBlock(nn.Module):
         del mod_img, mod_txt
 
         img_mod1_shift, img_mod1_scale, img_mod1_gate = img_mod1
+        del img_mod1
         img_mod2_shift, img_mod2_scale, img_mod2_gate = img_mod2
+        del img_mod2
         txt_mod1_shift, txt_mod1_scale, txt_mod1_gate = txt_mod1
+        del txt_mod1
         txt_mod2_shift, txt_mod2_scale, txt_mod2_gate = txt_mod2
-        del img_mod1, img_mod2, txt_mod1, txt_mod2
+        del txt_mod2
 
-        # prepare image for attention
+        # prepare image for attention — in-place safe on fresh LayerNorm output
         img_modulated = self.img_norm1(img)
-        img_modulated = (1 + img_mod1_scale) * img_modulated + img_mod1_shift
+        img_modulated.mul_(1 + img_mod1_scale).add_(img_mod1_shift)
         del img_mod1_scale, img_mod1_shift
 
+        # CRITICAL: call self.img_attn.qkv whole — slicing the weight bypasses the LoRA
+        # monkey-patched forward (LoRA Invariant #1). Splitting the output preserves LoRA.
         img_qkv = self.img_attn.qkv(img_modulated)
         del img_modulated
         img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         del img_qkv
-        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
-        # prepare txt for attention
+        # Per-tensor norm + cast: peak-live fp32 norm intermediate is one tensor at a time.
+        img_dtype = img_v.dtype
+        img_q = self.img_attn.norm.norm_q(img_q, img_dtype)
+        img_k = self.img_attn.norm.norm_k(img_k, img_dtype)
+
+        # prepare txt for attention — same pattern
         txt_modulated = self.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1_scale) * txt_modulated + txt_mod1_shift
+        txt_modulated.mul_(1 + txt_mod1_scale).add_(txt_mod1_shift)
         del txt_mod1_scale, txt_mod1_shift
+
+        # LoRA-safe whole-qkv call (see note above for img)
         txt_qkv = self.txt_attn.qkv(txt_modulated)
         del txt_modulated
         txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         del txt_qkv
-        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+        txt_dtype = txt_v.dtype
+        txt_q = self.txt_attn.norm.norm_q(txt_q, txt_dtype)
+        txt_k = self.txt_attn.norm.norm_k(txt_k, txt_dtype)
+
+        # Concat ctx+pe and apply RoPE inline per-tensor so freqs can be freed before v.
+        pe = torch.cat((pe_ctx, pe), dim=2)
+        del pe_ctx
 
         txt_len = txt_q.shape[2]
         q = torch.cat((txt_q, img_q), dim=2)
         del txt_q, img_q
+        q = apply_rope(q, pe).transpose(1, 2).contiguous()
+
         k = torch.cat((txt_k, img_k), dim=2)
         del txt_k, img_k
+        k = apply_rope(k, pe).transpose(1, 2).contiguous()
+        del pe  # freed before v transpose+contiguous and attention allocate
+
         v = torch.cat((txt_v, img_v), dim=2)
         del txt_v, img_v
+        v = v.transpose(1, 2).contiguous()
 
-        pe = torch.cat((pe_ctx, pe), dim=2)
-        del pe_ctx
-        qkv_list = [q, k, v]
+        attn = unified_attention([q, k, v], attn_params=attn_params)
         del q, k, v
-        attn = attention(qkv_list, pe, attn_params)
-        del qkv_list, pe
+
         txt_attn, img_attn = attn[:, :txt_len], attn[:, txt_len:]
         del attn
 
-        # calculate the img blocks
-        img = img + img_mod1_gate * self.img_attn.proj(img_attn)
-        del img_mod1_gate, img_attn
-        img = img + img_mod2_gate * self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
-        del img_mod2_gate, img_mod2_scale, img_mod2_shift
+        # img blocks — in-place mutation only on fresh `img_proj` / `img_temp` temporaries,
+        # NEVER on the `img` residual stream. The reassignment `img = img_proj` rebinds the
+        # name without mutating the prior tensor; autograd still sees the additive residual.
+        img_proj = self.img_attn.proj(img_attn)
+        del img_attn
+        img_proj.mul_(img_mod1_gate)
+        del img_mod1_gate
+        img_proj.add_(img)
+        img = img_proj
+        del img_proj
 
-        # calculate the txt blocks
-        txt = txt + txt_mod1_gate * self.txt_attn.proj(txt_attn)
-        del txt_mod1_gate, txt_attn
-        txt = txt + txt_mod2_gate * self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
-        del txt_mod2_gate, txt_mod2_scale, txt_mod2_shift
+        img_temp = self.img_norm2(img)
+        img_temp.mul_(1 + img_mod2_scale).add_(img_mod2_shift)
+        del img_mod2_scale, img_mod2_shift
+        img_mlp_out = self.img_mlp(img_temp)
+        del img_temp
+        img_mlp_out.mul_(img_mod2_gate)
+        del img_mod2_gate
+        img_mlp_out.add_(img)
+        img = img_mlp_out
+        del img_mlp_out
+
+        # txt blocks — same fresh-temporary pattern
+        txt_proj = self.txt_attn.proj(txt_attn)
+        del txt_attn
+        txt_proj.mul_(txt_mod1_gate)
+        del txt_mod1_gate
+        txt_proj.add_(txt)
+        txt = txt_proj
+        del txt_proj
+
+        txt_temp = self.txt_norm2(txt)
+        txt_temp.mul_(1 + txt_mod2_scale).add_(txt_mod2_shift)
+        del txt_mod2_scale, txt_mod2_shift
+        txt_mlp_out = self.txt_mlp(txt_temp)
+        del txt_temp
+        txt_mlp_out.mul_(txt_mod2_gate)
+        del txt_mod2_gate
+        txt_mlp_out.add_(txt)
+        txt = txt_mlp_out
+        del txt_mlp_out
+
         return img, txt
 
     def forward(
@@ -1085,39 +1157,20 @@ class QKNorm(torch.nn.Module):
         self.query_norm = RMSNorm(dim)
         self.key_norm = RMSNorm(dim)
 
+    def norm_q(self, q: Tensor, dtype: torch.dtype) -> Tensor:
+        """Per-tensor q-norm + cast. Lets callers interleave so the fp32 norm
+        intermediate is freed before the next tensor's norm allocates."""
+        return self.query_norm(q).to(dtype=dtype)
+
+    def norm_k(self, k: Tensor, dtype: torch.dtype) -> Tensor:
+        return self.key_norm(k).to(dtype=dtype)
+
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Back-compat path. New code should call norm_q / norm_k directly so
+        the q fp32 intermediate is released before key_norm runs."""
         q = self.query_norm(q)
         k = self.key_norm(k)
         return q.to(v), k.to(v)
-
-
-def attention(qkv_list: list[Tensor], pe: Tensor, attn_params: AttentionParams) -> Tensor:
-    """FLUX.2 attention wrapper that applies RoPE and delegates to unified attention.
-
-    Args:
-        qkv_list: List of [q, k, v] tensors, each (B, H, L, D)
-        pe: Positional encoding tensor for RoPE
-        attn_params: Attention configuration (mode, split_attn, masks)
-
-    Returns:
-        Attention output (B, L, H*D)
-    """
-    q, k, v = qkv_list
-    del qkv_list
-
-    # Apply rotary position embeddings
-    q, k = apply_rope(q, k, pe)
-
-    # Transpose from (B, H, L, D) to (B, L, H, D) for unified attention
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-
-    qkv_list = [q, k, v]
-    del q, k, v
-
-    x = unified_attention(qkv_list, attn_params=attn_params)
-    return x
 
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
@@ -1130,9 +1183,14 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     return out.float()
 
 
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+def apply_rope(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    """Per-tensor RoPE so callers can interleave q/k processing and free freqs_cis sooner.
+
+    The fp32 intermediate (`x_out`) is fresh, so the addcmul_ on it is autograd-safe —
+    no prior op stored it for backward. Mathematically identical to the prior fused
+    `freqs[0]*x[0] + freqs[1]*x[1]` form.
+    """
+    x_ = x.float().reshape(*x.shape[:-1], -1, 1, 2)
+    x_out = freqs_cis[..., 0] * x_[..., 0]
+    x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
+    return x_out.reshape(*x.shape).type_as(x)
