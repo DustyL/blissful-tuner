@@ -672,6 +672,13 @@ feature disabled, branch with optional feature enabled. Keep run length short bu
 past optimizer/compile warmup; the FLUX.2 Klein v8 gate used 300 steps and
 measured steps 201-300 / 251-300.
 
+For cheaper checks before committing to a full A/B, prefer a per-block CUDA
+peak-memory measurement via `tests/manual/measure_flux2_block_peak_memory.py`.
+Synthetic random-init blocks at Klein-9B shape capture the same activation
+profile as a real checkpoint. Decision rule: ≥200 MB drop per-block →
+escalate to focused A/B; <200 MB → close the door without spending a day on
+training-time measurement.
+
 **Recorded results:**
 
 - **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
@@ -680,6 +687,29 @@ measured steps 201-300 / 251-300.
   were neutral. Revisit only if the production path changes materially — e.g.
   `compile=false`, a different Torch / Inductor stack, or a different
   model/kernel mix. Receipts in PR #4 (merged) + the local ab_gate artifacts.
+
+- **xzuyn-optimizations round 2** (2026-05-20): rejected. Per-tensor
+  norm/RoPE + early `del pe` + fresh-temporary in-place modulation produced
+  0 MB per-block peak savings vs. main at Klein-9B production shape (batch=3,
+  img_seq=4096, txt_seq=512, with-DoRA, gradient_checkpointing). PyTorch's
+  CUDA caching allocator already reuses freed slots from short-lived
+  intermediates, so the targeted slack didn't exist. Branch
+  `perf/flux2-xzuyn-round2` kept as historical artifact; the xformers gate
+  fix + measurement harness salvaged to main (commit `ea3e1e9`). xzuyn's
+  rank_dropout bug fix independently converged on our prior fix (`5f78160`);
+  this convergence is the most useful signal from the fork now.
+
+- **LoRA bypass class (caught twice by guard tests)**: xzuyn's perf patches
+  repeatedly use `F.linear(x, self.<qkv>.weight[slice])` to interleave q/k/v
+  Linear calls. blissful-tuner's `LoRAModule.apply_to()` monkey-patches
+  `org_module.forward`, so calling the module fires the adapter but reading
+  the raw `.weight` silently bypasses it. Both `tests/test_lora_target_coverage.py`
+  and `tests/test_flux2_lora_target_coverage.py` exist specifically to catch
+  this — and have caught it on both review cycles. When porting upstream
+  perf patches that touch qkv / linear1 / proj modules, this is the first
+  invariant to check. Workaround: keep the whole-module call, split the
+  *output* tensor afterward (the per-tensor downstream norm/RoPE wins still
+  apply).
 
 ## Blissful Logger
 
