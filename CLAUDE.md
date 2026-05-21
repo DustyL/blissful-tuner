@@ -697,16 +697,38 @@ training-time measurement.
   `perf/flux2-xzuyn-round2` kept as historical artifact; the xformers gate
   fix + measurement harness salvaged to main (commit `ea3e1e9`). xzuyn's
   rank_dropout bug fix independently converged on our prior fix (`5f78160`);
-  this convergence is the most useful signal from the fork now.
+  one data point — not yet a reliable confirmatory pattern.
 
-- **LoRA bypass class (caught twice by guard tests)**: xzuyn's perf patches
-  repeatedly use `F.linear(x, self.<qkv>.weight[slice])` to interleave q/k/v
-  Linear calls. blissful-tuner's `LoRAModule.apply_to()` monkey-patches
-  `org_module.forward`, so calling the module fires the adapter but reading
-  the raw `.weight` silently bypasses it. Both `tests/test_lora_target_coverage.py`
-  and `tests/test_flux2_lora_target_coverage.py` exist specifically to catch
-  this — and have caught it on both review cycles. When porting upstream
-  perf patches that touch qkv / linear1 / proj modules, this is the first
+- **xzuyn-optimizations round 3 — custom Triton kernels** (2026-05-21):
+  rejected on numerics alone, no measurement run. Adds `RopeTriton`,
+  `ApplyRopeTriton`, `AdaLNTriton` in `src/musubi_tuner/modules/triton_kernels.py`
+  (file header reads `# AI slop kernels`). Standalone disqualifier:
+  `AdaLNTriton` self-reported bf16 backward max diff is **0.5** absolute
+  (the file's own header table). AdaLN runs at 7 call sites per Klein-9B
+  block × 32 blocks compounded under bf16 mixed precision — that magnitude
+  of bwd error in the core normalization gradient is not a candidate for
+  a model that just took weeks to tune. Corroborating signals: kernels are
+  wired default-on with no opt-in flag; `compile=true` would hit
+  `@triton.jit` boundaries 32× per forward (same Inductor-fusion-barrier
+  trap as last cycle's Liger 19% regression); xzuyn's own added/removed
+  oscillation on `FusedGateResidualTriton` ended with the commit message
+  "peak memory ended up being worse"; the five non-Triton micro-tweaks
+  (`a8a17f2..9f00186`) either are cosmetic (`return self.conv(...)`),
+  duplicate the round-2 patterns we already measured as null, or require
+  pe broadcast convention changes coupled with the unchanged LoRA-bypass
+  pattern. No rank_dropout-style convergence signal this round — the
+  one-prior-fix-converged data point should not be promoted further.
+
+- **LoRA bypass class (recurring across all three review cycles)**: xzuyn's
+  perf patches repeatedly use `F.linear(x, self.<qkv>.weight[slice])` to
+  interleave q/k/v Linear calls. blissful-tuner's `LoRAModule.apply_to()`
+  monkey-patches `org_module.forward`, so calling the module fires the
+  adapter but reading the raw `.weight` silently bypasses it. Both
+  `tests/test_lora_target_coverage.py` and `tests/test_flux2_lora_target_coverage.py`
+  exist specifically to catch this — and the pattern has appeared in every
+  review cycle (rounds 1, 2, and 3 commits `1d50b0b`, `9f00186` still ship
+  it). When porting upstream perf patches that touch qkv / linear1 / proj
+  modules, this is the first
   invariant to check. Workaround: keep the whole-module call, split the
   *output* tensor afterward (the per-tensor downstream norm/RoPE wins still
   apply).
