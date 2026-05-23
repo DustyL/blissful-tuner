@@ -2,15 +2,17 @@
 
 **Date:** 2026-05-23
 **Status:** ✅ decision made — **MERGE + post-merge cleanup** (hybrid). Do **not** green-field rebuild.
+**Revised 2026-05-23 (post-review):** estimate raised **14–19 h → 18–25 h** and several seam/dataset details sharpened after a read-only verification review ("Ampere"). The strategic call is unchanged (merge, don't rebuild); the corrections are confidence + scope, not direction. Every claim below was re-verified against `upstream/main` (`78acafb`) and blissful HEAD before landing here.
 **Trigger:** kohya-ss/musubi-tuner's large refactor merged to `upstream/main` (PR #950, `78acafb`; version bumped to **0.3.0**, `55691e8`). The two pre-existing migration plans — `2026-05-06-upstream-refactor-migration-plan.md` (PEFT slice) and `2026-05-21-masked-loss-refactor-integration-plan.md` (masked loss) — had their "wait for dev→main" pre-requisite satisfied. This doc supersedes their *timing* gate and sets the overall strategy they execute under.
 
 ---
 
 ## TL;DR
 
-- **The true "damage" is bounded.** A virtual `git merge upstream/main` produces **40 conflicts**, but the count is a vanity metric. **32 of 40 are "keep ours"** (21 files where blissful already shipped the feature *ahead* of upstream — including all 12 add/add files — plus 11 trivial docs/config). The genuinely hard work lives in **two places**: the `hv_train_network.py` structural split (already has its own plan) and the `dataset/` refactor.
+- **The true "damage" is bounded.** A virtual `git merge upstream/main` produces **40 conflicts**, but the count is a vanity metric. **32 of 40 are "keep ours"** (22 files where blissful already shipped the feature *ahead* of upstream — including all 12 add/add files — plus 10 trivial docs/config). The genuinely hard work lives in **three places**: the `hv_train_network.py` structural split (its own plan), the `dataset/` refactor (a **five-file** re-home, not two), and the trainer-seam feature port (which is *not* a magic vacuum hose — see below).
 - **Recommendation: merge, don't rebuild.** Starting fresh on refactored musubi-tuner would *discard* blissful's lead on 5 architectures, re-derive ~300 guarding tests, and re-debug features that already cost real effort to land. The debt you actually want gone (vendored post-processing) is severable in a **single post-merge `git rm` commit** — you do not need a green-field rebuild to get a clean tree.
 - **This is a feature-port, not a model-port.** Upstream v0.3.0 ships all 9 architectures natively. You inherit the scaffolding for free and only re-hang your training deltas onto the new seams.
+- **Budget ~18–25 h (still 2–3 focused days).** Don't bank on a 14 h fast path unless you're willing to defer full-finetune (Qwen/Z-Image) parity and the dead-weight cleanup. The dataset split and the trainer-seam gaps are bigger than a first read suggests.
 
 ---
 
@@ -51,15 +53,26 @@ Full per-file ledger in `2026-05-23-refactor-migration-A-conflict-ledger.md`. Su
 | **STRUCTURAL** | 1 | (own plan) | `hv_train_network.py` — see 2026-05-21 masked-loss plan |
 | **GENUINE-MERGE** | 4 | ~3.6 h | dataset split + 2 Qwen-Layered files (real hand-merge) |
 | **UPSTREAM-IMPROVEMENT** | 3 | ~1.1 h | keep ours + adopt a named upstream change |
-| **BLISSFUL-AHEAD** | 21 | ~3.4 h | keep ours; optional small cherry-picks |
-| **TRIVIAL** | 11 | ~0.6 h | docs/config; keep ours (already supersets) |
+| **BLISSFUL-AHEAD** | 22 | ~3.4 h | keep ours; optional small cherry-picks |
+| **TRIVIAL** | 10 | ~0.6 h | docs/config; keep ours (already supersets) |
 
 ### The only genuinely hard non-structural work
-1. **`dataset/image_video_dataset.py` (~90 min)** — upstream *moved* save/bucket/media functions out into new `dataset/architectures.py` + `dataset/media_utils.py`; blissful extended the monolith in place (mask_directory/alpha_mask, FLUX.2, Kandinsky). Must re-home blissful's additions onto the split layout (or consciously keep the monolith and forgo the split).
-2. **`dataset/config_utils.py` (~45 min)** — upstream renamed `flux_kontext_/qwen_image_edit_*_no_resize_control` → unified `no_resize_control` / `control_resolution` and added `multiple_target`. Adopt the rename, re-apply blissful's mask/alpha schema, fix call sites (ripples into cache/generate scripts). **This is the one real "merge intelligence" decision.**
-3. **`qwen_image_model.py` + `qwen_image_generate_image.py` (~80 min)** — both sides independently implemented Qwen-Image-Layered over the same regions; needs line-level reconciliation, not blind keep-ours.
+1. **`dataset/image_video_dataset.py` (~2–2.5 h)** — upstream split the monolith into **five** new files: `dataset/{architectures,bucket,cache_io,datasources,media_utils}.py`. Blissful extended the monolith in place. Adopting the split is the right move (cheaper future merges), but it is a **five-file re-home, not a two-file move** — the easy mistake is preserving cache helpers while silently dropping datasource behavior. The blissful local features that MUST survive the re-home are broader than "masks + FLUX.2 + Kandinsky": also `caption_directory`, multi-dot caption filtering, duplicate-basename protection (cache-key safety), mask lookup/fallback, cache mask-transform metadata, Qwen layered/`multiple_target` datasource behavior, and the Z-Image/FLUX.2 cache-mask conventions. **This is the highest-risk non-structural area.**
+2. **`dataset/config_utils.py` (~45 min)** — upstream renamed `flux_kontext_/qwen_image_edit_*_no_resize_control` → unified `no_resize_control` / `control_resolution` and added `multiple_target`. **Less dangerous than it looks: both blissful HEAD and upstream already carry a deprecated-key→new-key shim** (`config_utils.py` maps the old names), so old TOMLs keep working. Adopt the rename, re-apply blissful's mask/alpha schema. When grepping for stragglers use the **broad** pattern — the narrow `_no_resize_control` misses `qwen_image_edit_control_resolution`:
+   ```bash
+   git grep -nE 'flux_kontext_no_resize_control|qwen_image_edit_no_resize_control|qwen_image_edit_control_resolution'
+   ```
+3. **`qwen_image_model.py` + `qwen_image_generate_image.py` (~80 min)** — both sides independently implemented Qwen-Image-Layered over the same regions; needs line-level reconciliation, not blind keep-ours. **Guardrails:** in `qwen_image_model.py`, explicitly protect blissful's padded-text / `txt_seq_lens` / varlen `cu_seqlens` attention region — upstream lacks it and it's easy to simplify toward upstream during a Layered conflict. In `qwen_image_generate_image.py`, the layered one-control guard the ledger flagged is **already present in HEAD** — likely no pending cherry-pick; keep-ours stands (blissful carries true CFG, negative-prompt defaults, CFG-normalize controls).
 
 Everything else is "keep ours, skim upstream for a cheap cherry-pick" (e.g. upstream's `q,k,v=None` frees in `attention.py`; upstream's `rel_error` log line in the Z-Image LoRA converter).
+
+### Trainer seam — what does NOT come for free (verified)
+Upstream's `NetworkTrainer.process_batch()` (`trainer_base.py:1108`) / `compute_loss()` (`:1144`) / `on_post_optimizer_step` are the right place to re-hang LoRA masked-loss / prior / EMA — but the seam is **not** a magic vacuum hose. Four boundaries it does **not** cover, each verified on `upstream/main`:
+
+1. **Full-finetune trainers run their own loop.** `QwenImageTrainer.train()` (`qwen_image_train.py:143`) and `ZImageTrainer.train()` (`zimage_train.py:79`) define independent `train()` methods that do **not** call `trainer_base.process_batch()`. Masked loss does **not** inherit automatically here — either port the masked path into those loops or **consciously defer full-FT mask parity** (and say so).
+2. **`DiTOutput` shape adaptation is mandatory.** Blissful's `call_dit()` returns a bare tuple `model_pred, target` (`hv_train_network.py:1966`, unpacked at `:2800`); upstream's seam produces `DiTOutput(pred=…, target=…)` (`trainer_base.py:86`). The masked path must adapt explicitly — a tuple-unpack against a dataclass is a silent breakage.
+3. **The block-swap restore helper is blissful-only.** `restore_block_swap_after_no_grad_forward(...)` does **not** exist in upstream `trainer_base.py`. It must be ported *before* any masked prior-teacher no-grad forward is safe (else the block-swap × no_grad crash documented in CLAUDE.md returns).
+4. **Args / validation / warnings are setup-time, not per-step.** `--use_mask_loss` & friends, mask-source validation, loss-type args, and the "mask sources configured but `--use_mask_loss` off" warning are **not** reachable from `process_batch()`. They need inline ports into `parser_common.py` / `_validate_args_and_init()` / `_build_dataset()` or small new hooks.
 
 ---
 
@@ -73,6 +86,7 @@ Full import audit in `2026-05-23-refactor-migration-C-deadweight-audit.md`. Land
 
 ### Tier B — inference-only, optional (~10,349 LOC)
 - The 6 standalone `*_generate_image.py` / generate scripts that training does **not** borrow from (see gotcha #2), plus `src/musubi_tuner/gui/` (2,413 LOC).
+- ⚠️ **Tier B is training-import-safe but NOT test-suite-safe.** Deleting standalone generate scripts will break any test that imports them; those tests must be removed or rewritten **in the same commit**. This is why Tier B comes *after* the merge is green, never bundled with it.
 
 ### ⚠️ Gotchas that break a naive `git rm`
 1. **`guidance.py`, `advanced_rope.py`, `hvw_posemb_layers.py` are CORE WAN model code** — imported by `src/musubi_tuner/wan/modules/model.py:23-24`. They *look* like inference features. **KEEP.**
@@ -95,52 +109,108 @@ Full import audit in `2026-05-23-refactor-migration-C-deadweight-audit.md`. Land
 1. Branch off blissful main:  git checkout -b chore/merge-upstream-v0.3.0
 2. git merge upstream/main    (expect the 40 conflicts above)
 3a. RESOLVE dataset/config_utils.py FIRST (it ripples). Adopt upstream's unified
-     no_resize_control / control_resolution rename, re-apply blissful's mask/alpha
-     schema, then:  git grep -n '_no_resize_control'  and fix EVERY old arg-name
-     call site in cache + generate scripts before touching anything else.
-     (Do this before any keep-ours pass on qwen_image_cache_latents.py, or you'll
-     re-touch that file twice.)
-3b. Resolve the rest by the ledger:
-     - keep-ours wholesale for the 32 BLISSFUL-AHEAD + TRIVIAL files
-     - hand-merge the remaining 3 GENUINE files (dataset/image_video_dataset.py
-       + the 2 Qwen-Layered files)
+     no_resize_control / control_resolution rename (KEEP the deprecated-key shim
+     both sides already have), re-apply blissful's mask/alpha schema, then grep
+     with the BROAD pattern (the narrow one misses control_resolution):
+       git grep -nE 'flux_kontext_no_resize_control|qwen_image_edit_no_resize_control|qwen_image_edit_control_resolution'
+     and fix any straggler call sites before touching anything else.
+3b. RESOLVE the dataset split as a dedicated FIVE-FILE mini-port:
+     architectures.py / bucket.py / cache_io.py / datasources.py / media_utils.py
+     + image_video_dataset.py. Re-home blissful's additions (masks, alpha,
+     caption_directory, multi-dot caption filtering, duplicate-basename guard,
+     mask fallback, cache mask metadata, Qwen layered/multiple_target, Z-Image/
+     FLUX.2 cache-mask conventions) onto the split. Do NOT just diff two files.
+3c. Resolve the rest by the ledger:
+     - keep-ours wholesale for the 32 BLISSFUL-AHEAD + TRIVIAL files, BUT protect
+       the LoRA/DoRA/Conv2d invariants and the Qwen padded-text/varlen attention
+       region from accidental simplification toward upstream
+     - hand-merge the 2 Qwen-Layered files
      - LEAVE hv_train_network.py for step 5
-4. Adopt the 3 named upstream improvements (attention q,k,v=None; z-image
+4. Adopt the named upstream improvements (attention q,k,v=None; z-image
    converter rel_error log; any pyproject dep pins).
-5. Execute the structural plans against training/trainer_base.py seams:
-     - 2026-05-21 masked-loss-refactor-integration-plan.md  (masked loss, EMA,
-       prior, block-swap restore re-hung on process_batch/compute_loss seams)
-     - 2026-05-06 PEFT plan  (validate_pissa_training_args + ss_base_sha256
-       call-site re-targeting; folds into the same trainer_base edits)
-6. Re-run the full guarding test suite (~300 tests). This is the acceptance gate.
+5. Port the TRAINER SURFACES (not just process_batch — see "Trainer seam" above):
+     - masked_process_batch(...) on the LoRA path (process_batch override)
+     - DiTOutput adaptation (tuple → .pred/.target)
+     - port the block-swap restore helper into the new base
+     - EMA update on the on_post_optimizer_step hook
+     - parser args + mask validation + disabled-mask warning into
+       parser_common.py / _validate_args_and_init() / _build_dataset()
+     - full-FT Qwen/Z-Image: port into their own train() loops OR explicitly defer
+     - then 2026-05-06 PEFT plan: validate_pissa_training_args near upstream's
+       SageAttention validation (pre-load); ss_base_sha256 via extra_metadata()
+       for the LoRA path + explicit call sites for the full-FT trainers
+6. Run the TARGETED gates below (dataset/Qwen, then LoRA/trainer) BEFORE the full
+   suite — they localize fallout. Then run the full suite against the step-0 baseline.
 7. Separate commit: Tier-A dead-weight git rm (+ lockstep test/pyproject/ruff edits).
-8. Re-run tests again. Done.
+8. Re-run tests again. Done. (Tier B/C only after a deliberate test+helper-relocation pass.)
 ```
 
 ---
 
-## Effort estimate (honest range)
+## Targeted gates (the first acceptance ladder)
 
-The bottom-up file-by-file estimate (Agent A) and a top-down estimate diverge on one thing: **how carefully you audit the 32 keep-ours files**. A fast `git checkout --ours` + later-skim pass collapses them to ~2 h; a careful "verify each, cherry-pick upstream wins" pass is ~8.7 h. The irreducible work is the same either way.
+Run these *before* the full suite — they localize fallout to the subsystem you just touched. Capture the **step-0 green baseline** first so a regression is distinguishable from a pre-existing failure.
 
-| Phase | Fast path | Careful path |
-|---|---:|---:|
-| Conflict resolution (non-structural) | ~5.5 h | ~8.7 h |
-| Structural: masked-loss onto seams (2026-05-21 plan) | 6.5 h | 6.5 h |
-| PEFT call-site re-targeting (2026-05-06 plan, folds in) | ~0.5 h | 0.75 h |
-| Tier-A dead-weight cleanup | ~0.5 h | ~1 h |
-| Full test re-run + fix fallout | ~1.5 h | ~2 h |
-| **Total** | **~14 h** | **~19 h** |
+**After the dataset split + Qwen resolution (step 3):**
+```bash
+./venv314/bin/python -m pytest -q \
+  tests/test_dataset_caption_directory.py \
+  tests/test_cache_mask_wiring.py \
+  tests/test_cache_mask_preprocessing.py \
+  tests/test_mask_cache_metadata.py \
+  tests/test_mask_weights_cache_dtype.py \
+  tests/test_wan_dataset_loading.py \
+  tests/test_qwen_cache_variant_metadata.py \
+  tests/test_qwen_image_utils.py \
+  tests/test_qwen_image_cfg_normalize_toggle.py \
+  tests/test_qwen_image_dual_cfg.py \
+  tests/test_qwen_image_generate_image_cache_key.py \
+  tests/test_qwen_image_training.py
+```
 
-Anchor: **2–3 focused days**, single contiguous session preferred so the merge state doesn't go stale. The dataset/config_utils rename is the highest-judgment item; everything else is mechanical or already planned.
+**After the trainer-surface port (step 5):**
+```bash
+./venv314/bin/python -m pytest -q \
+  tests/test_mask_loss.py \
+  tests/test_prior_scheduling.py \
+  tests/test_lora_ema_teacher.py \
+  tests/test_block_swap_prior_restore.py \
+  tests/test_lora_dora_delta_path.py \
+  tests/test_lora_conv2d_forward.py \
+  tests/test_lora_target_coverage.py \
+  tests/test_flux2_lora_target_coverage.py \
+  tests/test_flux2_block_backward_anomaly.py \
+  tests/test_flux2_compile_smoke.py \
+  tests/test_flux2_integration_smoke.py
+```
+
+Add **one new tiny test** asserting the masked path handles a `DiTOutput`-shaped return (guards gap #2 above), and **one** for the Qwen padded-text / varlen attention region if that region is touched during the Layered reconciliation.
+
+---
+
+## Effort estimate (honest range — revised post-review)
+
+Bottom-up, after the seam/dataset corrections. The earlier 14–19 h was too optimistic about the trainer refactor and under-specified the dataset split; the dataset re-home is now the largest non-structural slice.
+
+| Phase | Estimate |
+|---|---:|
+| Conflict resolution, non-structural (incl. dataset split as the largest slice) | 6–9.5 h |
+| Trainer / seam feature port (masked path, DiTOutput, block-swap restore, EMA hook, parser/validation, full-FT) | 8.5–11 h |
+| PEFT / base-hash / PiSSA retargeting | 1–1.5 h |
+| Tier-A dead-weight cleanup | 0.5–1 h |
+| Targeted + full validation / fallout | 2–3 h |
+| **Total** | **~18–25 h** |
+
+Anchor: still **2–3 focused days**, single contiguous session preferred so the merge state doesn't go stale — but **do not bank on the 14 h fast path** unless you're willing to defer full-FT (Qwen/Z-Image) mask parity and the cleanup. The dataset five-file re-home and the four trainer-seam gaps are the judgment-heavy slices; everything else is mechanical or already planned.
 
 ---
 
 ## Risks / open items
-- **Dataset split adoption is a fork-direction choice**, not just a merge: do you re-home onto upstream's `architectures.py`/`media_utils.py` split (more upstream-trackable future) or keep blissful's monolithic `image_video_dataset.py` (less merge work now, more drift later)? Recommend adopting the split — future upstream merges get cheaper, and it's a one-time ~90 min cost.
+- **Dataset split adoption is a fork-direction choice**, not just a merge: do you re-home onto upstream's **five-file** split (`architectures.py` / `bucket.py` / `cache_io.py` / `datasources.py` / `media_utils.py`) — more upstream-trackable future — or keep blissful's monolithic `image_video_dataset.py` (less merge work now, more drift later)? Recommend adopting the split — future upstream merges get cheaper. But it's a **~2–2.5 h five-file re-home**, not the ~90 min two-file move first estimated; the live hazard is preserving cache helpers while silently dropping datasource behavior.
 - **Accepted divergent API on the LoHa/LoKr registry.** Keeping blissful's `loha.py`/`lokr.py`/`network_arch.py` (the `get_arch_config` / `ARCH_CONFIGS` API, Conv2d-capable, 13 archs) over upstream's `detect_arch_config(unet)` (Linear-only) is correct — blissful is the superset. But it means **future upstream changes in this area will not auto-merge**; they'll need manual translation between the two registry APIs. This is a cost you're choosing to pay for the richer implementation; name it so future-you isn't surprised when a network_arch merge conflicts.
-- **`config_utils.py` rename ripples** into cache + generate scripts; grep for the old `*_no_resize_control` arg names after resolving and fix all call sites before testing.
-- **Tier-C cleanup (the ~5 borrowed helpers)** is tempting but is a refactor, not a deletion — keep it out of the merge PR.
+- **`config_utils.py` rename is shimmed on both sides** (deprecated old keys still map to the new ones), so it's less dangerous than "rename ripples everywhere" implies. Still grep with the **broad** pattern (`flux_kontext_no_resize_control|qwen_image_edit_no_resize_control|qwen_image_edit_control_resolution`) before testing — the narrow `_no_resize_control` misses `qwen_image_edit_control_resolution`.
+- **Full-finetune mask parity is an explicit decision, not a freebie.** `QwenImageTrainer`/`ZImageTrainer` have their own `train()` loops that bypass `process_batch`. Either port the masked path into them or defer full-FT mask support — but decide deliberately and document which.
+- **Tier-C cleanup (the ~5 borrowed helpers)** is tempting but is a refactor, not a deletion — keep it out of the merge PR. **Tier B (generate scripts) is training-import-safe but not test-safe** — its tests must be removed/rewritten in the same commit.
 - Re-run the LoRA-invariant bundle and the block-swap × no_grad test specifically after step 5 — those are the invariants most exposed by re-hanging logic onto new seams.
 
 ## Cross-references

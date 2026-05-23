@@ -191,6 +191,10 @@ then deleting those scripts + the inference cluster:**
   (won't break install), but the exclude entries become dangling.
 - **Deleting `common_extensions.py` (Tier C)** → also delete `tests/test_prepare_metadata.py`
   (imports `prepare_metadata` from it).
+- **Tier B is training-import-safe but NOT test-suite-safe.** Before deleting any of the 6 standalone
+  generate scripts, sweep `tests/` for imports of them (`git grep -l '_generate_image\|_generate_video' tests/`)
+  and remove or rewrite those tests in the SAME commit — otherwise collection fails even though no training
+  path was touched. Same applies to the `gui/` dir if any GUI test imports it.
 - **No test lockstep for the post-proc top-levels or taehv/taesd/latent_preview** — a test sweep found no
   tests importing facefix/upscaler/GIMMVFI/yolo_blur/video_to_png/metaview/taehv/taesd/latent_preview.
 - **False-positive test matches (no action needed):** `tests/test_prior_scheduling.py` imports
