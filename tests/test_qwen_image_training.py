@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from musubi_tuner.hv_train_network import NetworkTrainer
+from musubi_tuner.hv_train_network import DiTOutput
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer, _round_up_to_multiple
 
@@ -50,7 +51,7 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
-        model_pred, target = trainer.call_dit(
+        output = trainer.call_dit(
             args=args,
             accelerator=accelerator,
             transformer=model,
@@ -61,6 +62,8 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
             timesteps=timesteps,
             network_dtype=torch.float32,
         )
+        assert isinstance(output, DiTOutput)
+        model_pred, target = output.pred, output.target
 
         self.assertEqual(model_pred.shape, latents.shape)
         self.assertEqual(target.shape, latents.shape)
@@ -80,7 +83,7 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
-        model_pred, target = trainer.call_dit(
+        output = trainer.call_dit(
             args=args,
             accelerator=accelerator,
             transformer=model,
@@ -91,6 +94,8 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
             timesteps=timesteps,
             network_dtype=torch.float32,
         )
+        assert isinstance(output, DiTOutput)
+        model_pred, target = output.pred, output.target
 
         self.assertEqual(model_pred.shape, latents.shape)
         self.assertEqual(target.shape, latents.shape)
@@ -114,7 +119,7 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
-        model_pred, target = trainer.call_dit(
+        output = trainer.call_dit(
             args=args,
             accelerator=accelerator,
             transformer=model,
@@ -125,6 +130,8 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
             timesteps=timesteps,
             network_dtype=torch.float32,
         )
+        assert isinstance(output, DiTOutput)
+        model_pred, target = output.pred, output.target
 
         # Layered call_dit permutes from (B, C, L, H, W) -> (B, L, C, H, W)
         self.assertEqual(model_pred.shape, (bsz, num_images, channels, height, width))
@@ -148,7 +155,7 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
         accelerator = _FakeAccelerator()
         model = _CapturingDummyQwenImageModel()
 
-        model_pred, target = trainer.call_dit(
+        output = trainer.call_dit(
             args=args,
             accelerator=accelerator,
             transformer=model,
@@ -159,6 +166,8 @@ class TestQwenImageTrainingCallDit(unittest.TestCase):
             timesteps=timesteps,
             network_dtype=torch.float32,
         )
+        assert isinstance(output, DiTOutput)
+        model_pred, target = output.pred, output.target
 
         # Base image is dropped from the target for loss and prediction: 2 remaining "layers".
         self.assertEqual(model_pred.shape, (bsz, num_images - 1, channels, height, width))

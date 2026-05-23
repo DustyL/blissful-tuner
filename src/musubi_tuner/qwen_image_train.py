@@ -672,13 +672,11 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                         args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
                     )
 
-                    weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
-                    )
-
-                    model_pred, target = self.call_dit(
+                    output = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, dit_dtype
                     )
+                    model_pred = output.pred
+                    target = output.target
                     loss_type = getattr(args, "loss_type", "mse")
                     loss_delta = getattr(args, "loss_delta", 1.0)
                     loss_unreduced = compute_unreduced_target_loss(
@@ -696,6 +694,10 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                     huber_threshold = 0.5 * float(loss_delta) * float(loss_delta)
                     target_huber_is_linear = (loss_unreduced > huber_threshold) if log_huber_stats else None
 
+                    # SD3 loss weighting at the actual loss rank (W14): n_dim=loss_unreduced.ndim.
+                    weighting = compute_loss_weighting_for_sd3(
+                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype, n_dim=loss_unreduced.ndim
+                    )
                     loss = loss_unreduced
                     if weighting is not None:
                         loss = loss * weighting

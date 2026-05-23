@@ -11,6 +11,7 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
 from musubi_tuner.hv_train_network import (
+    DiTOutput,
     NetworkTrainer,
     load_prompts,
     clean_memory_on_device,
@@ -32,6 +33,7 @@ from musubi_tuner.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 # blissful start
 from blissful_tuner.utils import error_out
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 from blissful_tuner.blissful_logger import BlissfulLogger
 
 logger = BlissfulLogger(__name__, "green")
@@ -41,6 +43,58 @@ logger = BlissfulLogger(__name__, "green")
 class WanNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path."""
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     # region model specific
 
@@ -783,13 +837,16 @@ class WanNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         if self.high_low_training:
             # high-low training case
             self.swap_high_low_weights(args, accelerator, transformer)
 
         # Call the DiT model
-        return self._call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
+        return self._call_dit(
+            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+        )
 
     def _call_dit(
         self,
@@ -802,7 +859,8 @@ class WanNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: WanModel = transformer
 
         # I2V training and Control training
@@ -857,7 +915,7 @@ class WanNetworkTrainer(NetworkTrainer):
         # flow matching loss
         target = noise - latents
 
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

@@ -289,8 +289,11 @@ accelerate launch --num_cpu_threads_per_process 1 src/musubi_tuner/zimage_train.
 - `--mem_eff_save`: Reduces main memory (RAM) usage when saving checkpoints.
 - `--blocks_to_swap`: Swaps model blocks between VRAM and main memory to reduce VRAM usage. This is effective when VRAM is limited.
 - `--disable_numpy_memmap`: Disables numpy memory mapping for model loading, loading with standard file read. Increases RAM usage but may speed up model loading in some cases.
+- `--block_swap_optimizer_patch_params` option is available to patch optimizer parameters for block swapping.
 
 `--full_bf16` reduces VRAM usage by about 30GB but may impact model accuracy as the weights are kept in bfloat16. Note that the optimizer state is still kept in float32. In addition, it is recommended to use this with an optimizer that supports stochastic rounding. In this repository, Adafactor optimizer with `--fused_backward_pass` option supports stochastic rounding.
+
+`--block_swap_optimizer_patch_params` option moves the gradients to the same device as the parameters during the optimizer step, which makes it work with block swapping. This workaround currently works with AdamW and Adafactor etc. AdamW8bit and other optimizers do not work with this patch due to their specific implementation.
 
 When using `--mem_eff_save`, please note that traditional saving methods are still used when saving the optimizer state in `--save_state`, requiring about 20GB of main memory.
 
@@ -300,11 +303,18 @@ We are still exploring the optimal settings. The configurations above are just e
 
 If you have ample VRAM, you can use any optimizer of your choice. `--full_bf16` is not recommended.
 
-For limited VRAM environments (e.g., 48GB or less), you may need to use `--full_bf16`, the Adafactor optimizer, and `--fused_backward_pass`. Settings above are the recommended options for that case. Please adjust `--lr_warmup_steps` to a value between approximately 10 and 100.
+For limited VRAM environments (e.g., 48GB or less), you can use one of the following options:
 
-`--fused_backward_pass` is not currently compatible with gradient accumulation, and max grad norm may not function as expected, so it is recommended to specify `--max_grad_norm 0`.
+1. Use `--blocks_to_swap` + `--block_swap_optimizer_patch_params` + compatible optimizer.
+2. Use `--blocks_to_swap` + Adafactor + `--fused_backward_pass`.
+3. Use `--full_bf16` + Adafactor optimizer + `--fused_backward_pass`.
+4. Use `--blocks_to_swap` + `--full_bf16` + Adafactor optimizer + `--fused_backward_pass`.
 
-If your VRAM is even more constrained, you can enable block swapping by specifying a value for `--blocks_to_swap`.
+VRAM usage decreases in the order of 1. to 4. (4. being the least). The time taken for training increases in the order of 2. = 3. < 4. < 1. (1. being the slowest). The expected accuracy is in the order of 1. > 2. > 3. = 4. (1. being the highest).
+
+The sample configuration is a recommended setting when using option 3. If VRAM is further constrained, you can also use option 4. Adjust `--lr_warmup_steps` to a value between about 10 and 100.
+
+`--fused_backward_pass` currently does not support gradient accumulation. Also, since max grad norm may not work as expected, it is recommended to specify `--max_grad_norm 0`.
 
 Experience with other models suggests that the learning rate may need to be reduced significantly; something in the range of 1e-6 to 1e-5 might be a good place to start.
 
@@ -321,8 +331,11 @@ Finetuningは専用のスクリプト`zimage_train.py`を使用します。こ�
 - `--mem_eff_save`: チェックポイント保存時のメインメモリ（RAM）使用量を削減します。
 - `--blocks_to_swap`: モデルのブロックをVRAMとメインメモリ間でスワップし、VRAM使用量を削減します。VRAMが少ない場合に有効です。
 - `--disable_numpy_memmap`: モデル読み込み時のnumpyメモリマッピングを無効化し、標準のファイル読み込みで読み込みを行います。RAM使用量は増加しますが、場合によってはモデルの読み込みが高速化されます。
+- `--block_swap_optimizer_patch_params`: ブロックスワッピングのためのオプティマイザパラメータをパッチするためのオプションです。
 
 `--full_bf16`はVRAM使用量を約30GB削減しますが、重みがbfloat16で保持されるため、モデルの精度に影響を与える可能性があります。オプティマイザの状態はfloat32で保持されます。また、効率的な学習のために、stochastic roundingをサポートするオプティマイザとの併用が推奨されます。このリポジトリでは、`adafactor`オプティマイザに`--fused_backward_pass`オプションの組み合わせでstochastic roundingをサポートしています。
+
+`--block_swap_optimizer_patch_params`オプションにより、オプティマイザステップ中に勾配がパラメータと同じデバイスに移動され、ブロックスワッピングで動作するようになります。この回避策は現在AdamWやAdafactorなどで動作します。オプティマイザの実装に依存するため、AdamW8bitやその他のオプティマイザはこのパッチでは動作しません。
 
 `--mem_eff_save`を使用する場合でも、`--save_state`においてはオプティマイザの状態を保存する際に従来の保存方法が依然として使用されるため、約20GBのメインメモリが必要であることに注意してください。
 
@@ -332,11 +345,20 @@ Finetuningは専用のスクリプト`zimage_train.py`を使用します。こ�
 
 十分なVRAMがある場合は、お好みのオプティマイザを使用できます。`--full_bf16`は推奨されません。
 
-VRAMが限られている環境（例：48GB以下）の場合は、`--full_bf16`、Adafactorオプティマイザ、および`--fused_backward_pass`を使用する必要があるかもしれません。上記の設定はその場合の推奨オプションです。`--lr_warmup_steps`は約10から100の間の値に調整してください。
+VRAMが限られている環境（例：48GB以下）の場合は、次のいずれかのオプションを利用できます。
+
+1. `--blocks_to_swap`＋`--block_swap_optimizer_patch_params`＋互換性のあるオプティマイザを使用する。
+2. `--blocks_to_swap`＋Adafactor＋`--fused_backward_pass`を使用する。
+3. `--full_bf16`＋Adafactorオプティマイザ＋`--fused_backward_pass`を使用する。
+4. `--blocks_to_swap`＋`--full_bf16`＋Adafactorオプティマイザ＋`--fused_backward_pass`を使用する。
+
+VRAM使用量は1.から4.の順で減少します（4.が最も少ない）。学習にかかる時間は2.=3. < 4. < 1.の順で長くなります（1.が最も遅い）。期待される精度は、1. > 2. > 3. = 4.の順になります（1.が最も高い）。
+
+サンプルの設定は、3.のオプションを使用する場合の推奨設定です。VRAMがさらに制約されている場合は、4.のオプションを使用することもできます。`--lr_warmup_steps`は約10から100の間の値に調整してください。
 
 現時点では`--fused_backward_pass`はgradient accumulationに対応していません。またmax grad normも想定通りに動作しない可能性があるため、`--max_grad_norm 0`を指定することを推奨します。
 
-さらにVRAMが制約されている場合は、`--blocks_to_swap`に値を指定してブロックスワッピングを有効にできます。
+他のモデルでの経験則では、学習率は大幅に減らす必要があるかもしれません。1e-6から1e-5の範囲で試してみると良いでしょう。
 
 </details>
 

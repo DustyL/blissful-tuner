@@ -11,6 +11,7 @@ from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_KANDINSKY5, ARCHITECTURE_KANDINSKY5_FULL
 from musubi_tuner.hv_train_network import (
+    DiTOutput,
     NetworkTrainer,
     clean_memory_on_device,
     setup_parser_common,
@@ -33,6 +34,7 @@ from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 
 from blissful_tuner.blissful_logger import BlissfulLogger
 from blissful_tuner.utils import ensure_dtype_form
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 
 logger = BlissfulLogger(__name__, "green")
 
@@ -52,6 +54,58 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
         self._i2v_mode = "first"
         self._control_training = False
         self.visual_cond_prob: float = 1.0
+
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path."""
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     # region model specific
 
@@ -764,7 +818,8 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         bsz = latents.shape[0]
         preds = []
         targets = []
@@ -922,7 +977,7 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
 
         model_pred = torch.stack(preds, dim=0)  # B, F, C, H, W
         target = torch.stack(targets, dim=0)  # B, F, C, H, W
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

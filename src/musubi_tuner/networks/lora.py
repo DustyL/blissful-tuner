@@ -876,6 +876,8 @@ def create_network(
     text_encoders: List[nn.Module],
     unet: nn.Module,
     neuron_dropout: Optional[float] = None,
+    module_class: Type[object] = None,
+    module_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ):
     """architecture independent network creation"""
@@ -929,8 +931,15 @@ def create_network(
     use_dora = parse_bool_arg(kwargs.get("use_dora", None), default=False)
     init_lora_weights = parse_init_lora_weights_arg(kwargs.get("init_lora_weights", None))
 
-    # Module class override (for LoKr/LoHa reuse of LoRANetwork)
-    module_class = kwargs.pop("module_class", LoRAModule)
+    # Module class override (for LoKr/LoHa reuse of LoRANetwork). Respect the explicit
+    # `module_class` parameter (upstream signature); fall back to kwargs for legacy
+    # keyword passing, else default to LoRAModule. (Merge fix: the explicit param
+    # captured the value, so the old unconditional kwargs.pop always returned the
+    # default LoRAModule — silently defeating the non-standard-module guards below.)
+    if module_class is None:
+        module_class = kwargs.pop("module_class", LoRAModule)
+    else:
+        kwargs.pop("module_class", None)
     if init_lora_weights != "kaiming" and not issubclass(module_class, LoRAModule):
         raise ValueError(
             f"init_lora_weights={init_lora_weights!r} is only supported by standard LoRA modules, "
@@ -940,7 +949,10 @@ def create_network(
         raise ValueError(
             f"rank_pattern and alpha_pattern are only supported by standard LoRA modules, got module_class={module_class.__name__}."
         )
-    module_kwargs = kwargs.pop("module_kwargs", None)
+    if module_kwargs is None:
+        module_kwargs = kwargs.pop("module_kwargs", None)
+    else:
+        kwargs.pop("module_kwargs", None)
     if isinstance(module_kwargs, str):
         module_kwargs = ast.literal_eval(module_kwargs)
     if module_kwargs is not None and not isinstance(module_kwargs, dict):
@@ -1462,6 +1474,9 @@ class LoRANetwork(torch.nn.Module):
                     else:
                         param_groups["lora"][f"{lora.lora_name}.{name}"] = param
 
+            if loraplus_ratio is not None and len(param_groups["plus"]) == 0:
+                logger.warning("LoRA+ is not effective for this network type (no 'lora_up' parameters found)")
+
             params = []
             descriptions = []
             for key in param_groups.keys():
@@ -1594,6 +1609,12 @@ class LoRANetwork(torch.nn.Module):
         keys_scaled = 0
 
         state_dict = self.state_dict()
+
+        # guard: only supported for LoRA (lora_down/lora_up parameterization)
+        if not any("lora_down" in k and "weight" in k for k in state_dict.keys()):
+            logger.warning("max_norm_regularization is only supported for LoRA")
+            return 0, 0.0, 0.0
+
         for key in state_dict.keys():
             if "lora_down" in key and "weight" in key:
                 # Skip split_dims keys (lora_down.0.weight, etc.) - not supported
@@ -1666,6 +1687,8 @@ def create_network_from_weights(
     text_encoders: Optional[List[nn.Module]] = None,
     unet: Optional[nn.Module] = None,
     for_inference: bool = False,
+    module_class: Optional[Type[object]] = None,
+    module_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> LoRANetwork:
     # get dim/alpha mapping
@@ -1717,7 +1740,8 @@ def create_network_from_weights(
             dim = max(value.shape)
             modules_dim[lora_name] = dim
 
-    module_class = LoRAInfModule if for_inference else LoRAModule
+    if module_class is None:
+        module_class = LoRAInfModule if for_inference else LoRAModule
 
     # Allow caller to override module_class (for LoHa/LoKr)
     module_class = kwargs.pop("module_class", module_class)

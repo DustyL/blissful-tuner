@@ -28,6 +28,7 @@ from musubi_tuner.hunyuan_video_1_5.hunyuan_video_1_5_models import (
 )
 from musubi_tuner.hunyuan_video_1_5.hunyuan_video_1_5_vae import VAE_LATENT_CHANNELS
 from musubi_tuner.hv_train_network import (
+    DiTOutput,
     NetworkTrainer,
     clean_memory_on_device,
     load_prompts,
@@ -36,6 +37,7 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +49,58 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = 6.0
+
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path."""
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     # region model specific
     @property
@@ -380,7 +434,8 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         transformer: HunyuanVideo_1_5_DiffusionTransformer = transformer_arg
 
         # Check if this batch has I2V conditioning (first frame latents)
@@ -455,7 +510,7 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         # Flow matching target: predict the velocity (noise - clean)
         # This is different from DDPM which predicts noise directly
         target = noise - latents
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

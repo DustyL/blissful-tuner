@@ -15,7 +15,7 @@ import os
 import tempfile
 import unittest
 
-from musubi_tuner.dataset.image_video_dataset import (
+from musubi_tuner.dataset.datasources import (
     ImageDirectoryDatasource,
     ImageJsonlDatasource,
     VideoDirectoryDatasource,
