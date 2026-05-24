@@ -138,5 +138,54 @@ class TestLoKrModuleStateDict(unittest.TestCase):
         self.assertNotIn("org_module_ref.weight", keys)
 
 
+class TestLoKrFactorThreadedThroughCreateNetworkFromWeights(unittest.TestCase):
+    """B1 regression: ``create_network_from_weights`` must honor an explicit ``module_kwargs``.
+
+    ``networks/lokr.py::create_arch_network_from_weights`` resolves the factor (``_resolve_factor``
+    over the ``lokr_factor`` buffer / ``ss_lokr_factor`` metadata) and forwards it as
+    ``module_kwargs={"factor": N}`` to ``lora.create_network_from_weights``. A merge splice there
+    did ``module_kwargs = kwargs.pop("module_kwargs", None)`` unconditionally — but ``module_kwargs``
+    was bound to the *named* parameter, not ``**kwargs``, so the pop returned ``None`` and discarded
+    the resolved factor. LoKr then rebuilt with ``factor=-1`` (automatic factorization), mismatching
+    saved ``lokr_w1``/``lokr_w2`` shapes on reload via ``--base_weights`` / ``--dim_from_weights`` /
+    ``wan_generate_video``. The fix mirrors the guard already present in ``create_network``.
+    """
+
+    def _tiny_unet(self):
+        class _Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+
+        return _Tiny()
+
+    def test_explicit_module_kwargs_is_not_discarded(self):
+        """The {'factor': 8} passed as the named param must reach the network, not be popped to None."""
+        from musubi_tuner.networks import lora
+        from musubi_tuner.networks.lokr import LoKrModule
+
+        network = lora.create_network_from_weights(
+            target_replace_modules=[],
+            multiplier=1.0,
+            weights_sd={},
+            unet=self._tiny_unet(),
+            module_class=LoKrModule,
+            module_kwargs={"factor": 8},
+        )
+        self.assertEqual(network.module_kwargs, {"factor": 8})
+
+    def test_missing_module_kwargs_defaults_to_empty(self):
+        """No module_kwargs supplied → network stores {} (the `module_kwargs or {}` default)."""
+        from musubi_tuner.networks import lora
+
+        network = lora.create_network_from_weights(
+            target_replace_modules=[],
+            multiplier=1.0,
+            weights_sd={},
+            unet=self._tiny_unet(),
+        )
+        self.assertEqual(network.module_kwargs, {})
+
+
 if __name__ == "__main__":
     unittest.main()

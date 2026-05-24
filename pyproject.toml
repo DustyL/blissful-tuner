@@ -105,12 +105,6 @@ postprocess = [
     "ultralytics>=8.3.0",
 ]
 
-[project.scripts]
-bt-compile = "blissful_tuner.config_manager.cli:main_compile"
-bt-diff = "blissful_tuner.config_manager.cli:main_diff"
-bt-prune = "blissful_tuner.config_manager.cli:main_prune"
-bt-tui = "blissful_tuner.config_manager.tui.app:main"
-
 [tool.pytest.ini_options]
 filterwarnings = [
     # External deprecation noise from PyTorch internals triggered during runtime parser imports.
@@ -214,11 +208,6 @@ extend-exclude = [
   "src/musubi_tuner/wan/utils/fm_solvers.py",
   "src/musubi_tuner/wan/utils/fm_solvers_unipc.py",
   "src/musubi_tuner/wan/utils/utils.py",
-  "src/blissful_tuner/codeformer",  # Blissful
-  "src/blissful_tuner/esrgan",
-  "src/blissful_tuner/gfpgan",
-  "src/blissful_tuner/gimmvfi",
-  "src/blissful_tuner/swinir",
 ]
 
 [tool.ruff.format]

@@ -17,6 +17,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.qwen_image import qwen_image_autoencoder_kl, qwen_image_model, qwen_image_utils
 from musubi_tuner.hv_train_network import (
+    DiTOutput,
     NetworkTrainer,
     load_prompts,
     clean_memory_on_device,
@@ -26,6 +27,7 @@ from musubi_tuner.hv_train_network import (
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.sai_model_spec import CUSTOM_ARCH_QWEN_IMAGE_EDIT_PLUS, CUSTOM_ARCH_QWEN_IMAGE_EDIT_2511
 from blissful_tuner.blissful_logger import BlissfulLogger
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 
 logger = BlissfulLogger(__name__, "green")
 
@@ -55,6 +57,58 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         timesteps = (t * 999.0 + 1.0).clamp(1.0, 1000.0)
         sigma = timesteps / 1000.0
         return sigma, timesteps
+
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path."""
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     # region model specific
 
@@ -447,7 +501,8 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: qwen_image_model.QwenImageTransformer2DModel = transformer
         is_edit = self.is_edit
 
@@ -631,7 +686,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         target = noise - latents
 
         # print(model_pred.dtype, target.dtype)
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

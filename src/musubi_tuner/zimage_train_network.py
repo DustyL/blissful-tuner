@@ -9,6 +9,7 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_Z_IMAGE, ARCHITECTURE_Z_IMAGE_FULL
 from musubi_tuner.zimage import zimage_model, zimage_utils, zimage_autoencoder, zimage_config
 from musubi_tuner.hv_train_network import (
+    DiTOutput,
     NetworkTrainer,
     load_prompts,
     clean_memory_on_device,
@@ -16,6 +17,7 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
 )
 from musubi_tuner.utils import model_utils
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 
 import logging
 
@@ -26,6 +28,58 @@ logging.basicConfig(level=logging.INFO)
 class ZImageNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path."""
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     # region model specific
 
@@ -284,7 +338,8 @@ class ZImageNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: zimage_model.ZImageTransformer2DModel = accelerator.unwrap_model(transformer)
         bsize = latents.shape[0]
 
@@ -342,7 +397,7 @@ class ZImageNetworkTrainer(NetworkTrainer):
 
         target = noise - latents
 
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
 
 def zimage_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

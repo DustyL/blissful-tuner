@@ -96,7 +96,7 @@ Musubi Tunerの開発に尽力いただいたkohya-ssさん、重要なコード
 
 ## はじめに
 
-このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、Qwen-ImageのLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、公式のHunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、Qwen-Imageのリポジトリとは関係ありません。
+このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、FLUX.2 dev/klein、Qwen-Image、Z-ImageのLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、それらの公式リポジトリとは関係ありません。
 
 *リポジトリは開発中です。*
 
@@ -126,16 +126,12 @@ GitHub Discussionsを有効にしました。コミュニティのQ&A、知識�
         - チェックポイントやオプションの詳細など、詳細は[ドキュメント](./docs/qwen_image.md)を参照してください。
         - キャッシュ作成、学習、推論の各スクリプトで、`--model_version` オプションに `edit-2511` を指定してください。
 
-- 2025/12/25
-    - Kandinsky 5のLoRA学習に対応しました。[PR #774](https://github.com/kohya-ss/musubi-tuner/pull/774) AkaneTendo25氏に深く感謝します。
-        - 詳細は[ドキュメント](./docs/kandinsky5.md)を参照してください。
-        - **重みの指定が一部、Hugging FaceのID形式になっています。近日中に（他のモデルと同様の）*.safetensorsの直接指定方式に変更予定ですのでご注意ください。**
-
-- 2025/12/13
-    - Z-Imageのfinetuningに対応しました。[PR #778](https://github.com/kohya-ss/musubi-tuner/pull/778) sdbds氏に深く感謝します。
+- 2026/02/15
+    - LoHa/LoKrの学習に対応しました。[PR #900](https://github.com/kohya-ss/musubi-tuner/pull/900)
+        - LyCORISのLoHa/LoKrアルゴリズムに基づいて実装されています。LyCORISプロジェクトのKohakuBlueleaf氏に深く感謝します。
+        - 詳細は[ドキュメント](./docs/loha_lokr.md)を参照してください。
+    - Z-Imageのfine-tuningで、blocks_to_swapを使用している場合に、一部のオプティマイザを使用可能にする`--block_swap_optimizer_patch_params`オプションを追加しました。[PR #899](https://github.com/kohya-ss/musubi-tuner/pull/899)
         - 詳細は[ドキュメント](./docs/zimage.md#finetuning)を参照してください。
-    - ごくシンプルなGUIツールを追加しました。[PR #779](https://github.com/kohya-ss/musubi-tuner/pull/779)
-        - 現在はZ-Image-TurboとQwen-ImageのLoRA学習に対応しています。詳細は[ドキュメント](./src/musubi_tuner/gui/gui.ja.md)を参照してください。
 
 ### リリースについて
 
@@ -196,6 +192,10 @@ Musubi Tunerの解説記事執筆や、関連ツールの開発に取り組ん�
 - [FramePack (1フレーム推論)](./docs/framepack_1f.md)
 - [FLUX.1 Kontext](./docs/flux_kontext.md)
 - [Qwen-Image](./docs/qwen_image.md)
+- [Z-Image](./docs/zimage.md)
+- [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
+- [Kandinsky 5](./docs/kandinsky5.md)
+- [FLUX.2](./docs/flux_2.md)
 
 **共通設定・その他:**
 - [データセット設定](./docs/dataset_config.md)

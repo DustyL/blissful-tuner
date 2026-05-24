@@ -128,31 +128,40 @@ GitHub Discussions Enabled: We've enabled GitHub Discussions for community Q&A, 
         - Please refer to the [documentation](./docs/qwen_image.md) for details such as checkpoints and options.
         - In the caching, training, and inference scripts, specify `--model_version` option as `edit-2511`.
 
-- December 25, 2025
-    - Added support for LoRA training of Kandinsky 5. See [PR #774](https://github.com/kohya-ss/musubi-tuner/pull/774). Many thanks to AkaneTendo25 for this contribution.
-        - Please refer to the [documentation](./docs/kandinsky5.md) for details.
-        - **Note that some weight specifications are in Hugging Face ID format. We plan to change to direct *.safetensors specification like other models soon, so please be aware.**
-
-- December 13, 2025
-    - Added support for finetuning Qwen-Image. See [PR #778](https://github.com/kohya-ss/musubi-tuner/pull/778). Many thanks to sdbds for this contribution.
+- February 15, 2026
+    - Added support for LoHa/LoKr training. See [PR #900](https://github.com/kohya-ss/musubi-tuner/pull/900)
+        - Implemented based on the LoHa/LoKr algorithms from LyCORIS. Special thanks to KohakuBlueleaf from the LyCORIS project.
+        - Please refer to the [documentation](./docs/loha_lokr.md) for details.
+    - Added `--block_swap_optimizer_patch_params` option to enable the use of some optimizers when using `blocks_to_swap` in Z-Image fine-tuning. See [PR #899](https://github.com/kohya-ss/musubi-tuner/pull/899)
         - Please refer to the [documentation](./docs/zimage.md#finetuning) for details.
-    - Added a very simple GUI tool. See [PR #779](https://github.com/kohya-ss/musubi-tuner/pull/779).
-        - Currently supports LoRA training for Z-Image-Turbo and Qwen-Image. Please refer to the [documentation](./src/musubi_tuner/gui/gui.md) for details.
 
-- December 9, 2025
-    - LoRA weights in Diffusers format can now be loaded with the `--base_weights` option in training scripts. See [PR #772](https://github.com/kohya-ss/musubi-tuner/pull/772).
-        - This allows training using Z-Image-Turbo's Training Adapter, etc.
-    - Updated the [documentation](./docs/zimage.md) on how to perform LoRA training for Z-Image-Turbo using De-Turbo models or Training Adapters.
-    - We would like to express our deep gratitude to ostris for providing these.
+- January 29, 2026
+    - With the release of Z-Image-Base, we have verified that both LoRA and finetuning work correctly.
+    - Updated the [related documentation](./docs/zimage.md) for Z-Image.
+    - Fixed an issue where sample image generation did not work correctly in LoRA training and finetuning of Z-Image. See [PR #861](https://github.com/kohya-ss/musubi-tuner/pull/861).
 
-- December 7, 2025
-    - Added support for Z-Image Turbo. See [PR #757](https://github.com/kohya-ss/musubi-tuner/pull/757).
-        - Since this is a Turbo (distilled) model, training may be unstable. Feedback is welcome.
-        - Please refer to the [documentation](./docs/zimage.md) for details.
+- January 24, 2026
+    - Fixed an issue where LoRA training for FLUX.2 [klein] did not work. Also made various bug fixes and feature additions related to FLUX.2. See [PR #858](https://github.com/kohya-ss/musubi-tuner/pull/858).
+        - The `--model_version` specification has changed from `flux.2-dev` or `flux.2-klein-4b` to `dev` or `klein-4b`, etc.
+        - fp8 optimization and other features also work. Please refer to the [documentation](./docs/flux_2.md) for details.
+        - Since klein 9B, dev models, and training with multiple control images have not been sufficiently tested, please report any issues via Issue.
 
-- December 5, 2025
-    - Added support for HunyuanVideo 1.5. See [PR #748](https://github.com/kohya-ss/musubi-tuner/pull/748).
-        - LoRA training for T2V and I2V is now supported. Please refer to the [documentation](./docs/hunyuan_video_1_5.md) for details.
+- January 21, 2026
+    - Added support for LoRA training of FLUX.2 [dev]/[klein]. See [PR #841](https://github.com/kohya-ss/musubi-tuner/pull/841). Many thanks to christopher5106 from https://www.scenario.com for this contribution.
+        - Please refer to the [documentation](./docs/flux_2.md) for details.
+
+- January 17, 2026
+    - Changed to use `convert_lora.py` for converting Z-Image LoRA for ComfyUI to improve compatibility. See [PR #851](https://github.com/kohya-ss/musubi-tuner/pull/851).
+        - The previous `convert_z_image_lora_to_comfy.py` can still be used, but the converted weights may not work correctly with nunchaku.
+        - Please refer to the [documentation](./docs/zimage.md#converting-lora-weights-to-diffusers-format-for-comfyui--lora重みをcomfyuiで使用可能なdiffusers形式に変換する) for details.
+        - Many thanks to fai-9 for providing the solution in [Issue #847](https://github.com/kohya-ss/musubi-tuner/issues/847).
+    - Added `--remove_first_image_from_target` option for LoRA training of Qwen-Image-Layered. See [PR #852](https://github.com/kohya-ss/musubi-tuner/pull/852).
+        - Please refer to the [documentation](./docs/qwen_image.md#lora-training--lora学習) for details.
+
+- January 11, 2026
+    - Added support for LoRA training of Qwen-Image-Layered. See [PR #816](https://github.com/kohya-ss/musubi-tuner/pull/816).
+        - Please refer to the [documentation](./docs/qwen_image.md) for details.
+        - In the caching, training, and inference scripts, specify `--model_version` option as `layered`.
 
 ### Releases
 
@@ -214,6 +223,10 @@ For detailed information on specific architectures, configurations, and advanced
 - [FLUX.1 Kontext](./docs/flux_kontext.md)
 - [FLUX.2](./docs/flux_2.md)
 - [Qwen-Image](./docs/qwen_image.md)
+- [Z-Image](./docs/zimage.md)
+- [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
+- [Kandinsky 5](./docs/kandinsky5.md)
+- [FLUX.2](./docs/flux_2.md)
 
 **Common Configuration & Usage:**
 - [Dataset Configuration](./docs/dataset_config.md)

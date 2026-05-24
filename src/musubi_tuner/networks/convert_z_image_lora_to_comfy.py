@@ -58,10 +58,10 @@ def main(args):
             count += 1
             # print(f"Renamed {k} to {new_k}")
 
-    # concat or split LoRA for QKV layers
+    # concat or split LoRA/LoHa/LoKr for QKV layers
     qkv_count = 0
     if args.reverse:
-        # ComfyUI to sd-scripts: split QKV
+        # ComfyUI to sd-scripts: split QKV (LoRA only)
         keys = list(state_dict.keys())
         for key in keys:
             if key not in state_dict:
@@ -98,6 +98,8 @@ def main(args):
                 qkv_count += 1
     else:
         # sd-scripts to ComfyUI: concat QKV
+
+        # LoRA QKV merge
         keys = list(state_dict.keys())
         for key in keys:
             if key not in state_dict:
@@ -264,6 +266,12 @@ def main(args):
                 sqrt_S = S[:rank].sqrt()
                 lora_up = (U[:, :rank] * sqrt_S.unsqueeze(0)).to(combined.dtype)
                 lora_down = (Vh[:rank] * sqrt_S.unsqueeze(1)).to(combined.dtype)
+
+                # Log SVD reconstruction quality (cherry-picked from upstream's converter).
+                # Diagnostic only; does not affect the LoHa path above.
+                reconstructed = (U[:, :rank] * S[:rank].unsqueeze(0)) @ Vh[:rank, :]
+                rel_error = (combined.float() - reconstructed).norm() / combined.float().norm()
+                logger.info(f"  LoKr->LoRA QKV {lora_name_prefix}qkv: rank={rank}/{S.shape[0]}, relative error={rel_error:.6f}")
 
                 new_lora_name = lora_name_prefix + "qkv"
                 state_dict[f"{new_lora_name}.lora_up.weight"] = lora_up

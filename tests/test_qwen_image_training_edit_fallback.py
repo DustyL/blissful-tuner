@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
+from musubi_tuner.hv_train_network import DiTOutput
 
 
 class _FakeAccelerator:
@@ -79,7 +80,7 @@ class TestQwenImageEditFallback(unittest.TestCase):
         )
         accelerator = _FakeAccelerator()
 
-        model_pred, target = trainer.call_dit(
+        output = trainer.call_dit(
             args=args,
             accelerator=accelerator,
             transformer=_DummyQwenImageModel(),
@@ -90,6 +91,8 @@ class TestQwenImageEditFallback(unittest.TestCase):
             timesteps=timesteps,
             network_dtype=torch.float32,
         )
+        assert isinstance(output, DiTOutput)
+        model_pred, target = output.pred, output.target
 
         self.assertEqual(model_pred.shape, latents.shape)
         self.assertEqual(target.shape, latents.shape)

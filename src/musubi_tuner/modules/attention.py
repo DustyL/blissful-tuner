@@ -23,7 +23,11 @@ except ImportError:
 
 try:
     import xformers.ops as xops
-except ImportError:
+except (ImportError, OSError):
+    # OSError fires when xformers is installed but its native extension (`mslk.so`,
+    # `_C.so`) fails to load — typically because the daily PyTorch rebuild left
+    # behind a stale ABI. Treat that the same as "xformers not available" rather
+    # than crashing the whole import chain.
     xops = None
 
 try:

@@ -264,6 +264,7 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd, metadata: dict[st
 
         new_weights_sd[new_key] = weight
 
+    logger.info(f"estimated type: {net_type}")
     return new_weights_sd
 
 

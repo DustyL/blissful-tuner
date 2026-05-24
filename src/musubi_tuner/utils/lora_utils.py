@@ -212,7 +212,7 @@ def load_safetensors_with_lora_and_fp8(
 
         # make hook for LoRA merging
         def weight_hook_func(model_weight_key, model_weight: torch.Tensor, keep_on_calc_device=False):
-            nonlocal list_of_lora_weight_keys, lora_weights_list, lora_multipliers, calc_device
+            nonlocal list_of_lora_weight_keys, lora_weights_list, lora_multipliers, lora_network_types, calc_device
 
             if not model_weight_key.endswith(".weight"):
                 return model_weight

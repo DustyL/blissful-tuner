@@ -505,15 +505,92 @@ canonical direct-kwargs pattern with pre-allocation guard assertions.
 
 ```bash
 --blocks_to_swap N            # Swap N blocks to CPU (max 39 for 14B)
---fp8_base                    # FP8 precision for DiT
+--fp8_base                    # FP8 for DiT. NOTE: alone = blunt full-model fp8 cast (norms/modulation
+                              #   included) → WAN 2.2's TP-03 guard rejects it. For WAN, PAIR with --fp8_scaled.
+--fp8_scaled                  # Per-layer scaled fp8 (requires --fp8_base): quantizes only .weight, excludes
+                              #   norm/modulation/embeddings. THIS is the working WAN fp8 path.
 --fp8_t5                      # FP8 for T5 encoder
 --gradient_checkpointing      # Enable gradient checkpointing
---offload_inactive_dit        # Offload inactive model (WAN 2.2)
+--offload_inactive_dit        # Offload inactive expert to CPU (WAN 2.2). MUTUALLY EXCLUSIVE with
+                              #   --blocks_to_swap (WAN asserts). Pick one memory strategy, not both.
 --rope_func comfy             # VRAM-efficient rope (good with --compile)
 --no_compact_time_embedding   # WAN 2.2: disable compact time embedding (default: enabled; saves multi-GiB at T2V training, no-op for I2V)
 --force_v2_1_time_embedding   # WAN 2.2: revert to Wan2.1-style modulation entirely (more aggressive than compact)
 --prefer_lycoris              # Use LyCORIS backend for LoRA merging (inference)
 ```
+
+**WAN 2.2 fp8 gotcha (cost a debug cycle during the v0.3.0 parity gate):** `--fp8_base` *alone* casts the
+whole DiT to fp8 — including `norm`/`modulation` params — and blissful's TP-03 guard
+(`wan_train_network.py`, fires when `args.fp8_base` and any norm/modulation param is fp8) correctly aborts
+the run. The intended WAN fp8 path is **`--fp8_base --fp8_scaled` together**: that sets `dit_weight_dtype=None`
+and routes through `optimize_state_dict_with_fp8`, which targets only `.weight` keys and honors
+`FP8_OPTIMIZATION_EXCLUDE_KEYS` (norm, modulation, embeddings, head). This is by design and identical across
+the v0.3.0 merge — not a regression. (For a 14B dual-expert run on a 32 GB card, also note `--blocks_to_swap`
+and `--offload_inactive_dit` cannot be combined; heavy `--blocks_to_swap` alone fits.)
+
+### Block Swap Invariants
+
+Training block swap migrates early transformer blocks to CPU during forward
+and **relies on backward hooks to return them to GPU before the next forward**.
+Any code path that runs a forward pass under `torch.no_grad()` skips the
+backward hooks entirely, leaving blocks stuck on CPU. The next training forward
+then hits `F.linear(input_cuda, weight_cpu, ...)` and raises:
+`RuntimeError: Expected all tensors to be on the same device, but got mat2 is
+on cpu, different from other tensors on cuda:0`.
+
+The crash surfaces in `lora.py:560` because the LoRA wrapper is the first
+caller of the original Linear's `forward`, but the LoRA wrapper is not the
+bug — it's just the topmost place a CPU `weight` gets touched.
+
+Two restore mechanisms exist; new no-grad forward paths must use one:
+
+- **`NetworkTrainer.restore_block_swap_after_no_grad_forward(accelerator, transformer)`**
+  (`hv_train_network.py:623`) — for the prior-teacher no-grad forward.
+  Called at `hv_train_network.py:2791` after the teacher `call_dit(...)`
+  but before the student `call_dit(...)`. Internally calls
+  `prepare_block_swap_before_forward()` on the unwrapped transformer when
+  `blocks_to_swap > 0`. No-op when block swap is disabled.
+
+- **`transformer.switch_block_swap_for_inference()` / `..._for_training()`**
+  pair (`hv_train_network.py:1410` / `:1451`) — for sample generation.
+  `sample_images()` wraps the no-grad sampling loop in a `try:` with a
+  nested `finally:` that runs both RNG restore and `..._for_training()`,
+  so block-swap layout is restored even if RNG restoration or sampling
+  itself raises.
+
+EMA teacher operations (`LoRAEmaTeacher.update()`, `LoRAEmaTeacher.apply_to()`
+in `modules/lora_ema_teacher.py`) iterate `network.named_parameters()` where
+`network` is the **LoRA adapter network**, not the base transformer. They
+never touch transformer parameters and therefore cannot disturb block-swap
+state. This is true by construction, not by luck.
+
+Guarded by:
+- `tests/test_block_swap_prior_restore.py` — 7 tests covering the helper's
+  safety guard, prior teacher no-grad restore, sample-mode switch round-trip,
+  EMA non-interference, exception-path cleanup in `sample_images()`, and
+  combined EMA + LoRA(DoRA) + block swap + restore + student backward.
+- `tests/manual/test_flux2_block_swap_smoke.py` — real-checkpoint smoke
+  (gated behind `--run-manual`) that loads FLUX.2 Klein-9B, enables block
+  swap, applies DoRA LoRA, optionally compiles each block, runs an EMA
+  prior teacher forward under `no_grad()`, verifies block 0 lands on CPU
+  (bug present), calls the restore, verifies block 0 returns to CUDA, then
+  runs a student forward+backward to confirm gradients flow.
+
+```bash
+# Replay the manual smoke against your local checkpoint:
+./venv314/bin/python -m pytest -q tests/manual/test_flux2_block_swap_smoke.py \
+  --run-manual \
+  --model-path /home/dustin/Training_Models_FLUX_2_and_Klein/FLUX2-Klein-Base-9B.safetensors \
+  --model-version klein-base-9b \
+  --blocks-to-swap 4 \
+  --compile-blocks
+```
+
+When adding a new `torch.no_grad()` forward through a block-swapped
+transformer (validation, custom teacher, evaluation pass, etc.), pair it
+with either the prior-teacher restore helper or the sample-mode switch
+pair. Failure to do so will reproduce the FLUX.2 Klein 9B + DoRA + compile
+crash discovered on 2026-05-16.
 
 ### Muon Optimizer
 
@@ -571,6 +648,7 @@ The mask loss system (`src/musubi_tuner/modules/mask_loss.py`) is a key differen
 - **Compact mask representation**: Masks are kept as `(B,1,F,H,W)` and broadcast against `(B,C,F,H,W)` loss tensors. Weight sums are multiplied by `num_channels` to compensate. This saves VRAM.
 - **Prior mask non-overlap (threshold mode)**: When `prior_mask_threshold` is set, the target mask is zeroed wherever the prior mask applies (`mask_processed *= (1 - prior_mask)`), preventing double-counting.
 - **EMA teacher (graph-safe)**: `LoRAEmaTeacher` uses in-place parameter swap to avoid creating new tensors, making it compatible with `torch.compile` graphs. Initialized after warmup to avoid step-0 adapter noise.
+- **`compute_loss_weighting_for_sd3` MUST keep its `n_dim=` parameter** (`training/timesteps.py:53`). Upstream's version hardcodes `n_dim=5`; blissful threads the *actual loss-tensor rank* (`n_dim=loss.ndim` in base `compute_loss`, `loss_unreduced.ndim` in `masked_process_batch`, full-FT loops) so 4D image-model sigma weighting is correct (`sigma_sqrt`/`cosmap` schemes differ by rank). This silently regressed during the v0.3.0 merge (upstream's signature was spliced in, dropping the param) and is guarded by `tests/test_loss_weighting_ndim.py` — **never retire that test; re-restore `n_dim=` on every future upstream merge.** Weighting is deferred until after the unreduced loss so the rank is known; this is numerically identical (weighting depends only on scheme/scheduler/timesteps/device/dtype).
 
 ### Known Limitations
 - **Prior preservation not supported for `layout="layered"`**: Raises `NotImplementedError`. Affects Qwen-Image edit mode with prior preservation.
@@ -608,6 +686,13 @@ feature disabled, branch with optional feature enabled. Keep run length short bu
 past optimizer/compile warmup; the FLUX.2 Klein v8 gate used 300 steps and
 measured steps 201-300 / 251-300.
 
+For cheaper checks before committing to a full A/B, prefer a per-block CUDA
+peak-memory measurement via `tests/manual/measure_flux2_block_peak_memory.py`.
+Synthetic random-init blocks at Klein-9B shape capture the same activation
+profile as a real checkpoint. Decision rule: ≥200 MB drop per-block →
+escalate to focused A/B; <200 MB → close the door without spending a day on
+training-time measurement.
+
 **Recorded results:**
 
 - **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
@@ -616,6 +701,58 @@ measured steps 201-300 / 251-300.
   were neutral. Revisit only if the production path changes materially — e.g.
   `compile=false`, a different Torch / Inductor stack, or a different
   model/kernel mix. Receipts in PR #4 (merged) + the local ab_gate artifacts.
+
+- **xzuyn-optimizations round 2** (2026-05-20): rejected. Per-tensor
+  norm/RoPE + early `del pe` + fresh-temporary in-place modulation produced
+  0 MB per-block peak savings vs. main at Klein-9B production shape (batch=3,
+  img_seq=4096, txt_seq=512, with-DoRA, gradient_checkpointing). PyTorch's
+  CUDA caching allocator already reuses freed slots from short-lived
+  intermediates, so the targeted slack didn't exist. Branch
+  `perf/flux2-xzuyn-round2` kept as historical artifact; the xformers gate
+  fix + measurement harness salvaged to main (commit `ea3e1e9`). xzuyn's
+  rank_dropout bug fix independently converged on our prior fix (`5f78160`);
+  one data point — not yet a reliable confirmatory pattern.
+
+- **xzuyn-optimizations round 3 — custom Triton kernels** (2026-05-21):
+  rejected on numerics alone, no measurement run. Adds `RopeTriton`,
+  `ApplyRopeTriton`, `AdaLNTriton` in `src/musubi_tuner/modules/triton_kernels.py`
+  (file header reads `# AI slop kernels`). Standalone disqualifier:
+  `AdaLNTriton` self-reported bf16 backward max diff is **0.5** absolute
+  (the file's own header table). AdaLN runs at 7 call sites per Klein-9B
+  block × 32 blocks compounded under bf16 mixed precision — that magnitude
+  of bwd error in the core normalization gradient is not a candidate for
+  a model that just took weeks to tune. Corroborating signals: kernels are
+  wired default-on with no opt-in flag; `compile=true` would hit
+  `@triton.jit` boundaries 32× per forward (same Inductor-fusion-barrier
+  trap as last cycle's Liger 19% regression); xzuyn's own added/removed
+  oscillation on `FusedGateResidualTriton` ended with the commit message
+  "peak memory ended up being worse"; the five non-Triton micro-tweaks
+  (`a8a17f2..9f00186`) either are cosmetic (`return self.conv(...)`),
+  duplicate the round-2 patterns we already measured as null, or require
+  pe broadcast convention changes coupled with the unchanged LoRA-bypass
+  pattern. No rank_dropout-style convergence signal this round — the
+  one-prior-fix-converged data point should not be promoted further.
+
+- **LoRA bypass class (recurring across all three review cycles)**: xzuyn's
+  perf patches repeatedly use `F.linear(x, self.<qkv>.weight[slice])` to
+  interleave q/k/v Linear calls. blissful-tuner's `LoRAModule.apply_to()`
+  monkey-patches `org_module.forward`, so calling the module fires the
+  adapter but reading the raw `.weight` silently bypasses it. Both
+  `tests/test_lora_target_coverage.py` and `tests/test_flux2_lora_target_coverage.py`
+  exist specifically to catch this — and the pattern has appeared in every
+  review cycle (rounds 1, 2, and 3 commits `1d50b0b`, `9f00186` still ship
+  it). When porting upstream perf patches that touch qkv / linear1 / proj
+  modules, this is the first
+  invariant to check. Workaround: keep the whole-module call, split the
+  *output* tensor afterward (the per-tensor downstream norm/RoPE wins still
+  apply).
+
+## Upstream Merge Workflow
+
+blissful-tuner is a heavily-diverged fork (~1300 commits ahead of `kohya-ss/musubi-tuner`). The v0.3.0 merge strategy + analyses live in `docs/plans/2026-05-23-refactor-*.md`. Two hard-won lessons from that merge:
+
+- **Splice bugs are the dominant failure mode — and they compile.** When resolving conflicts "keep ours," the recurring trap is upstream's *changed lines* landing on blissful's *variable names / function bodies*: the file compiles and often passes a quick smoke, but misbehaves at runtime. The v0.3.0 merge produced ~7 of these (e.g. `convert_lora.py` referencing an unassigned `estimated_type`; `create_network` / `create_network_from_weights` `kwargs.pop("module_kwargs", ...)` clobbering an explicit param → LoKr `factor` lost; `cache_io.py` missing `import glob`; a duplicate `detect_network_type` last-wins shadow). **When porting any conflict that touches a function signature, verify the *body* still reads the params it was given** — don't trust `py_compile`. Behavior tests (not import tests) are what catch these.
+- **After a multi-session merge, the index holds conflict-resolution-time file versions.** Edits made *after* `git add`-ing a file during resolution are unstaged and silently dropped by a commit-from-index. Before the final atomic merge commit: `git add -u` (stages tracked mods, leaves untracked alone), then for each substantively re-edited file `git show HEAD:<file> | grep <session-edit-marker>` to confirm your edits actually landed (expect non-zero matches). Amend with `git commit --amend -F msg` (preserves merge parents).
 
 ## Blissful Logger
 

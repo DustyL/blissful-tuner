@@ -560,13 +560,11 @@ class ZImageTrainer(ZImageNetworkTrainer):
                         args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
                     )
 
-                    weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
-                    )
-
-                    model_pred, target = self.call_dit(
+                    output = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, dit_dtype
                     )
+                    model_pred = output.pred
+                    target = output.target
                     loss_type = getattr(args, "loss_type", "mse")
                     loss_delta = getattr(args, "loss_delta", 1.0)
                     loss = compute_unreduced_target_loss(
@@ -576,6 +574,10 @@ class ZImageTrainer(ZImageNetworkTrainer):
                         loss_delta=loss_delta,
                     )
 
+                    # SD3 loss weighting at the actual loss rank (W14): n_dim=loss.ndim.
+                    weighting = compute_loss_weighting_for_sd3(
+                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype, n_dim=loss.ndim
+                    )
                     if weighting is not None:
                         loss = loss * weighting
 

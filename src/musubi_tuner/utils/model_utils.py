@@ -260,3 +260,39 @@ def compile_transformer(
             )
             blocks[i] = block
     return transformer
+
+
+def count_dynamo_cache_entries(model: torch.nn.Module) -> int:
+    """Sum of Dynamo cache entries across all unique compiled forwards in `model`.
+
+    Walks `model.modules()` once, finds each `OptimizedModule` (identified by a `_orig_mod`
+    attribute pointing to a *different* module), and sums `_get_total_cache_entry_count`
+    over the **distinct code objects** of their forwards. Dedup matters: N instances of the
+    same block class share one Dynamo cache keyed on `Class.forward.__code__`, so summing
+    per-instance would over-report by Nx. Returns 0 when the private API is unavailable
+    (pre-2.13 builds) or no compiled blocks are present.
+    """
+    try:
+        from torch._dynamo.eval_frame import _get_total_cache_entry_count
+    except (ImportError, AttributeError):
+        return 0
+
+    seen_codes: set = set()
+    total = 0
+    for module in model.modules():
+        orig = getattr(module, "_orig_mod", None)
+        # Skip non-compiled modules and the accelerator self-reference set on the
+        # top-level transformer (hv_train_network.py: `transformer.__dict__["_orig_mod"] = transformer`).
+        if orig is None or orig is module:
+            continue
+        try:
+            fn = orig.forward
+            code = getattr(fn, "__code__", None)
+            if code is None or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            total += _get_total_cache_entry_count(fn)
+        except Exception:
+            # Private API may shift across daily builds; one bad block must not kill telemetry.
+            pass
+    return total

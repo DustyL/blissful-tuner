@@ -71,6 +71,19 @@ def load_torch_file(
 # Below here, Blyss wrote it!
 
 
+def ensure_dtype_form(dtype: any, out_form: str = "torch"):
+    """For managing dtypes betweeen str and torch.dtype easily in one place. More robust than str_to_dtype below"""
+    str_to_torch = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
+    torch_to_str = {torch.float16: "float16", torch.float32: "float32", torch.bfloat16: "bfloat16"}
+    if dtype is None:
+        return None
+    if out_form == "torch" and type(dtype) is str and dtype in ["float16", "bfloat16", "float32"]:
+        return str_to_torch[dtype]
+    if out_form == "str" and type(dtype) is torch.dtype and dtype in [torch.float16, torch.bfloat16, torch.float32]:
+        return torch_to_str[dtype]
+    raise ValueError(f"Unable to process '{dtype}' into type '{out_form}'")
+
+
 def str_to_dtype(dtype_str: str):
     dtype_mapping = {
         "fp16": torch.float16,

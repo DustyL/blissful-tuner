@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from musubi_tuner.zimage import zimage_config
+from musubi_tuner.hv_train_network import DiTOutput
 from musubi_tuner.zimage_train_network import ZImageNetworkTrainer
 
 
@@ -50,7 +51,7 @@ def test_zimage_call_dit_standard_sign_convention():
 
     batch = {"llm_embed": [torch.zeros((3, 2560), dtype=torch.float32)]}
 
-    model_pred, target = trainer.call_dit(
+    output = trainer.call_dit(
         args=args,
         accelerator=accelerator,
         transformer=transformer,
@@ -61,6 +62,8 @@ def test_zimage_call_dit_standard_sign_convention():
         timesteps=timesteps,
         network_dtype=network_dtype,
     )
+    assert isinstance(output, DiTOutput)
+    model_pred, target = output.pred, output.target
 
     assert model_pred.shape == latents.shape
     assert torch.allclose(model_pred, torch.full_like(latents, -2.0))
