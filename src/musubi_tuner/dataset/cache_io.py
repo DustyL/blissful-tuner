@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import Optional, TYPE_CHECKING
+from typing import List, Optional, Sequence, TYPE_CHECKING
 
 import torch
 from safetensors.torch import save_file
@@ -21,7 +21,9 @@ from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str
 
 if TYPE_CHECKING:
-    from musubi_tuner.dataset.image_video_dataset import ItemInfo
+    # Runtime import would be circular (image_video_dataset imports cache_io); these are only
+    # referenced in string annotations (from __future__ import annotations), so TYPE_CHECKING suffices.
+    from musubi_tuner.dataset.image_video_dataset import BaseDataset, ItemInfo
 
 import logging
 
@@ -84,6 +86,7 @@ def save_latent_cache_wan(
         sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
 
 def save_latent_cache_framepack(
     item_info: ItemInfo,
@@ -183,6 +186,7 @@ def save_latent_cache_flux_2(
 
     save_latent_cache_common(item_info, sd, arch_full)
 
+
 def save_latent_cache_qwen_image(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -215,6 +219,7 @@ def save_latent_cache_qwen_image(
         sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, architecture)
+
 
 def save_latent_cache_kandinsky5(
     item_info: ItemInfo,
@@ -340,6 +345,7 @@ def save_latent_cache_z_image(
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     metadata = {
         "architecture": arch_fullname,
@@ -376,6 +382,7 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     os.makedirs(latent_dir, exist_ok=True)
 
     save_file(sd, item_info.latent_cache_path, metadata=metadata)
+
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
     """HunyuanVideo architecture"""
@@ -451,6 +458,7 @@ def save_text_encoder_output_cache_flux_2(
 
     save_text_encoder_output_cache_common(item_info, sd, arch_full)
 
+
 def save_text_encoder_output_cache_qwen_image(
     item_info: ItemInfo, embed: torch.Tensor, architecture: str = ARCHITECTURE_QWEN_IMAGE_FULL
 ):
@@ -460,6 +468,7 @@ def save_text_encoder_output_cache_qwen_image(
     sd[f"varlen_vl_embed_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, architecture)
+
 
 def save_text_encoder_output_cache_kandinsky5(
     item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
@@ -538,6 +547,7 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
 
 # --- blissful-tuner additions (re-homed from monolith) ---
 
+
 def has_omnibase_cache(cache_path: str) -> bool:
     """
     Check if a Z-Image cache file contains OmniBase data (control latents/SigLIP features).
@@ -556,6 +566,7 @@ def has_omnibase_cache(cache_path: str) -> bool:
             return any(k.startswith("latents_control_") or k.startswith("siglip_") for k in keys)
     except Exception:
         return False
+
 
 def read_cache_mask_transform_metadata(cache_path: str) -> tuple[float | None, float | None]:
     """Read cache-time mask preprocessing parameters from a latent cache safetensors file.
@@ -578,6 +589,7 @@ def read_cache_mask_transform_metadata(cache_path: str) -> tuple[float | None, f
         return float(gamma_str), float(min_weight_str)
     except Exception:  # noqa: BLE001
         return None, None
+
 
 def scan_cache_mask_transform_metadata(
     datasets: Sequence["BaseDataset"],

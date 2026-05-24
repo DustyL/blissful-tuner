@@ -296,6 +296,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         self.current_idx += 1
         return fetcher
 
+
 class ImageJsonlDatasource(ImageDatasource):
     def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None, multiple_target: bool = False):
         super().__init__()
@@ -432,6 +433,7 @@ class ImageJsonlDatasource(ImageDatasource):
 
         self.current_idx += 1
         return fetcher
+
 
 class VideoDatasource(ContentDatasource):
     def __init__(self):
@@ -640,6 +642,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         self.current_idx += 1
         return fetcher
 
+
 class VideoJsonlDatasource(VideoDatasource):
     def __init__(self, video_jsonl_file: str):
         super().__init__()
@@ -739,6 +742,7 @@ class VideoJsonlDatasource(VideoDatasource):
 
 # --- blissful-tuner additions (re-homed from monolith) ---
 
+
 def _check_duplicate_basenames(paths: list[str], kind: str = "image") -> None:
     """
     Check for duplicate basenames which would cause cache collisions.
@@ -771,6 +775,7 @@ def _check_duplicate_basenames(paths: list[str], kind: str = "image") -> None:
             f"Examples: {msg}{more}. "
             f"Rename files to have unique basenames."
         )
+
 
 def _filter_paths_by_caption(
     paths: list[str],
@@ -840,6 +845,7 @@ def _filter_paths_by_caption(
         )
 
     return filtered
+
 
 def _validate_caption_config(
     caption_extension: Optional[str],

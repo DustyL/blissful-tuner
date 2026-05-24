@@ -35,7 +35,11 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_WAN,
 )
 from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
-from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
+from musubi_tuner.dataset.media_utils import (  # explicit imports for local use (resolve star-import F405)
+    glob_images,
+    resize_image_to_bucket,
+    resize_mask_to_bucket,
+)
 
 
 class ItemInfo:
@@ -686,6 +690,7 @@ class ImageDataset(BaseDataset):
         super().__getitem__(idx)
         return self.batch_manager[idx]
 
+
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
@@ -1064,6 +1069,7 @@ class VideoDataset(BaseDataset):
     def __getitem__(self, idx):
         super().__getitem__(idx)
         return self.batch_manager[idx]
+
 
 class DatasetGroup(torch.utils.data.ConcatDataset):
     def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset]]):

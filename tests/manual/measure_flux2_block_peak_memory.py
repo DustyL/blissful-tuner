@@ -215,13 +215,16 @@ def main():
     branch = "unknown"
     try:
         import subprocess
+
         branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
     except Exception:
         pass
 
     print(f"# Branch: {branch}")
     print(f"# Config: batch={args.batch} img_seq={args.img_seq} txt_seq={args.txt_seq} with_lora={args.with_lora}")
-    print(f"# Klein-9B shape: hidden={KLEIN_9B_HIDDEN_SIZE} heads={KLEIN_9B_NUM_HEADS} head_dim={KLEIN_9B_HEAD_DIM} mlp_ratio={KLEIN_9B_MLP_RATIO}")
+    print(
+        f"# Klein-9B shape: hidden={KLEIN_9B_HIDDEN_SIZE} heads={KLEIN_9B_NUM_HEADS} head_dim={KLEIN_9B_HEAD_DIM} mlp_ratio={KLEIN_9B_MLP_RATIO}"
+    )
     print()
 
     results = {}

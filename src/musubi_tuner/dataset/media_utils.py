@@ -72,6 +72,7 @@ def glob_images(directory, base="*"):
     img_paths.sort()
     return img_paths
 
+
 def glob_videos(directory, base="*"):
     video_paths = []
     for ext in VIDEO_EXTENSIONS:
@@ -252,6 +253,7 @@ def load_video(
 
 
 # --- blissful-tuner additions (re-homed from monolith) ---
+
 
 def resize_mask_to_bucket(mask: Union[Image.Image, np.ndarray], bucket_reso: tuple[int, int]) -> np.ndarray:
     """

@@ -118,7 +118,9 @@ class _FakeTrainer:
 # ---------------------------------------------------------------------------
 
 
-def _legacy_masked_process(self, args, accelerator, transformer, network, batch, latents, noise, noise_scheduler, dit_dtype, network_dtype, global_step):
+def _legacy_masked_process(
+    self, args, accelerator, transformer, network, batch, latents, noise, noise_scheduler, dit_dtype, network_dtype, global_step
+):
     # === Prior scheduling / EMA teacher configuration (pre-merge :2594-2613) ===
     prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
     prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
@@ -241,7 +243,9 @@ def _legacy_masked_process(self, args, accelerator, transformer, network, batch,
     target_cast = target.to(network_dtype)
     loss_unreduced = compute_unreduced_target_loss(model_pred_cast, target_cast, loss_type=loss_type, loss_delta=loss_delta)
 
-    log_huber_stats = str(loss_type).lower() == "huber" and len(accelerator.trackers) > 0 and bool(getattr(args, "use_mask_loss", False))
+    log_huber_stats = (
+        str(loss_type).lower() == "huber" and len(accelerator.trackers) > 0 and bool(getattr(args, "use_mask_loss", False))
+    )
     huber_threshold = 0.5 * float(loss_delta) * float(loss_delta)
     target_huber_is_linear = (loss_unreduced > huber_threshold) if log_huber_stats else None
 
@@ -357,8 +361,19 @@ def _run_new(args, mask, global_step, monkeypatch):
     acc = _FakeAccelerator()
     latents = torch.zeros(1, 4, 1, 4, 4)
     loss, metrics = masked_process_batch(
-        trainer, args, acc, "transformer", network, {"timesteps": None, "mask_weights": mask},
-        latents, torch.zeros_like(latents), None, torch.float32, torch.float32, None, global_step,
+        trainer,
+        args,
+        acc,
+        "transformer",
+        network,
+        {"timesteps": None, "mask_weights": mask},
+        latents,
+        torch.zeros_like(latents),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        global_step,
     )
     return loss, metrics, trainer
 
@@ -369,8 +384,18 @@ def _run_legacy(args, mask, global_step):
     acc = _FakeAccelerator()
     latents = torch.zeros(1, 4, 1, 4, 4)
     loss, metrics = _legacy_masked_process(
-        trainer, args, acc, "transformer", network, {"timesteps": None, "mask_weights": mask},
-        latents, torch.zeros_like(latents), None, torch.float32, torch.float32, global_step,
+        trainer,
+        args,
+        acc,
+        "transformer",
+        network,
+        {"timesteps": None, "mask_weights": mask},
+        latents,
+        torch.zeros_like(latents),
+        None,
+        torch.float32,
+        torch.float32,
+        global_step,
     )
     return loss, metrics, trainer
 
@@ -381,7 +406,9 @@ def _assert_parity(new, legacy):
     torch.testing.assert_close(new_loss, old_loss, atol=1e-6, rtol=0)
     assert new_metrics.keys() == old_metrics.keys(), f"telemetry key drift: {new_metrics.keys()} vs {old_metrics.keys()}"
     for key in old_metrics:
-        assert new_metrics[key] == pytest.approx(old_metrics[key], abs=1e-6), f"metric {key}: {new_metrics[key]} != {old_metrics[key]}"
+        assert new_metrics[key] == pytest.approx(old_metrics[key], abs=1e-6), (
+            f"metric {key}: {new_metrics[key]} != {old_metrics[key]}"
+        )
     # Same number of forwards + same block-swap restore count (no-grad teacher restore parity).
     assert new_trainer.call_count == old_trainer.call_count
     assert new_trainer.restore_calls == old_trainer.restore_calls

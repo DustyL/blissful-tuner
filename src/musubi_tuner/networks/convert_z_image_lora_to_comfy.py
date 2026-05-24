@@ -271,9 +271,7 @@ def main(args):
                 # Diagnostic only; does not affect the LoHa path above.
                 reconstructed = (U[:, :rank] * S[:rank].unsqueeze(0)) @ Vh[:rank, :]
                 rel_error = (combined.float() - reconstructed).norm() / combined.float().norm()
-                logger.info(
-                    f"  LoKr->LoRA QKV {lora_name_prefix}qkv: rank={rank}/{S.shape[0]}, relative error={rel_error:.6f}"
-                )
+                logger.info(f"  LoKr->LoRA QKV {lora_name_prefix}qkv: rank={rank}/{S.shape[0]}, relative error={rel_error:.6f}")
 
                 new_lora_name = lora_name_prefix + "qkv"
                 state_dict[f"{new_lora_name}.lora_up.weight"] = lora_up
