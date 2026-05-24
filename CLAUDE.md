@@ -505,15 +505,28 @@ canonical direct-kwargs pattern with pre-allocation guard assertions.
 
 ```bash
 --blocks_to_swap N            # Swap N blocks to CPU (max 39 for 14B)
---fp8_base                    # FP8 precision for DiT
+--fp8_base                    # FP8 for DiT. NOTE: alone = blunt full-model fp8 cast (norms/modulation
+                              #   included) → WAN 2.2's TP-03 guard rejects it. For WAN, PAIR with --fp8_scaled.
+--fp8_scaled                  # Per-layer scaled fp8 (requires --fp8_base): quantizes only .weight, excludes
+                              #   norm/modulation/embeddings. THIS is the working WAN fp8 path.
 --fp8_t5                      # FP8 for T5 encoder
 --gradient_checkpointing      # Enable gradient checkpointing
---offload_inactive_dit        # Offload inactive model (WAN 2.2)
+--offload_inactive_dit        # Offload inactive expert to CPU (WAN 2.2). MUTUALLY EXCLUSIVE with
+                              #   --blocks_to_swap (WAN asserts). Pick one memory strategy, not both.
 --rope_func comfy             # VRAM-efficient rope (good with --compile)
 --no_compact_time_embedding   # WAN 2.2: disable compact time embedding (default: enabled; saves multi-GiB at T2V training, no-op for I2V)
 --force_v2_1_time_embedding   # WAN 2.2: revert to Wan2.1-style modulation entirely (more aggressive than compact)
 --prefer_lycoris              # Use LyCORIS backend for LoRA merging (inference)
 ```
+
+**WAN 2.2 fp8 gotcha (cost a debug cycle during the v0.3.0 parity gate):** `--fp8_base` *alone* casts the
+whole DiT to fp8 — including `norm`/`modulation` params — and blissful's TP-03 guard
+(`wan_train_network.py`, fires when `args.fp8_base` and any norm/modulation param is fp8) correctly aborts
+the run. The intended WAN fp8 path is **`--fp8_base --fp8_scaled` together**: that sets `dit_weight_dtype=None`
+and routes through `optimize_state_dict_with_fp8`, which targets only `.weight` keys and honors
+`FP8_OPTIMIZATION_EXCLUDE_KEYS` (norm, modulation, embeddings, head). This is by design and identical across
+the v0.3.0 merge — not a regression. (For a 14B dual-expert run on a 32 GB card, also note `--blocks_to_swap`
+and `--offload_inactive_dit` cannot be combined; heavy `--blocks_to_swap` alone fits.)
 
 ### Block Swap Invariants
 
