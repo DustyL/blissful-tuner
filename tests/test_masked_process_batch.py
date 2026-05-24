@@ -14,6 +14,7 @@ during each forward, restore timing, telemetry key presence — not masked-loss 
 import argparse
 from contextlib import contextmanager
 
+import pytest
 import torch
 
 import blissful_tuner.mask_loss_process_batch as mpb
@@ -188,6 +189,34 @@ def test_base_prior_runs_teacher_then_student_with_restore():
     assert metrics.get("prior/teacher_mode_ema_used") == 0.0
 
 
+def test_block_swap_restore_runs_even_if_teacher_forward_raises():
+    """Regression (restore-in-finally): if the prior-teacher ``call_dit`` raises mid-forward,
+    the block-swap restore must STILL run — otherwise swapped blocks stay on CPU and the next
+    training forward crashes with "mat2 is on cpu". The restore lives in a ``finally`` so the
+    raising teacher path can't strand them. See [[project_block_swap_no_grad_invariant]]."""
+
+    class _RaisingTeacherTrainer(_FakeTrainer):
+        def call_dit(self, *args, **kwargs):
+            # Raise on the (first) teacher forward, before the student forward is reached.
+            self.call_dit_count += 1
+            raise RuntimeError("boom in teacher forward")
+
+    network = _FakeNetwork()
+    pred = torch.zeros(1, 4, 1, 4, 4)
+    target = torch.ones(1, 4, 1, 4, 4)
+    trainer = _RaisingTeacherTrainer(pred, target, network)
+    args = _args(prior_preservation_weight=1.0, prior_teacher_mode="base")
+    mask = torch.ones(1, 1, 1, 4, 4)
+    mask[..., 2:, :] = 0.0  # background region → need_prior True → teacher forward attempted
+
+    with pytest.raises(RuntimeError, match="boom in teacher forward"):
+        _run(trainer, network, args, mask)
+
+    assert trainer.call_dit_count == 1, "raised during the teacher forward, before the student forward"
+    assert trainer.restore_calls == 1, "block-swap restore must fire in finally even when the teacher raises"
+    assert network.enabled is True, "prior_model_context finally must re-enable the adapter despite the raise"
+
+
 def test_all_ones_mask_skips_teacher_forward():
     """Continuous-mode optimization: an all-ones mask has no prior region → teacher skipped."""
     network = _FakeNetwork()
@@ -216,8 +245,19 @@ def test_no_trackers_skips_telemetry_build():
     acc = _FakeAccelerator(with_trackers=False)
     latents = torch.zeros(1, 4, 1, 4, 4)
     loss, metrics = masked_process_batch(
-        trainer, args, acc, "transformer", network, _make_batch(mask), latents,
-        torch.zeros_like(latents), None, torch.float32, torch.float32, None, 10,
+        trainer,
+        args,
+        acc,
+        "transformer",
+        network,
+        _make_batch(mask),
+        latents,
+        torch.zeros_like(latents),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        10,
     )
 
     assert loss.ndim == 0 and torch.isfinite(loss)

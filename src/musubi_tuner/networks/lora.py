@@ -1740,12 +1740,21 @@ def create_network_from_weights(
             dim = max(value.shape)
             modules_dim[lora_name] = dim
 
+    # Module class / kwargs override (for LoKr/LoHa reuse of LoRANetwork). Respect the explicit
+    # parameters (upstream signature); fall back to kwargs for legacy keyword passing. (Merge fix:
+    # the old unconditional `kwargs.pop("module_kwargs", None)` silently discarded a caller-supplied
+    # `module_kwargs` bound to the named param — e.g. LoKr's {"factor": ...} from
+    # create_arch_network_from_weights — defeating _resolve_factor and forcing factor=-1 (automatic
+    # factorization) on reload, mismatching saved lokr_w1/lokr_w2 shapes. Mirrors the guard in
+    # create_network() above.)
     if module_class is None:
-        module_class = LoRAInfModule if for_inference else LoRAModule
-
-    # Allow caller to override module_class (for LoHa/LoKr)
-    module_class = kwargs.pop("module_class", module_class)
-    module_kwargs = kwargs.pop("module_kwargs", None)
+        module_class = kwargs.pop("module_class", LoRAInfModule if for_inference else LoRAModule)
+    else:
+        kwargs.pop("module_class", None)
+    if module_kwargs is None:
+        module_kwargs = kwargs.pop("module_kwargs", None)
+    else:
+        kwargs.pop("module_kwargs", None)
     if isinstance(module_kwargs, str):
         module_kwargs = ast.literal_eval(module_kwargs)
     if module_kwargs is not None and not isinstance(module_kwargs, dict):

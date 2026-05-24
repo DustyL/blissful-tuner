@@ -635,6 +635,7 @@ The mask loss system (`src/musubi_tuner/modules/mask_loss.py`) is a key differen
 - **Compact mask representation**: Masks are kept as `(B,1,F,H,W)` and broadcast against `(B,C,F,H,W)` loss tensors. Weight sums are multiplied by `num_channels` to compensate. This saves VRAM.
 - **Prior mask non-overlap (threshold mode)**: When `prior_mask_threshold` is set, the target mask is zeroed wherever the prior mask applies (`mask_processed *= (1 - prior_mask)`), preventing double-counting.
 - **EMA teacher (graph-safe)**: `LoRAEmaTeacher` uses in-place parameter swap to avoid creating new tensors, making it compatible with `torch.compile` graphs. Initialized after warmup to avoid step-0 adapter noise.
+- **`compute_loss_weighting_for_sd3` MUST keep its `n_dim=` parameter** (`training/timesteps.py:53`). Upstream's version hardcodes `n_dim=5`; blissful threads the *actual loss-tensor rank* (`n_dim=loss.ndim` in base `compute_loss`, `loss_unreduced.ndim` in `masked_process_batch`, full-FT loops) so 4D image-model sigma weighting is correct (`sigma_sqrt`/`cosmap` schemes differ by rank). This silently regressed during the v0.3.0 merge (upstream's signature was spliced in, dropping the param) and is guarded by `tests/test_loss_weighting_ndim.py` — **never retire that test; re-restore `n_dim=` on every future upstream merge.** Weighting is deferred until after the unreduced loss so the rank is known; this is numerically identical (weighting depends only on scheme/scheduler/timesteps/device/dtype).
 
 ### Known Limitations
 - **Prior preservation not supported for `layout="layered"`**: Raises `NotImplementedError`. Affects Qwen-Image edit mode with prior preservation.
@@ -732,6 +733,13 @@ training-time measurement.
   invariant to check. Workaround: keep the whole-module call, split the
   *output* tensor afterward (the per-tensor downstream norm/RoPE wins still
   apply).
+
+## Upstream Merge Workflow
+
+blissful-tuner is a heavily-diverged fork (~1300 commits ahead of `kohya-ss/musubi-tuner`). The v0.3.0 merge strategy + analyses live in `docs/plans/2026-05-23-refactor-*.md`. Two hard-won lessons from that merge:
+
+- **Splice bugs are the dominant failure mode — and they compile.** When resolving conflicts "keep ours," the recurring trap is upstream's *changed lines* landing on blissful's *variable names / function bodies*: the file compiles and often passes a quick smoke, but misbehaves at runtime. The v0.3.0 merge produced ~7 of these (e.g. `convert_lora.py` referencing an unassigned `estimated_type`; `create_network` / `create_network_from_weights` `kwargs.pop("module_kwargs", ...)` clobbering an explicit param → LoKr `factor` lost; `cache_io.py` missing `import glob`; a duplicate `detect_network_type` last-wins shadow). **When porting any conflict that touches a function signature, verify the *body* still reads the params it was given** — don't trust `py_compile`. Behavior tests (not import tests) are what catch these.
+- **After a multi-session merge, the index holds conflict-resolution-time file versions.** Edits made *after* `git add`-ing a file during resolution are unstaged and silently dropped by a commit-from-index. Before the final atomic merge commit: `git add -u` (stages tracked mods, leaves untracked alone), then for each substantively re-edited file `git show HEAD:<file> | grep <session-edit-marker>` to confirm your edits actually landed (expect non-zero matches). Amend with `git commit --amend -F msg` (preserves merge parents).
 
 ## Blissful Logger
 

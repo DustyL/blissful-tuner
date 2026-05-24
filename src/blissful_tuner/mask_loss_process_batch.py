@@ -275,19 +275,18 @@ def masked_process_batch(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
                     prior_pred_raw = prior_output.pred
-                # Block swap relies on backward hooks to return CPU blocks to GPU; the no-grad teacher
-                # forward skips them, so restore explicitly before the student forward. See
-                # [[project_block_swap_no_grad_invariant]].
-                self.restore_block_swap_after_no_grad_forward(accelerator, transformer)
             prior_pred = prior_pred_raw.detach()
         finally:
+            # Block swap relies on backward hooks to return CPU blocks to GPU; the no-grad teacher
+            # forward skips them, so restore explicitly before the student forward. In `finally` so a
+            # raising call_dit can't strand blocks on CPU and crash the next forward ("mat2 is on cpu").
+            # See [[project_block_swap_no_grad_invariant]]. The restore is a no-op when block swap is off.
+            self.restore_block_swap_after_no_grad_forward(accelerator, transformer)
             if prior_teacher_eval and transformer_was_training:
                 transformer.train()
 
     # --- Student forward (LoRA enabled, gradients flow) ---
-    output = self.call_dit(
-        args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
-    )
+    output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
     model_pred, target = output.pred, output.target
 
     loss_type = getattr(args, "loss_type", "mse")
