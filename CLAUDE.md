@@ -701,14 +701,19 @@ training-time measurement.
   were neutral. Revisit only if the production path changes materially — e.g.
   `compile=false`, a different Torch / Inductor stack, or a different
   model/kernel mix. Receipts in PR #4 (merged) + the local ab_gate artifacts.
+  The rejected Liger integration + perf micro-tweaks are archived at tag
+  `archive/flux2-liger-rejected` (formerly local branch
+  `feat/flux2-liger-integration`, deleted 2026-05-27); the branch's
+  LoRA-invariant tests + the `rank_dropout` mask-shape fix did land via PR #4.
 
 - **xzuyn-optimizations round 2** (2026-05-20): rejected. Per-tensor
   norm/RoPE + early `del pe` + fresh-temporary in-place modulation produced
   0 MB per-block peak savings vs. main at Klein-9B production shape (batch=3,
   img_seq=4096, txt_seq=512, with-DoRA, gradient_checkpointing). PyTorch's
   CUDA caching allocator already reuses freed slots from short-lived
-  intermediates, so the targeted slack didn't exist. Branch
-  `perf/flux2-xzuyn-round2` kept as historical artifact; the xformers gate
+  intermediates, so the targeted slack didn't exist. The round-2 work is
+  archived at tag `archive/flux2-xzuyn-round2-rejected` (formerly branch
+  `perf/flux2-xzuyn-round2`, deleted 2026-05-27); the xformers gate
   fix + measurement harness salvaged to main (commit `ea3e1e9`). xzuyn's
   rank_dropout bug fix independently converged on our prior fix (`5f78160`);
   one data point — not yet a reliable confirmatory pattern.
