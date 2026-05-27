@@ -5,6 +5,8 @@ on:
     branches:
       - main
   push:
+    branches:
+      - main
     paths:
       - "src/musubi_tuner/**/*.py"
       - "src/musubi_tuner/**/*.pth"
