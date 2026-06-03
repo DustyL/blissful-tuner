@@ -1,8 +1,13 @@
 # Unified attention function supporting various implementations
 
+import os
 from dataclasses import dataclass
 import torch
 from typing import Optional, Union
+
+from blissful_tuner.blissful_logger import BlissfulLogger
+
+logger = BlissfulLogger(__name__, "green")
 
 try:
     import flash_attn
@@ -39,6 +44,79 @@ except ImportError:
     CUTE_AVAILABLE = False
     cute_flash_attn_func = None
     cute_flash_attn_varlen_func = None
+
+
+# ---------------------------------------------------------------------------
+# Blackwell cuDNN-SDPA guard
+#
+# cuDNN's fused attention (mha_graph) backward produces NaN / crashes during
+# *training* on Blackwell-family GPUs — observed on B300 (sm_103) and reported on
+# consumer sm_12x (RTX 5090 / RTX Pro 6000). PyTorch's SDPA dispatcher
+# (attn_mode="torch") can auto-select the cuDNN backend, so we disable *only that
+# backend* process-wide on Blackwell. FLASH / mem-efficient / math remain — and on
+# sm_120 FLASH is both healthy and the fastest path measured, so excluding cuDNN is
+# ~free there (it is crash-avoidance, not a speedup, on the data-center cards).
+#
+# Mechanism note: this flips the process-global torch.backends.cuda.enable_cudnn_sdp
+# toggle at import (read by the SDPA dispatcher at torch.compile time — no graph
+# break) rather than wrapping each call in an sdpa_kernel() context manager (which
+# would sit inside the compiled FLUX.2 region). The global also covers raw SDPA
+# call sites outside this module (FLUX.2 VAE attention, HV1.5, Z-Image).
+#
+# Opt out with BLISSFUL_ALLOW_CUDNN_SDP=1 (e.g. to benchmark, or once a future cuDNN
+# fixes the backward).
+# ---------------------------------------------------------------------------
+
+# Compute-capability majors for the Blackwell family: 10 = data-center
+# (B200 sm_100 / B300 sm_103), 12 = consumer/workstation (sm_120). Hopper (sm_90)
+# and earlier are unaffected and keep the cuDNN SDPA backend.
+_BLACKWELL_SDP_MAJORS = (10, 12)
+
+
+def _should_disable_cudnn_sdp(capability_major: Optional[int], *, allow_override: bool) -> bool:
+    """Pure decision: should the cuDNN SDPA backend be disabled on this device?
+
+    Returns True only on Blackwell-family GPUs when not overridden. ``capability_major``
+    is ``None`` when CUDA is unavailable (→ no guard). Kept side-effect-free so it can
+    be unit-tested without a GPU.
+    """
+    if allow_override:
+        return False
+    if capability_major is None:
+        return False
+    return capability_major in _BLACKWELL_SDP_MAJORS
+
+
+def _apply_blackwell_sdp_guard() -> bool:
+    """Disable the cuDNN SDPA backend process-wide on Blackwell. Returns True if applied."""
+    allow_override = os.environ.get("BLISSFUL_ALLOW_CUDNN_SDP", "0") == "1"
+    try:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+        else:
+            major = minor = None
+    except Exception:
+        major = minor = None
+
+    if not _should_disable_cudnn_sdp(major, allow_override=allow_override):
+        return False
+    if not hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        return False
+
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    try:
+        device_name = torch.cuda.get_device_name()
+    except Exception:
+        device_name = "unknown"
+    logger.info(
+        f"Blackwell GPU detected ({device_name}, sm_{major}{minor}) — disabling cuDNN SDPA backend "
+        "(buggy attention backward on Blackwell). FLASH / mem-efficient / math remain. "
+        "Set BLISSFUL_ALLOW_CUDNN_SDP=1 to re-enable cuDNN."
+    )
+    return True
+
+
+_BLACKWELL_SDP_GUARD_APPLIED = _apply_blackwell_sdp_guard()
 
 
 @torch.compiler.disable
