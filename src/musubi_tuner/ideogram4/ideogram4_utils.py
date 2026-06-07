@@ -6,10 +6,12 @@ from typing import Optional, Union
 
 import torch
 from accelerate import init_empty_weights
+from safetensors import safe_open
 from tqdm import tqdm
 
 from blissful_tuner.blissful_logger import BlissfulLogger
 from musubi_tuner.flux_2 import flux2_utils
+from musubi_tuner.ideogram4 import constants as ideogram4_constants
 from musubi_tuner.ideogram4.latent_norm import latent_denorm, latent_norm
 from musubi_tuner.ideogram4.modeling_ideogram4 import Ideogram4Config, Ideogram4Transformer
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
@@ -20,6 +22,7 @@ logger = BlissfulLogger(__name__, "green")
 
 _FP8_DTYPES = tuple(d for d in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)) if d is not None)
 IDEOGRAM4_PATCH_SIZE = 2
+IDEOGRAM4_TOKEN_CHANNELS = 128  # VAE z_channels (32) * patch_size**2 (4): the patchified DiT token channels
 
 
 @dataclass
@@ -269,11 +272,11 @@ def decode_raw_vae_tokens_to_pixels(
 
 
 # Cache-writer convention: the ONLY sanctioned producer of DiT-ready (normalized) latents is
-# encode_pixels_to_dit_tokens. A cache writer must stamp this key so a reader can tell training-ready
-# latents from raw ones. This is a CONVENTION guard, not cryptographic proof (a tensor can't prove it
-# was normalized) — but it forces the writer to consciously assert normalization and lets a reader reject
-# raw caches. The real enforcement lands when ideogram4_cache_latents.py is built.
-LATENT_NORM_METADATA_KEY = "ideogram4_latent_norm_applied"
+# encode_pixels_to_dit_tokens / encode_pixels_to_latent_grid. A cache writer stamps this key so a reader can
+# tell training-ready latents from raw ones. This is a CONVENTION guard, not cryptographic proof (a tensor
+# can't prove it was normalized) — but it forces the writer to assert normalization and lets a reader reject
+# raw/stale/fork caches via preflight_ideogram4_latent_cache (the shared bucket.py reader ignores metadata).
+LATENT_NORM_METADATA_KEY = ideogram4_constants.IDEOGRAM4_LATENT_NORM_METADATA_KEY
 
 
 def encode_pixels_to_dit_tokens(ae: torch.nn.Module, pixels: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -306,13 +309,87 @@ def decode_dit_tokens_to_pixels(ae: torch.nn.Module, tokens: torch.Tensor, *, gr
 
 
 def assert_latent_norm_applied(metadata: dict) -> None:
-    """Cache-writer guard: refuse to persist Ideogram latents that were not produced by the sanctioned
-    normalized path. The writer must set ``metadata[LATENT_NORM_METADATA_KEY] == "true"`` (only warranted
-    for tokens from encode_pixels_to_dit_tokens). Catches the most likely mistake: caching raw encoder
-    output (encode_pixels_to_raw_vae_tokens) as if it were training-ready.
+    """Guard: refuse Ideogram latents not produced by the sanctioned normalized path. The cache metadata
+    must carry ``LATENT_NORM_METADATA_KEY == "true"`` (only warranted for encode_pixels_to_dit_tokens /
+    encode_pixels_to_latent_grid output). Catches the most likely mistake: a raw encoder grid
+    (encode_pixels_to_raw_vae_tokens) cached as if it were training-ready.
     """
     if metadata.get(LATENT_NORM_METADATA_KEY) != "true":
         raise ValueError(
             f"Ideogram 4 latent cache must set {LATENT_NORM_METADATA_KEY}='true': latents must come from "
-            "encode_pixels_to_dit_tokens (latent_norm applied), not the raw VAE helpers."
+            "encode_pixels_to_dit_tokens / encode_pixels_to_latent_grid (latent_norm applied), not raw helpers."
         )
+
+
+def encode_pixels_to_latent_grid(ae: torch.nn.Module, pixels: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """Encode [0, 1] pixels to the cache-ready NORMALIZED token GRID ``(B, 128, gh, gw)`` + grid dims.
+
+    This is what ideogram4_cache_latents persists, under blissful's native key ``latents_{gh}x{gw}_{dtype}``
+    (grid-native, channel-first like flux_2's (C, H, W)). It is encode_pixels_to_dit_tokens reshaped from
+    (B, L, 128) back to channel-first grid. The grid is ALREADY patchified (128-ch) and latent_norm'd; the
+    trainer must use grid_to_dit_tokens (flatten only) — NEVER patchify_vae_latents or latent_norm again.
+    """
+    tokens, grid_h, grid_w = encode_pixels_to_dit_tokens(ae, pixels)  # (B, L, 128), normalized
+    batch_size = tokens.shape[0]
+    grid = tokens.reshape(batch_size, grid_h, grid_w, IDEOGRAM4_TOKEN_CHANNELS).permute(0, 3, 1, 2).contiguous()
+    return grid, grid_h, grid_w
+
+
+def grid_to_dit_tokens(grid: torch.Tensor) -> torch.Tensor:
+    """Trainer-side inverse of the cache grid: ``(B, 128, gh, gw)`` -> DiT tokens ``(B, L, 128)``.
+
+    Flatten ONLY. The cache grid is already patchified and latent_norm'd, so the trainer must not call
+    patchify_vae_latents (would re-fold to 512-ch: the B3 bug) or latent_norm (double-normalize) again.
+    """
+    if grid.ndim != 4 or grid.shape[1] != IDEOGRAM4_TOKEN_CHANNELS:
+        raise ValueError(f"expected ideogram latent grid (B, {IDEOGRAM4_TOKEN_CHANNELS}, gh, gw), got {tuple(grid.shape)}")
+    batch_size, channels, grid_h, grid_w = grid.shape
+    return grid.permute(0, 2, 3, 1).reshape(batch_size, grid_h * grid_w, channels)
+
+
+def preflight_ideogram4_latent_cache(latent_cache_path: str) -> None:
+    """Reader-side guard: reject stale / raw / fork-format Ideogram latent caches BEFORE training.
+
+    blissful's shared latent reader (bucket.py) loads tensors via load_file() and NEVER inspects safetensors
+    metadata, so the writer's flags are invisible at read time. This preflight opens the file and enforces the
+    grid-native normalized contract on BOTH metadata and the tensor itself, so copied/stale metadata can't
+    approve a semantically wrong file. Call it during dataset/cache validation or before the first training
+    step — write-time guarding alone misses old or foreign caches.
+    """
+    with safe_open(latent_cache_path, framework="pt") as f:
+        metadata = f.metadata() or {}
+        latent_keys = [k for k in f.keys() if k.startswith("latents_")]
+        shapes = {k: tuple(f.get_slice(k).get_shape()) for k in latent_keys}
+
+    def _fail(reason: str) -> None:
+        raise ValueError(f"Ideogram 4 latent cache {latent_cache_path}: {reason}")
+
+    # 1) Metadata contract: norm applied, grid layout, dit-token space.
+    assert_latent_norm_applied(metadata)
+    layout = metadata.get(ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_KEY)
+    if layout != ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_GRID_CHW:
+        _fail(
+            f"expected {ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_KEY}="
+            f"{ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_GRID_CHW}, got {layout!r} — stale/raw/fork cache?"
+        )
+    space = metadata.get(ideogram4_constants.IDEOGRAM4_LATENT_SPACE_KEY)
+    if space != ideogram4_constants.IDEOGRAM4_LATENT_SPACE_DIT_TOKENS:
+        _fail(
+            f"expected {ideogram4_constants.IDEOGRAM4_LATENT_SPACE_KEY}="
+            f"{ideogram4_constants.IDEOGRAM4_LATENT_SPACE_DIT_TOKENS}, got {space!r}"
+        )
+
+    # 2) Tensor contract: exactly one latents_* tensor, shaped (128, gh, gw), with the key's gh/gw matching.
+    if len(latent_keys) != 1:
+        _fail(f"expected exactly one latents_* tensor, got {sorted(latent_keys)}")
+    key = latent_keys[0]
+    shape = shapes[key]
+    if len(shape) != 3 or shape[0] != IDEOGRAM4_TOKEN_CHANNELS:
+        _fail(f"expected latent grid ({IDEOGRAM4_TOKEN_CHANNELS}, gh, gw), got tensor shape {shape} for {key}")
+    reso = key[len("latents_") :].split("_", 1)[0]  # "{gh}x{gw}" from latents_{gh}x{gw}_{dtype}
+    try:
+        key_gh, key_gw = (int(x) for x in reso.split("x"))
+    except ValueError:
+        _fail(f"malformed latent key {key!r} (expected latents_{{gh}}x{{gw}}_{{dtype}})")
+    if (key_gh, key_gw) != (shape[1], shape[2]):
+        _fail(f"key {key!r} grid {key_gh}x{key_gw} != tensor grid {shape[1]}x{shape[2]}")

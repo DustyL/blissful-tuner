@@ -299,10 +299,37 @@ cache-writer assertion.
 > **RESOLVED**: use the VAE **mean** (chunk[0]) — the fork's *training* cache path confirms it
 > (`ideogram4_autoencoder.py:337`), and it's guarded by a determinism/mean test. 9 tests (20 total).
 
-Remaining Phase 2: `ideogram4_cache_latents` + `ideogram4_cache_text_encoder_outputs` (53,248-dim, fp8-key
-fixed, caption verifier warn-only); cache_io by intent per §7; wire `assert_latent_norm_applied` into the
-cache writer. Exit: cache→load round-trip on a **real** `encode()` shape (guards B3) **plus** an assertion
-that raw tokens can't be cached as training-ready.
+> **`ideogram4_cache_latents` — LANDED 2026-06-07.** Grid-native persistence contract (chosen over flattened
+> `(L,128)` because blissful's reader is grid-native and metadata-blind): cache stores the already-patchified +
+> `latent_norm`'d DiT-token **grid `(128, gh, gw)`** under the native key `latents_{gh}x{gw}_{dtype}`, so
+> `bucket.py` loads it **unchanged**. Metadata flags (`ideogram4_latent_norm_applied=true`,
+> `latent_layout=grid_chw`, `latent_space=ideogram4_dit_tokens`) mark it training-ready. Because the shared
+> reader ignores metadata, an arch-specific **`preflight_ideogram4_latent_cache`** enforces the contract before
+> training on BOTH metadata (norm/layout/space) **and the tensor** (exactly one `latents_*`, shape `(128,gh,gw)`,
+> key `gh×gw` matching the tensor — so copied/stale metadata can't approve a wrong file) — write-time guarding
+> alone misses stale/raw/fork caches. Trainer uses **`grid_to_dit_tokens` (flatten only)** — never `patchify`
+> (B3) or `latent_norm` again. **Mask-loss contract:** the cache is RGB-only (`supports_alpha=False`, no
+> `mask_weights`), so `ideogram4_train_network` must **reject `--use_mask_loss` at setup validation** until mask
+> caching exists — never silently train unmasked. cache_io grafted **by intent** per §7: `extra_metadata` param added to
+> `save_latent_cache_common` (kept the guarded NaN check + contiguity); other arches verified **byte-identical**
+> (no `ideogram4_` key leak). Registration additive (`architectures.py`, `bucket.py` steps=16). VAE **mean**
+> (chunk[0]). Validated: 6 cache tests + a real-image round-trip (grid→flatten **maxerr 0.0000** vs DiT tokens).
+> 26 tests total.
+
+Remaining Phase 2 — `ideogram4_cache_text_encoder_outputs` (53,248-dim). Front-load the fixes per second review:
+- **H5 (do FIRST, as shared infra not Ideogram-only):** the `bucket.py` key normalizer uses `rsplit("_",1)` to
+  strip the dtype, which mangles multi-underscore dtype names like `float8_e4m3fn`. Replace with a **dtype-aware
+  suffix stripper** (match against the known dtype strings, **longest-first**), and test both a normal key and a
+  `…_float8_e4m3fn` key. This unblocks the fp8 text cache (the only way the 53k-dim cache is affordable).
+- **H6 (offline, annoyingly explicit):** require a local tokenizer/TE path (or local fallback), `local_files_only=True`,
+  **no** remote repo fallback, **no** network `trust_remote_code`; if remote-code classes are unavoidable, resolve
+  them from the cloned local Ideogram/Qwen code only, with a test that monkeypatches HF/network calls and proves
+  the cache command still initializes from local paths.
+- **H4:** caption verification defaults to **warn-only**; "strict verifier" is an opt-in validation mode, never a
+  default cache requirement (don't brick plain-`.txt` LoRA datasets).
+- cache_io text-encoder graft **by intent** per §7 (keep blissful's guarded NaN check; do not patch-apply the fork's
+  unguarded `isnan`). Then wire `preflight_ideogram4_latent_cache` into trainer/dataset validation; then minimal
+  generate + t-schedule parity.
 
 **Phase 3 — Training.** `ideogram4_train_network` subclassing `NetworkTrainer` with zimage/flux_2-shaped
 `process_batch`, canonical t-convention, blissful flow-matching knobs. `--use_mask_loss` either fully wired
