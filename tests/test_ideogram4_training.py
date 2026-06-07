@@ -59,8 +59,14 @@ def test_training_step_backward_on_real_tiny_model():
     # AdaLN, llm_features projection) must be differentiable and the MSE loss must backprop to the weights.
     # mrope_section[h/w] must be > 0 and *3 <= inv_freq_size (head_dim/2 = 8 here); (2,2,2) is valid.
     cfg = Ideogram4Config(
-        emb_dim=32, num_layers=2, num_heads=2, intermediate_size=48,
-        adanln_dim=16, in_channels=128, llm_features_dim=16, mrope_section=(2, 2, 2),
+        emb_dim=32,
+        num_layers=2,
+        num_heads=2,
+        intermediate_size=48,
+        adanln_dim=16,
+        in_channels=128,
+        llm_features_dim=16,
+        mrope_section=(2, 2, 2),
     )
     model = Ideogram4Transformer(cfg)  # real (random) weights on CPU
     latents = torch.randn(1, 128, 2, 2)

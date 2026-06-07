@@ -32,8 +32,7 @@ def neutralize_unused_fp8_args(args) -> bool:
     had = bool(getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False))
     if had:
         logger.warning(
-            "Ideogram 4 loads fp8 weights via its pre-quantized shim; --fp8_base/--fp8_scaled have no effect "
-            "here and are ignored."
+            "Ideogram 4 loads fp8 weights via its pre-quantized shim; --fp8_base/--fp8_scaled have no effect here and are ignored."
         )
     args.fp8_base = False
     args.fp8_scaled = False
