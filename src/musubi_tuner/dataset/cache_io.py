@@ -12,11 +12,16 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_FLUX_KONTEXT_FULL,
     ARCHITECTURE_HUNYUAN_VIDEO_FULL,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL,
+    ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
 )
+
+# Leaf-module import (ideogram4/__init__ is trivial; ideogram4.constants imports nothing): safe here even
+# though importing ideogram4_utils would cycle (it -> flux2_utils -> image_video_dataset -> cache_io).
+from musubi_tuner.ideogram4 import constants as ideogram4_constants
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str
 
@@ -187,6 +192,28 @@ def save_latent_cache_flux_2(
     save_latent_cache_common(item_info, sd, arch_full)
 
 
+def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor, arch_full: str = ARCHITECTURE_IDEOGRAM4_FULL):
+    """Ideogram 4: persist the already-patchified + latent_norm'd DiT-token GRID as (128, gh, gw) under the
+    native key latents_{gh}x{gw}_{dtype}, so blissful's grid-native reader loads it unchanged. The trainer
+    flattens (ideogram4_utils.grid_to_dit_tokens) and must NOT patchify or latent_norm again. Metadata flags
+    mark it training-ready; the shared reader ignores metadata, so an Ideogram-specific preflight
+    (ideogram4_utils.preflight_ideogram4_latent_cache) enforces them before training.
+    """
+    assert latent.dim() == 3 and latent.shape[0] == 128, (
+        f"Ideogram 4 latent must be the (128, gh, gw) token grid, got {tuple(latent.shape)}"
+    )
+    _, gh, gw = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{gh}x{gw}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    extra_metadata = {
+        ideogram4_constants.IDEOGRAM4_LATENT_NORM_METADATA_KEY: "true",
+        ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_KEY: ideogram4_constants.IDEOGRAM4_LATENT_LAYOUT_GRID_CHW,
+        ideogram4_constants.IDEOGRAM4_LATENT_SPACE_KEY: ideogram4_constants.IDEOGRAM4_LATENT_SPACE_DIT_TOKENS,
+    }
+    save_latent_cache_common(item_info, sd, arch_full, extra_metadata=extra_metadata)
+
+
 def save_latent_cache_qwen_image(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -346,7 +373,9 @@ def save_latent_cache_z_image(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_latent_cache_common(
+    item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, extra_metadata: Optional[dict[str, str]] = None
+):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
@@ -377,6 +406,11 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
             if torch.isnan(value).any():
                 logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replacing NaN with 0")
                 value[torch.isnan(value)] = 0
+
+    # Architecture-specific metadata (additive). Empty/None for every existing arch => byte-identical
+    # metadata; only Ideogram 4 currently passes it (latent_norm_applied / latent_layout / latent_space).
+    if extra_metadata:
+        metadata.update(extra_metadata)
 
     latent_dir = os.path.dirname(item_info.latent_cache_path)
     os.makedirs(latent_dir, exist_ok=True)
@@ -410,6 +444,22 @@ def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor)
     sd[f"varlen_{text_encoder_type}_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_text_encoder_output_cache_ideogram4(item_info: ItemInfo, features: torch.Tensor):
+    """Ideogram 4: store the per-prompt (L, 53248) Qwen3-VL conditioning features as a VARLEN text cache.
+
+    Key is `varlen_i4_llm_features_{dtype}`: the `varlen_` prefix keeps it unstacked (per-prompt L varies),
+    and the reader strips the dtype via the H5 dtype-aware stripper (so a `float8_e4m3fn` cache reads back as
+    `i4_llm_features`, not `i4_llm_features_float8`). Goes through the shared common writer (guarded NaN check
+    intact — no §7 splice).
+    """
+    assert features.dim() == 2 and features.shape[1] == ideogram4_constants.IDEOGRAM4_TE_FEATURE_DIM, (
+        f"Ideogram 4 text features must be (L, {ideogram4_constants.IDEOGRAM4_TE_FEATURE_DIM}), got {tuple(features.shape)}"
+    )
+    dtype_str = dtype_to_str(features.dtype)
+    sd = {f"varlen_i4_llm_features_{dtype_str}": features.detach().cpu().contiguous()}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)
 
 
 def save_text_encoder_output_cache_framepack(

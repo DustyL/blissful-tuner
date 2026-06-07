@@ -94,6 +94,54 @@ def dtype_to_str(dtype: torch.dtype) -> str:
     return dtype_name
 
 
+# Cache keys are formatted "{stem}_{dtype_to_str(dtype)}". Several dtype names contain underscores
+# (float8_e4m3fn, float8_e5m2, the *uz variants), so a naive rsplit("_", 1) mangles them into "...float8".
+# Match known dtype suffixes LONGEST-FIRST instead. Built from torch dtypes, getattr-guarded for older builds.
+_CACHE_DTYPE_STRINGS = sorted(
+    {
+        dtype_to_str(d)
+        for d in (
+            getattr(torch, name, None)
+            for name in (
+                "float64",
+                "float32",
+                "float16",
+                "bfloat16",
+                "float8_e4m3fn",
+                "float8_e5m2",
+                "float8_e4m3fnuz",
+                "float8_e5m2fnuz",
+                "int8",
+                "int16",
+                "int32",
+                "int64",
+                "uint8",
+                "bool",
+                "complex32",
+                "complex64",
+                "complex128",
+            )
+        )
+        if d is not None
+    },
+    key=len,
+    reverse=True,
+)
+
+
+def strip_dtype_suffix(key: str) -> str:
+    """Strip a trailing ``_<dtype>`` suffix from a cache key, matching known dtype strings LONGEST-FIRST.
+
+    Robust to multi-underscore dtype names (e.g. ``float8_e4m3fn``) that a naive ``rsplit("_", 1)`` would
+    mangle into ``"...float8"``. Returns the key unchanged if it carries no recognized dtype suffix.
+    """
+    for dtype_str in _CACHE_DTYPE_STRINGS:
+        suffix = "_" + dtype_str
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
 def str_to_dtype(s: Optional[str], default_dtype: Optional[torch.dtype] = None) -> torch.dtype:
     """
     Convert a string to a torch.dtype

@@ -16,6 +16,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_FLUX_KONTEXT,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
+    ARCHITECTURE_IDEOGRAM4,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
@@ -24,6 +25,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_Z_IMAGE,
 )
 from musubi_tuner.dataset.media_utils import divisible_by
+from musubi_tuner.utils.model_utils import strip_dtype_suffix
 
 if TYPE_CHECKING:
     from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -44,6 +46,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_IDEOGRAM4 = 16  # FLUX.2 VAE (/8) * patch_size (2) = /16
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -59,6 +62,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_IDEOGRAM4: RESOLUTION_STEPS_IDEOGRAM4,
     }
 
     def __init__(
@@ -260,7 +264,7 @@ class BucketBatchManager:
                     # Legacy FLUX.2 caches briefly wrote this key without a dtype suffix.
                     pass
                 else:
-                    content_key = content_key.rsplit("_", 1)[0]  # remove dtype
+                    content_key = strip_dtype_suffix(content_key)  # remove dtype (handles float8_e4m3fn etc.)
                     if content_key.startswith("latents_"):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
                     elif content_key.startswith("mask_weights_"):
