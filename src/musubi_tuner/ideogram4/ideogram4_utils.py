@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from blissful_tuner.blissful_logger import BlissfulLogger
 from musubi_tuner.flux_2 import flux2_utils
+from musubi_tuner.ideogram4.latent_norm import latent_denorm, latent_norm
 from musubi_tuner.ideogram4.modeling_ideogram4 import Ideogram4Config, Ideogram4Transformer
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.device_utils import synchronize_device
@@ -265,3 +266,53 @@ def decode_raw_vae_tokens_to_pixels(
     z = unpatchify_vae_latents(tokens, grid_h=grid_h, grid_w=grid_w).to(device=ae.device, dtype=ae.dtype)
     decoded = ae.decoder(z)
     return ((decoded.float().clamp(-1.0, 1.0) + 1.0) * 0.5).clamp_(0.0, 1.0)
+
+
+# Cache-writer convention: the ONLY sanctioned producer of DiT-ready (normalized) latents is
+# encode_pixels_to_dit_tokens. A cache writer must stamp this key so a reader can tell training-ready
+# latents from raw ones. This is a CONVENTION guard, not cryptographic proof (a tensor can't prove it
+# was normalized) — but it forces the writer to consciously assert normalization and lets a reader reject
+# raw caches. The real enforcement lands when ideogram4_cache_latents.py is built.
+LATENT_NORM_METADATA_KEY = "ideogram4_latent_norm_applied"
+
+
+def encode_pixels_to_dit_tokens(ae: torch.nn.Module, pixels: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """Encode [0, 1] pixels to DiT-ready NORMALIZED tokens. The sanctioned training-ready path.
+
+    pixels[0,1] -> raw AE encoder mean (32ch) -> patchify to (pi,pj,c) 128ch -> flatten to (B, L, 128)
+    channel-last -> latent_norm. Returns ``(tokens[B, L, 128], grid_h, grid_w)``; grid dims are required to
+    invert (decode_dit_tokens_to_pixels) and to build DiT position ids.
+
+    Training convention (mean, RESOLVED): uses the VAE posterior MEAN (chunk[0]) — never a reparameterized
+    sample. Confirmed against the fork's TRAINING cache path (ideogram4_cache_latents.py -> encode ->
+    chunk(moments, 2)[0] at ideogram4_autoencoder.py:337). Canonical is inference-only so cannot confirm,
+    but mean is the intended training-encode convention. Guarded by
+    test_encode_dit_tokens_uses_posterior_mean_not_sample.
+    """
+    grid = encode_pixels_to_raw_vae_tokens(ae, pixels)  # (B, 128, gh, gw), pre-norm
+    batch_size, channels, grid_h, grid_w = grid.shape
+    tokens = grid.permute(0, 2, 3, 1).reshape(batch_size, grid_h * grid_w, channels)  # (B, L, 128) channel-last
+    return latent_norm(tokens), grid_h, grid_w
+
+
+def decode_dit_tokens_to_pixels(ae: torch.nn.Module, tokens: torch.Tensor, *, grid_h: int, grid_w: int) -> torch.Tensor:
+    """Inverse of encode_pixels_to_dit_tokens: latent_denorm -> unpatchify -> raw decoder -> [0, 1] pixels.
+
+    ``tokens`` are normalized DiT tokens (B, L, 128); denorm returns them to raw AE latent space before
+    the raw decoder (which must never see normalized tokens).
+    """
+    raw_tokens = latent_denorm(tokens)
+    return decode_raw_vae_tokens_to_pixels(ae, raw_tokens, grid_h=grid_h, grid_w=grid_w)
+
+
+def assert_latent_norm_applied(metadata: dict) -> None:
+    """Cache-writer guard: refuse to persist Ideogram latents that were not produced by the sanctioned
+    normalized path. The writer must set ``metadata[LATENT_NORM_METADATA_KEY] == "true"`` (only warranted
+    for tokens from encode_pixels_to_dit_tokens). Catches the most likely mistake: caching raw encoder
+    output (encode_pixels_to_raw_vae_tokens) as if it were training-ready.
+    """
+    if metadata.get(LATENT_NORM_METADATA_KEY) != "true":
+        raise ValueError(
+            f"Ideogram 4 latent cache must set {LATENT_NORM_METADATA_KEY}='true': latents must come from "
+            "encode_pixels_to_dit_tokens (latent_norm applied), not the raw VAE helpers."
+        )

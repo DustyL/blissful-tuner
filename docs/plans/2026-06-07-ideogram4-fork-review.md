@@ -287,11 +287,22 @@ The raw helpers (`encode_pixels_to_raw_vae_tokens` / `decode_raw_vae_tokens_to_p
 **pre-`latent_norm`** tokens (docstring-warned in 1.5). The guard: a cache writer must **refuse** raw-token
 output unless normalization has been applied — enforce via (a) distinct names (`…_raw_vae_tokens` vs
 `encode_pixels_to_dit_tokens`), **and** (b) cache metadata `latent_norm_applied=true`, **and** (c) a
-cache-writer assertion. Verify `latent_norm` dim/placement against canonical (`pipeline_ideogram4.py:624` +
-the `latent_norm` constants) — BN is over 128 channels, so normalization is likely **post-patchify** on the
-128-ch grid. Then `ideogram4_cache_latents` + `ideogram4_cache_text_encoder_outputs` (53,248-dim, fp8-key
-fixed, caption verifier warn-only); cache_io by intent per §7. Exit: cache→load round-trip on a **real**
-`encode()` shape (guards B3) **plus** an assertion that raw tokens can't be cached as training-ready.
+cache-writer assertion.
+
+> **`latent_norm` module — LANDED 2026-06-07** (`ideogram4/latent_norm.py`): verified against canonical —
+> **128-dim, post-patchify**, in `(B, L, 128)` channel-last space; `norm = (t − shift) / scale` (inverse of
+> canonical decode `t*scale + shift`, `pipeline_ideogram4.py:624`). Constants vendored programmatically (no
+> hand-transcription); `encode_pixels_to_dit_tokens` / `decode_dit_tokens_to_pixels` sanctioned pair +
+> `assert_latent_norm_applied` convention guard (`latent_norm_applied=true`). Validated by a **direction-pinned**
+> unit test (round-trip is direction-blind) **and** a real-weight gate (real image → normalized **std 1.11** vs
+> inverted **3.10** → gate discriminates). Open item: VAE **mean vs sample** for the training-encode is flagged
+> **RESOLVED**: use the VAE **mean** (chunk[0]) — the fork's *training* cache path confirms it
+> (`ideogram4_autoencoder.py:337`), and it's guarded by a determinism/mean test. 9 tests (20 total).
+
+Remaining Phase 2: `ideogram4_cache_latents` + `ideogram4_cache_text_encoder_outputs` (53,248-dim, fp8-key
+fixed, caption verifier warn-only); cache_io by intent per §7; wire `assert_latent_norm_applied` into the
+cache writer. Exit: cache→load round-trip on a **real** `encode()` shape (guards B3) **plus** an assertion
+that raw tokens can't be cached as training-ready.
 
 **Phase 3 — Training.** `ideogram4_train_network` subclassing `NetworkTrainer` with zimage/flux_2-shaped
 `process_batch`, canonical t-convention, blissful flow-matching knobs. `--use_mask_loss` either fully wired
