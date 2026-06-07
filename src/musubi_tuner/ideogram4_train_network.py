@@ -172,6 +172,13 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "block-swap hooks (base training would call transformer.enable_block_swap()). Remove the flag "
                 "and train at a lower resolution, or add block swap to modeling_ideogram4."
             )
+        if getattr(args, "compile", False):
+            raise ValueError(
+                "Ideogram 4 does not support --compile yet: it has no compile_transformer hook, so the base "
+                "default raises NotImplementedError (trainer_base.py:1127) only AFTER accelerator.prepare — a "
+                "confusing late crash. Remove --compile; a compile_transformer over [transformer.layers] can be "
+                "added later (see docs/plans/2026-06-07-ideogram4-native-1024-gc-blockswap.md)."
+            )
 
         # args.mixed_precision is filled from the accelerate config LATER (trainer_base.py:1516); when this
         # hook runs it is still None if the CLI omitted it. Default the omitted case to bf16 — fp32 would OOM

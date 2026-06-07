@@ -105,6 +105,14 @@ def test_handle_model_specific_args_rejects_blocks_to_swap():
         trainer.handle_model_specific_args(SimpleNamespace(blocks_to_swap=4))
 
 
+def test_handle_model_specific_args_rejects_compile():
+    # --compile has no compile_transformer hook on Ideogram; the base default raises NotImplementedError only
+    # AFTER accelerator.prepare (a confusing late crash). Reject it fail-fast at setup like the other flags.
+    trainer = Ideogram4NetworkTrainer()
+    with pytest.raises(ValueError, match="compile"):
+        trainer.handle_model_specific_args(SimpleNamespace(compile=True))
+
+
 def test_handle_model_specific_args_defaults_omitted_mixed_precision_to_bf16():
     # Omitted --mixed_precision (None) must default to bf16, not fp32 (which would OOM the 8B DiT). The set
     # value drives BOTH self.dit_dtype here and the base loop's dit_dtype (read later from args.mixed_precision).
