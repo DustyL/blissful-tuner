@@ -25,6 +25,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_Z_IMAGE,
 )
 from musubi_tuner.dataset.media_utils import divisible_by
+from musubi_tuner.utils.model_utils import strip_dtype_suffix
 
 if TYPE_CHECKING:
     from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -263,7 +264,7 @@ class BucketBatchManager:
                     # Legacy FLUX.2 caches briefly wrote this key without a dtype suffix.
                     pass
                 else:
-                    content_key = content_key.rsplit("_", 1)[0]  # remove dtype
+                    content_key = strip_dtype_suffix(content_key)  # remove dtype (handles float8_e4m3fn etc.)
                     if content_key.startswith("latents_"):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
                     elif content_key.startswith("mask_weights_"):
