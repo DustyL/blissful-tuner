@@ -316,20 +316,42 @@ cache-writer assertion.
 > (chunk[0]). Validated: 6 cache tests + a real-image round-trip (grid→flatten **maxerr 0.0000** vs DiT tokens).
 > 26 tests total.
 
-Remaining Phase 2 — `ideogram4_cache_text_encoder_outputs` (53,248-dim). Front-load the fixes per second review:
-- **H5 (do FIRST, as shared infra not Ideogram-only):** the `bucket.py` key normalizer uses `rsplit("_",1)` to
-  strip the dtype, which mangles multi-underscore dtype names like `float8_e4m3fn`. Replace with a **dtype-aware
-  suffix stripper** (match against the known dtype strings, **longest-first**), and test both a normal key and a
-  `…_float8_e4m3fn` key. This unblocks the fp8 text cache (the only way the 53k-dim cache is affordable).
-- **H6 (offline, annoyingly explicit):** require a local tokenizer/TE path (or local fallback), `local_files_only=True`,
-  **no** remote repo fallback, **no** network `trust_remote_code`; if remote-code classes are unavoidable, resolve
-  them from the cloned local Ideogram/Qwen code only, with a test that monkeypatches HF/network calls and proves
-  the cache command still initializes from local paths.
-- **H4:** caption verification defaults to **warn-only**; "strict verifier" is an opt-in validation mode, never a
-  default cache requirement (don't brick plain-`.txt` LoRA datasets).
-- cache_io text-encoder graft **by intent** per §7 (keep blissful's guarded NaN check; do not patch-apply the fork's
-  unguarded `isnan`). Then wire `preflight_ideogram4_latent_cache` into trainer/dataset validation; then minimal
-  generate + t-schedule parity.
+Remaining Phase 2 — text-encoder cache, decomposed into sub-slices.
+
+**H5 — LANDED** (commit `2d809b9`): `model_utils.strip_dtype_suffix` (dtype-aware, longest-first) fixes the
+`bucket.py` key normalizer for `float8_e4m3fn`; shared infra, all arches benefit. Unblocks the fp8 text cache.
+
+**Text cache is PER-PROMPT (image-independent)** — verified from canonical `_build_packed_sequence`: layout is
+`[pad][text][image]`, text positions are local `arange(num_text)`, and `_encode_text` masks non-LLM positions, so
+the 13-layer text features depend only on the prompt, not the image grid/content. Cache **once per unique caption**.
+2c contract (per second review): still **materialize/link a cache at each `item_info.text_encoder_output_cache_path`**
+(blissful's reader is item-file-oriented) — a true global caption-store keyed by hash is a separate reader change.
+
+**2a — offline TE loader + feature extraction (NEXT).** Decision: **HF-full is the default canonical-parity path**;
+Comfy text-only is opt-in behind `--text_encoder_format {hf_full,comfy_text}`.
+- `hf_full` (default): `Qwen3VLConfig.from_pretrained(local, local_files_only=True)` → **native** `Qwen3VLModel(cfg)`;
+  load `~/Ideogram-4/Huggingface-Model-Weights/text_encoder/model.safetensors` (`language_model.*`+`visual.*`, **per-row**
+  scales). Exit gates: (1) native config+model only — **no** AutoModel/AutoConfig/`trust_remote_code`/Hub; (2) header/path
+  gate asserts hf_full (lang+visual, 368 fp8, 368 scales, 0 comfy_quant) BEFORE load; (3) `set_linear_compute_dtype`
+  before first forward; (4) `apply_fp8_monkey_patch(use_scaled_mm=False)` + strict load; (5) assert **368/368** patched;
+  (6) tokenization EXACTLY canonical: `apply_chat_template(messages,add_generation_prompt=True,tokenize=False)` then
+  `tokenizer(text, add_special_tokens=False)` (messages=`[{"role":"user","content":[{"type":"text","text":prompt}]}]`);
+  (7) tap layers `(0,3,…,35)` **before final norm**, `stack→permute→reshape`→`(L,53248)` float32; (8) **per-prompt
+  guardrail test** (tiny/fake Qwen3-VL: packed `[text][image]` indicator-masked slice == text-only output); (9)
+  real-weight gate: finite `(L,53248)` + sane token count.
+- `comfy_text` (opt-in): build from `cfg.text_config` (native `Qwen3VLTextModel(Qwen3VLConfig)` FAILS in this env);
+  load `~/Training_Models_Ideogram/text_encoders/qwen3vl_8b_fp8_scaled.safetensors`, strip `model.` prefix, drop/ignore
+  `lm_head.weight`, **per-tensor** scales, assert **252/252** + `dropped_comfy_quant==252`. Not default until it passes
+  structural parity vs the HF language tower OR an explicitly-accepted lower-memory/different-quant quality gate.
+- **RISK (novel):** native transformers Qwen3-VL API ≠ canonical/fork's `trust_remote_code` custom modeling, and there is
+  **no local canonical oracle** for numerical parity. So the tap must be re-derived for the native API and verified
+  empirically; parity confidence comes from the gate-8 guardrail test, not a canonical diff. Empirical/iterative slice.
+
+**2b — caption verifier (H4):** port the lightweight stdlib verifier, **warn-only by default**, strict opt-in.
+**2c — text cache writer:** `ideogram4_cache_text_encoder_outputs` + `save_text_encoder_output_cache_ideogram4`;
+cache_io text-encoder graft **by intent** per §7 (keep blissful's guarded NaN check; do NOT patch-apply the fork's
+unguarded `isnan`); fp8 text-cache key now works (H5). Then wire `preflight_ideogram4_latent_cache` into trainer/dataset
+validation; then minimal generate + t-schedule parity.
 
 **Phase 3 — Training.** `ideogram4_train_network` subclassing `NetworkTrainer` with zimage/flux_2-shaped
 `process_batch`, canonical t-convention, blissful flow-matching knobs. `--use_mask_loss` either fully wired
