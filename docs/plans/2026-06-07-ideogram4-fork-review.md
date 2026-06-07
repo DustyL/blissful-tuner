@@ -418,3 +418,49 @@ The two amendments the user asked to fold first (fp8 dtype cast, VAE source/layo
 exit criteria**, not optional polish — they are precisely what makes Phase 1 "actually runs a forward"
 instead of merely "loads," and the fp8-dtype one also unblocks the Phase-0 empirical confirmation (since the
 fork's own generate is dead and cannot be the oracle).
+
+---
+
+## 12. Phase 2 COMPLETE; Phase 3/4 (trainer + generate) spec — resolved design
+
+**Landed (branch `feat/ideogram4-phase1`, 11 commits, 59 tests):** Phase 1 (fp8 loader + raw VAE), 1.5
+(hardening), latent_norm, latent cache (grid-native), H5 (dtype-key stripper), 2a (offline Qwen3-VL TE +
+53k features, native tap verified), 2b (caption verifier warn-only), 2c (text cache writer), LoRA module
+(`networks.lora_ideogram4`, plain-nn.Linear targets, DoRA works). The full **loading + caching + LoRA-target**
+foundation is validated. Remaining: the trainer + generate.
+
+**DiT forward signature** (`modeling_ideogram4.py`):
+`forward(x, t, llm_features, position_ids, segment_ids, indicator)` — `x` (B,L,128) noisy image tokens; `t`
+(0–1); `llm_features` (B,L,53248); `position_ids` (B,L,3) MRoPE; `segment_ids` (B,L); `indicator` (B,L) role.
+Output is meaningful only at `indicator == OUTPUT_IMAGE_INDICATOR` positions.
+
+**Phase 0 t-convention (B5) — RESOLVED, must be generate-validated.** Canonical: noise at t≈0, clean at t≈1.
+Trainer flow-matching: `noisy = (1-t)*noise + t*clean`; `target = clean - noise`; loss = MSE(pred, target) at
+OUTPUT_IMAGE positions. (The fork's `noisy=(1-t)*clean+t*noise` / `target=noise-clean` is the mirrored B5 bug —
+do NOT copy it.) **Gate:** load the base DiT + uncond DiT, run generate with this convention + the canonical
+per-step `(t_val=schedule(S[i+1]), s_val=schedule(S[i]), delta=s-t, z+=v*delta)` loop; a coherent image
+confirms the direction, garbage means it's flipped. Loss-descent alone cannot confirm it.
+
+**Phase 3 — `ideogram4_train_network` (subclass NetworkTrainer, zimage/flux_2 shape):**
+- `--network_module networks.lora_ideogram4`; standard LoRA (DoRA works — targets are nn.Linear).
+- Load DiT via `load_ideogram4_transformer` (fp8). `--dit` = HF per-row (recommended) or Comfy.
+- `process_batch` reads cached **grid latents** → `ideogram4_utils.grid_to_dit_tokens` (flatten ONLY — never
+  `patchify_vae_latents` (B3) or `latent_norm` again) → image tokens (B, L_img=gh*gw, 128); reads cached
+  **varlen text features** `i4_llm_features` (B, L_txt, 53248).
+- Build the joint sequence per canonical `_build_packed_sequence`: `[pad][text][image]`, `text_position_ids`
+  (text=arange, image=`(0,h,w)+IMAGE_POSITION_OFFSET`), `indicator` (LLM vs OUTPUT_IMAGE), `segment_ids`. The
+  noised tokens go in the image slots; loss only at OUTPUT_IMAGE positions.
+- t sampling: canonical logit-normal (`mu`,`std`); thread blissful `--timestep_sampling`/`--discrete_flow_shift`
+  or default-match. **`--use_mask_loss` must be REJECTED at setup validation** (no mask cache; cache is RGB-only).
+- Wire `preflight_ideogram4_latent_cache` into dataset/cache validation (reader-side metadata guard).
+- Exit: 50-step run, loss descends, LoRA saves/loads. (Correctness still pending the Phase-0 generate gate.)
+
+**Phase 4 — `ideogram4_generate_image`:** asymmetric CFG via the separate `unconditional_transformer`
+(load in `on_before_sample_images`, free after); canonical denoise loop + sampler presets (V4_DEFAULT_20 etc.,
+polish steps at lower guidance); the Phase-0 t-convention; blissful latent-preview/guidance integration. This
+is also the oracle for the Phase-0 gate.
+
+**Tests to add:** canonical t-parity (per-step `(t,s,gw)` sequence), joint-sequence construction (text+image
+layout/positions/indicator), grid→tokens flatten round-trip in the trainer, `--use_mask_loss` rejection,
+block-swap no-grad restore (`trainer_base.py:737`), and the fp8-LoRA-gradient guard (analogous to
+`test_lora_conv2d_forward.py`).
