@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -60,21 +61,39 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         return result
 
     def _preflight_latent_caches(self, train_dataset_group) -> int:
-        """Validate every on-disk Ideogram latent cache (norm-applied, grid layout, dit-token space, shape).
+        """Validate every ACTIVE Ideogram latent cache (norm-applied, grid layout, dit-token space, shape).
 
         Raises ValueError (from preflight_ideogram4_latent_cache) on the first stale / raw / fork-format cache,
         aborting before the model load. Returns the number of distinct cache files validated.
+
+        Active set only: the cached-dataset path (image_video_dataset.py:644) skips any latent cache that has
+        no paired text-encoder cache, so preflight mirrors that pairing — otherwise a stale orphan
+        ``*_i4.safetensors`` (which training would ignore) could abort an otherwise-valid run.
         """
         seen: set[str] = set()
+        skipped_orphans = 0
         for dataset in train_dataset_group.datasets:
-            if getattr(dataset, "cache_directory", None) is None:
+            cache_dir = getattr(dataset, "cache_directory", None)
+            if cache_dir is None:
                 continue
+            arch = getattr(dataset, "architecture", self.architecture)
             for cache_path in dataset.get_all_latent_cache_files():
                 if cache_path in seen:
                     continue
+                # Pairing key = item_key (basename minus the trailing _{WxH}_{arch} tokens), exactly as the
+                # dataset derives it; TE cache is {item_key}_{arch}_te.safetensors in the same directory.
+                tokens = os.path.basename(cache_path).split("_")
+                item_key = "_".join(tokens[:-2])
+                te_path = os.path.join(cache_dir, f"{item_key}_{arch}_te.safetensors")
+                if not os.path.exists(te_path):
+                    skipped_orphans += 1
+                    continue
                 seen.add(cache_path)
                 ideogram4_utils.preflight_ideogram4_latent_cache(cache_path)
-        logger.info(f"Ideogram 4 latent-cache preflight passed: {len(seen)} cache file(s) validated.")
+        msg = f"Ideogram 4 latent-cache preflight passed: {len(seen)} active cache file(s) validated."
+        if skipped_orphans:
+            msg += f" ({skipped_orphans} orphan latent cache(s) without a paired TE cache skipped — training ignores them.)"
+        logger.info(msg)
         return len(seen)
 
     def process_batch(
@@ -178,6 +197,18 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         self.default_guidance_scale = 7.0  # Ideogram uses asymmetric CFG at inference; unused at train time
         self.default_discrete_flow_shift = 1.0
 
+    def extra_metadata(self, args) -> dict:
+        # The Ideogram DiT is loaded as PRE-QUANTIZED fp8 via the shim, not the musubi fp8 path — so the base
+        # loop records ss_fp8_base=False (we neutralize --fp8_base/--fp8_scaled). Record the real base-precision
+        # provenance here so inventory/debug tools don't read the LoRA as trained from a full-precision base.
+        metadata = super().extra_metadata(args)
+        metadata["ss_ideogram4_prequantized_fp8"] = True
+        metadata["ss_ideogram4_fp8_source"] = os.path.basename(args.dit) if getattr(args, "dit", None) else ""
+        layout = getattr(self, "_ideogram4_fp8_layout", None)
+        if layout:
+            metadata["ss_ideogram4_fp8_scale_layout"] = layout  # per_row (HF) / per_tensor (Comfy) / ...
+        return metadata
+
     def scale_shift_latents(self, latents):
         # Cached Ideogram latents are already latent_norm'd (grid_to_dit_tokens flattens, never re-normalizes).
         return latents
@@ -198,12 +229,17 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         dit_weight_dtype: Optional[torch.dtype],
     ):
         # Ideogram 4 attention is SDPA-only (Blackwell guard is active); attn_mode/split_attn are not used.
-        return ideogram4_utils.load_ideogram4_transformer(
+        transformer = ideogram4_utils.load_ideogram4_transformer(
             dit_path,
             dtype=self.dit_dtype,
             loading_device=loading_device,
             disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False),
         )
+        # Capture the real fp8 scale geometry for checkpoint provenance (see extra_metadata): the base loop
+        # records ss_fp8_base=False because we neutralize the musubi fp8 flags, so the LoRA would otherwise
+        # look like it was trained from a full-precision base.
+        self._ideogram4_fp8_layout = ideogram4_utils.detect_fp8_scale_layout(transformer)
+        return transformer
 
     def call_dit(self, *args, **kwargs):
         # Ideogram 4 computes its loss directly in process_batch (custom joint-sequence flow-matching), so the

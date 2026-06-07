@@ -149,6 +149,34 @@ def _validate_fp8_linears_patched(model: torch.nn.Module) -> tuple[int, int]:
     return patched, len(fp8_linears)
 
 
+def detect_fp8_scale_layout(model: torch.nn.Module) -> str:
+    """Classify the pre-quantized fp8 scale geometry of a loaded DiT, for provenance metadata.
+
+    After the shim normalizes scales (``_reshape_scale_weight``), each ``scale_weight`` buffer is ``[1]``
+    (per-tensor, Comfy-style), ``[out, 1]`` (per-row, HF-style) or ``[out, num_blocks, 1]`` (per-block).
+    Returns the single uniform class name, ``"mixed:<a>,<b>"`` if layers disagree, or ``"none"`` if the
+    model carries no scale buffers. Reports the verifiable geometry, not an assumed HF/Comfy origin.
+    """
+    classes: set[str] = set()
+    for m in model.modules():
+        scale = getattr(m, "scale_weight", None)
+        if scale is None:
+            continue
+        if scale.numel() == 1:
+            classes.add("per_tensor")
+        elif scale.ndim == 2 and scale.shape[-1] == 1:
+            classes.add("per_row")
+        elif scale.ndim == 3 and scale.shape[-1] == 1:
+            classes.add("per_block")
+        else:
+            classes.add(f"shape{tuple(scale.shape)}")
+    if not classes:
+        return "none"
+    if len(classes) == 1:
+        return next(iter(classes))
+    return "mixed:" + ",".join(sorted(classes))
+
+
 def set_linear_compute_dtype(model: torch.nn.Module, dtype: torch.dtype) -> None:
     for module in model.modules():
         if isinstance(module, torch.nn.Linear):

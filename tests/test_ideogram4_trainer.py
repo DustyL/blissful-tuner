@@ -1,20 +1,25 @@
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 from safetensors.torch import save_file
 
 from musubi_tuner.ideogram4 import constants as i4c
+from musubi_tuner.ideogram4.ideogram4_utils import detect_fp8_scale_layout
 from musubi_tuner.ideogram4_train_network import (
     Ideogram4NetworkTrainer,
     ideogram4_setup_parser,
     neutralize_unused_fp8_args,
 )
+from musubi_tuner.training import trainer_base
 
 
 class _FakeDataset:
-    def __init__(self, cache_directory, files):
+    def __init__(self, cache_directory, files, architecture="i4"):
         self.cache_directory = cache_directory
+        self.architecture = architecture
         self._files = files
 
     def get_all_latent_cache_files(self):
@@ -47,6 +52,24 @@ def _write_valid_cache(path) -> str:
         },
     )
     return str(path)
+
+
+def _write_te_cache(cache_dir, item_key="img", arch="i4") -> str:
+    # Preflight only validates latent caches that have a paired TE cache (it mirrors the dataset's active set);
+    # this makes a latent cache "active" so the wiring tests actually reach the preflight validation.
+    path = os.path.join(str(cache_dir), f"{item_key}_{arch}_te.safetensors")
+    save_file({"x": torch.zeros(1)}, path)
+    return path
+
+
+def _module_with_scales(*shapes) -> nn.Module:
+    root = nn.Module()
+    for i, shape in enumerate(shapes):
+        lin = nn.Linear(2, 2)
+        if shape is not None:
+            lin.scale_weight = torch.ones(*shape)
+        root.add_module(f"lin{i}", lin)
+    return root
 
 
 def test_trainer_architecture_names():
@@ -136,6 +159,7 @@ def test_preflight_wiring_aborts_on_stale_cache(tmp_path):
     # The wiring (not just the preflight fn): _build_dataset's loop must propagate the abort BEFORE model load.
     trainer = Ideogram4NetworkTrainer()
     stale = _write_stale_cache(tmp_path / "img_0064x0064_i4.safetensors")
+    _write_te_cache(tmp_path)  # paired TE -> the stale latent is "active", so preflight validates (and aborts)
     group = _FakeGroup([_FakeDataset(str(tmp_path), [stale])])
     with pytest.raises(ValueError, match="must set"):
         trainer._preflight_latent_caches(group)
@@ -144,8 +168,18 @@ def test_preflight_wiring_aborts_on_stale_cache(tmp_path):
 def test_preflight_wiring_passes_and_counts_valid_cache(tmp_path):
     trainer = Ideogram4NetworkTrainer()
     good = _write_valid_cache(tmp_path / "img_0064x0064_i4.safetensors")
+    _write_te_cache(tmp_path)
     group = _FakeGroup([_FakeDataset(str(tmp_path), [good])])
     assert trainer._preflight_latent_caches(group) == 1
+
+
+def test_preflight_wiring_skips_orphan_latent_without_te(tmp_path):
+    # An orphan latent cache (no paired TE) is skipped — training ignores it (image_video_dataset.py:644),
+    # so preflight must NOT abort even when the orphan is itself stale/invalid. This is the over-strictness fix.
+    trainer = Ideogram4NetworkTrainer()
+    stale = _write_stale_cache(tmp_path / "img_0064x0064_i4.safetensors")  # NO TE cache written
+    group = _FakeGroup([_FakeDataset(str(tmp_path), [stale])])
+    assert trainer._preflight_latent_caches(group) == 0  # skipped, not aborted
 
 
 def test_preflight_wiring_skips_datasets_without_cache_dir():
@@ -159,5 +193,36 @@ def test_preflight_wiring_dedups_repeated_paths(tmp_path):
     # The same file referenced by two subsets is validated once (dedup), so the count reflects distinct files.
     trainer = Ideogram4NetworkTrainer()
     good = _write_valid_cache(tmp_path / "img_0064x0064_i4.safetensors")
+    _write_te_cache(tmp_path)
     group = _FakeGroup([_FakeDataset(str(tmp_path), [good]), _FakeDataset(str(tmp_path), [good])])
     assert trainer._preflight_latent_caches(group) == 1
+
+
+def test_detect_fp8_scale_layout_classifies_geometry():
+    # The shim normalizes scales to [1] (per-tensor), [out,1] (per-row), [out,num_blocks,1] (per-block).
+    assert detect_fp8_scale_layout(_module_with_scales((8, 1), (8, 1))) == "per_row"
+    assert detect_fp8_scale_layout(_module_with_scales((1,), (1,))) == "per_tensor"
+    assert detect_fp8_scale_layout(_module_with_scales((4, 3, 1))) == "per_block"
+    assert detect_fp8_scale_layout(_module_with_scales(None)) == "none"
+    assert detect_fp8_scale_layout(_module_with_scales((8, 1), (1,))).startswith("mixed:")
+
+
+def test_extra_metadata_records_fp8_provenance(monkeypatch):
+    # Counterbalance the base ss_fp8_base=False: record the real prequantized-fp8 provenance + scale layout.
+    monkeypatch.setattr(trainer_base.NetworkTrainer, "extra_metadata", lambda self, args: {})
+    trainer = Ideogram4NetworkTrainer()
+    trainer._ideogram4_fp8_layout = "per_row"
+    md = trainer.extra_metadata(SimpleNamespace(dit="/models/FLUX-Ideogram-fp8.safetensors"))
+    assert md["ss_ideogram4_prequantized_fp8"] is True
+    assert md["ss_ideogram4_fp8_source"] == "FLUX-Ideogram-fp8.safetensors"
+    assert md["ss_ideogram4_fp8_scale_layout"] == "per_row"
+
+
+def test_extra_metadata_omits_layout_when_unknown(monkeypatch):
+    # If load_transformer never ran (no layout stashed) the layout key is omitted, not emitted as None/"".
+    monkeypatch.setattr(trainer_base.NetworkTrainer, "extra_metadata", lambda self, args: {})
+    trainer = Ideogram4NetworkTrainer()
+    md = trainer.extra_metadata(SimpleNamespace(dit=None))
+    assert md["ss_ideogram4_prequantized_fp8"] is True
+    assert md["ss_ideogram4_fp8_source"] == ""
+    assert "ss_ideogram4_fp8_scale_layout" not in md
