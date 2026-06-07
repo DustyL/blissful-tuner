@@ -446,6 +446,20 @@ def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor)
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
+def save_text_encoder_output_cache_ideogram4(item_info: ItemInfo, features: torch.Tensor):
+    """Ideogram 4: store the per-prompt (L, 53248) Qwen3-VL conditioning features as a VARLEN text cache.
+
+    Key is `varlen_i4_llm_features_{dtype}`: the `varlen_` prefix keeps it unstacked (per-prompt L varies),
+    and the reader strips the dtype via the H5 dtype-aware stripper (so a `float8_e4m3fn` cache reads back as
+    `i4_llm_features`, not `i4_llm_features_float8`). Goes through the shared common writer (guarded NaN check
+    intact — no §7 splice).
+    """
+    assert features.dim() == 2, f"Ideogram 4 text features must be (L, 53248), got {tuple(features.shape)}"
+    dtype_str = dtype_to_str(features.dtype)
+    sd = {f"varlen_i4_llm_features_{dtype_str}": features.detach().cpu().contiguous()}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)
+
+
 def save_text_encoder_output_cache_framepack(
     item_info: ItemInfo, llama_vec: torch.Tensor, llama_attention_mask: torch.Tensor, clip_l_pooler: torch.Tensor
 ):
