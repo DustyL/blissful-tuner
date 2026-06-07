@@ -454,7 +454,9 @@ def save_text_encoder_output_cache_ideogram4(item_info: ItemInfo, features: torc
     `i4_llm_features`, not `i4_llm_features_float8`). Goes through the shared common writer (guarded NaN check
     intact — no §7 splice).
     """
-    assert features.dim() == 2, f"Ideogram 4 text features must be (L, 53248), got {tuple(features.shape)}"
+    assert features.dim() == 2 and features.shape[1] == ideogram4_constants.IDEOGRAM4_TE_FEATURE_DIM, (
+        f"Ideogram 4 text features must be (L, {ideogram4_constants.IDEOGRAM4_TE_FEATURE_DIM}), got {tuple(features.shape)}"
+    )
     dtype_str = dtype_to_str(features.dtype)
     sd = {f"varlen_i4_llm_features_{dtype_str}": features.detach().cpu().contiguous()}
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)

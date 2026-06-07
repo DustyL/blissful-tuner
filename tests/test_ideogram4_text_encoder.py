@@ -4,9 +4,8 @@ import os
 import pytest
 import torch
 
-from musubi_tuner.ideogram4.constants import QWEN3_VL_ACTIVATION_LAYERS
+from musubi_tuner.ideogram4.constants import IDEOGRAM4_TE_FEATURE_DIM, QWEN3_VL_ACTIVATION_LAYERS
 from musubi_tuner.ideogram4.text_encoder import (
-    IDEOGRAM4_TE_FEATURE_DIM,
     _assert_hf_full_format,
     _tap_qwen3_vl_text_layers,
     inspect_te_checkpoint,
@@ -113,6 +112,40 @@ def test_tokenizer_loads_local_only(monkeypatch):
     monkeypatch.setattr(te, "AutoTokenizer", _FakeTok)
     assert te.load_ideogram4_tokenizer("/local/tok") == "tok"
     assert captured["local_files_only"] is True and captured["trust_remote_code"] is False
+
+
+@_needs_config
+def test_loader_config_path_is_native_and_offline(monkeypatch):
+    """H6 regression guard: the loader must use native Qwen3VLConfig with local_files_only and never touch
+    AutoModel / AutoConfig / hf_hub_download / trust_remote_code. Forbidding those + a missing weights file
+    proves the offline native config path runs to the format gate without any of them firing."""
+    import huggingface_hub
+    import transformers
+
+    from musubi_tuner.ideogram4 import text_encoder as te
+
+    def _boom(*a, **k):
+        raise AssertionError("H6 violation: forbidden Auto*/Hub call in the offline TE loader")
+
+    for name in ("AutoModel", "AutoConfig"):
+        fake = type(name, (), {"from_pretrained": staticmethod(_boom), "from_config": staticmethod(_boom)})
+        monkeypatch.setattr(transformers, name, fake, raising=False)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _boom, raising=False)
+
+    seen = {}
+    orig = te.Qwen3VLConfig.from_pretrained
+
+    def spy(*a, **k):
+        seen.update(k)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(te.Qwen3VLConfig, "from_pretrained", spy)
+    # A nonexistent weights path must fail at the header/format gate (FileNotFound) AFTER the offline native
+    # config load -- i.e. the loader reaches the gate without AutoModel/AutoConfig/hf_hub_download.
+    with pytest.raises((FileNotFoundError, OSError, ValueError)):
+        te.load_ideogram4_text_encoder("/nonexistent_i4_te.safetensors", _TE_CONFIG_DIR, loading_device="cpu")
+    assert seen.get("local_files_only") is True
+    assert seen.get("trust_remote_code") is False
 
 
 # --------------------------------------------------------------------------- native tap (tiny real Qwen3-VL)

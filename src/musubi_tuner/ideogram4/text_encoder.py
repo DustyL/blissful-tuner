@@ -36,8 +36,6 @@ from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 
 logger = BlissfulLogger(__name__, "green")
 
-IDEOGRAM4_TE_HIDDEN_SIZE = 4096
-IDEOGRAM4_TE_FEATURE_DIM = IDEOGRAM4_TE_HIDDEN_SIZE * len(QWEN3_VL_ACTIVATION_LAYERS)  # 4096 * 13 = 53248
 TEXT_ENCODER_FORMATS = ("hf_full", "comfy_text")
 
 

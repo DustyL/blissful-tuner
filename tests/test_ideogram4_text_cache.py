@@ -29,8 +29,15 @@ def test_text_cache_key_roundtrip_and_reader_strip(tmp_path):
 
 def test_text_cache_rejects_wrong_rank(tmp_path):
     item = _item(tmp_path, "bad.safetensors")
-    with pytest.raises(AssertionError, match="L, 53248"):
+    with pytest.raises(AssertionError, match="53248"):
         save_text_encoder_output_cache_ideogram4(item, torch.randn(1, 5, 53248, dtype=torch.bfloat16))
+
+
+def test_text_cache_rejects_wrong_feature_width(tmp_path):
+    # Right rank (2D) but wrong feature width must be rejected before it reaches the trainer as a varlen item.
+    item = _item(tmp_path, "badw.safetensors")
+    with pytest.raises(AssertionError, match="53248"):
+        save_text_encoder_output_cache_ideogram4(item, torch.randn(3, 7, dtype=torch.bfloat16))
 
 
 def test_text_cache_fp8_key_strips_to_i4_llm_features(tmp_path):

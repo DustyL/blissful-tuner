@@ -21,6 +21,9 @@ logging.basicConfig(level=logging.INFO)
 
 
 def encode_and_save_batch(tokenizer, text_encoder, batch: List[ItemInfo], device, text_cache_dtype, strict_caption):
+    # Features are image-independent (per-prompt), but materialized PER ITEM at each item's
+    # text_encoder_output_cache_path (blissful's reader is item-file oriented) — not yet deduped by caption.
+    # A global caption-store keyed by hash would be a separate reader-contract change (see plan §12 / 2c).
     for item in batch:
         caption = item.caption
         verify_caption(caption, strict=strict_caption)  # H4: warn-only by default
@@ -68,6 +71,7 @@ def main():
     tokenizer = load_ideogram4_tokenizer(args.tokenizer)
 
     def encode_for_text_encoder(batch: List[ItemInfo]):
+        nonlocal text_encoder  # captured by the closure; `del text_encoder` below would otherwise trip F821
         encode_and_save_batch(tokenizer, text_encoder, batch, device, text_cache_dtype, args.strict_caption_verifier)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
