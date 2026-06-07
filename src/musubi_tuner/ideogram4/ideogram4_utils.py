@@ -162,7 +162,7 @@ def detect_fp8_scale_layout(model: torch.nn.Module) -> str:
         scale = getattr(m, "scale_weight", None)
         if scale is None:
             continue
-        if scale.numel() == 1:
+        if tuple(scale.shape) == (1,):
             classes.add("per_tensor")
         elif scale.ndim == 2 and scale.shape[-1] == 1:
             classes.add("per_row")
