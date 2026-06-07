@@ -20,9 +20,62 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def neutralize_unused_fp8_args(args) -> bool:
+    """Ideogram 4 always loads its DiT as fp8 via the pre-quantized shim, so ``--fp8_base`` / ``--fp8_scaled``
+    do not drive the load path (``load_transformer`` ignores ``dit_weight_dtype``). Neutralize both to False
+    (warning if either was set) so the base ``fp8_scaled requires fp8_base`` assert — which fires inside
+    ``_validate_args_and_init`` before our model-specific validation — cannot abort the run on a no-op flag.
+
+    Returns True if either flag had been set (for telemetry/tests).
+    """
+    had = bool(getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False))
+    if had:
+        logger.warning(
+            "Ideogram 4 loads fp8 weights via its pre-quantized shim; --fp8_base/--fp8_scaled have no effect "
+            "here and are ignored."
+        )
+    args.fp8_base = False
+    args.fp8_scaled = False
+    return had
+
+
 class Ideogram4NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+
+    def _validate_args_and_init(self, args) -> bool:
+        # Neutralize the no-op fp8 flags BEFORE the base fp8 assert (which lives inside the base
+        # _validate_args_and_init at trainer_base.py:1443). Done here rather than in main() so it holds for
+        # ANY caller of train() — CLI, GUI, or a test that constructs the trainer directly.
+        neutralize_unused_fp8_args(args)
+        return super()._validate_args_and_init(args)
+
+    def _build_dataset(self, args):
+        # Build the dataset, then preflight every Ideogram latent cache BEFORE the heavy TE/DiT load. The
+        # shared latent reader (bucket.py) loads tensors via load_file() and never inspects safetensors
+        # metadata, so a stale / raw / fork-format cache would otherwise enter training silently. This runs
+        # after dataset construction (trainer_base.py:1362) and before model load (1365).
+        result = super()._build_dataset(args)
+        self._preflight_latent_caches(result[0])
+        return result
+
+    def _preflight_latent_caches(self, train_dataset_group) -> int:
+        """Validate every on-disk Ideogram latent cache (norm-applied, grid layout, dit-token space, shape).
+
+        Raises ValueError (from preflight_ideogram4_latent_cache) on the first stale / raw / fork-format cache,
+        aborting before the model load. Returns the number of distinct cache files validated.
+        """
+        seen: set[str] = set()
+        for dataset in train_dataset_group.datasets:
+            if getattr(dataset, "cache_directory", None) is None:
+                continue
+            for cache_path in dataset.get_all_latent_cache_files():
+                if cache_path in seen:
+                    continue
+                seen.add(cache_path)
+                ideogram4_utils.preflight_ideogram4_latent_cache(cache_path)
+        logger.info(f"Ideogram 4 latent-cache preflight passed: {len(seen)} cache file(s) validated.")
+        return len(seen)
 
     def process_batch(
         self,
@@ -44,6 +97,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         latents: cached grid (B, 128, gh, gw), already patchified + latent_norm'd (scale_shift_latents is a
         no-op). batch["i4_llm_features"]: varlen list of (L_text_i, 53248) cached Qwen3-VL features.
         """
+        # Backstop only — the authoritative fail-fast rejection is in handle_model_specific_args (setup time,
+        # before the model load). Kept here so a direct process_batch caller (test/future path) still errors.
         if getattr(args, "use_mask_loss", False):
             raise ValueError(
                 "Ideogram 4 does not support --use_mask_loss yet (the latent cache writes no mask_weights). "
@@ -78,6 +133,42 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         return ARCHITECTURE_IDEOGRAM4_FULL
 
     def handle_model_specific_args(self, args):
+        # This hook runs inside _validate_args_and_init (the FIRST phase of train()), before dataset build /
+        # accelerator setup / model load — so it is the right place to fail fast on unsupported config and to
+        # pin the compute dtype, rather than discovering the problem deep in the training loop.
+
+        if getattr(args, "use_mask_loss", False):
+            raise ValueError(
+                "Ideogram 4 does not support --use_mask_loss yet (the latent cache writes no mask_weights). "
+                "Remove --use_mask_loss, or add mask caching + token-grid mask patchify first."
+            )
+        if getattr(args, "gradient_checkpointing", False):
+            raise ValueError(
+                "Ideogram 4 does not support --gradient_checkpointing yet: the vendored modeling_ideogram4 has "
+                "no checkpointing hooks (base training would call transformer.enable_gradient_checkpointing()). "
+                "Remove the flag and train at a lower resolution, or add checkpointing to modeling_ideogram4."
+            )
+        if getattr(args, "blocks_to_swap", 0):
+            raise ValueError(
+                "Ideogram 4 does not support --blocks_to_swap yet: the vendored modeling_ideogram4 has no "
+                "block-swap hooks (base training would call transformer.enable_block_swap()). Remove the flag "
+                "and train at a lower resolution, or add block swap to modeling_ideogram4."
+            )
+
+        # args.mixed_precision is filled from the accelerate config LATER (trainer_base.py:1516); when this
+        # hook runs it is still None if the CLI omitted it. Default the omitted case to bf16 — fp32 would OOM
+        # the 8B DiT AND split the loaded-model dtype (self.dit_dtype) from the training-loop dtype (the local
+        # dit_dtype computed at trainer_base.py:1521). Setting it here fixes both, since both read this value.
+        # Explicit --mixed_precision (fp16 / bf16 / no) is left untouched and takes precedence.
+        if not args.mixed_precision:
+            # WARNING (not INFO): this silently overrides the user's omitted choice and affects memory, and the
+            # base loop configures the root logger so INFO from this module is suppressed. Make it visible.
+            logger.warning(
+                "Ideogram 4: --mixed_precision omitted; defaulting to bf16 (fp32 would OOM the 8B DiT). "
+                "Pass --mixed_precision explicitly (no/fp16/bf16) to override."
+            )
+            args.mixed_precision = "bf16"
+
         self.dit_dtype = (
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
@@ -135,9 +226,12 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument(
         "--ideogram4_timestep_std", type=float, default=1.0, help="logit-normal schedule std for training timesteps"
     )
-    # Ideogram 4 weights are always fp8 (loaded via the pre-quantized shim), so these are accepted for base-loop
-    # compatibility but do not change the load path; the DiT is fp8 regardless.
-    parser.add_argument("--fp8_scaled", action="store_true", help="accepted for compatibility (Ideogram DiT is fp8)")
+    # Ideogram 4 weights are always fp8 (loaded via the pre-quantized shim), so this is defined only so the base
+    # loop can read args.fp8_scaled; it is neutralized (with a warning) in neutralize_unused_fp8_args(). --fp8_base
+    # is already defined by the common parser and is neutralized the same way.
+    parser.add_argument(
+        "--fp8_scaled", action="store_true", help="no-op for Ideogram 4 (DiT is fp8 via the shim); accepted for compatibility"
+    )
     return parser
 
 
