@@ -5,6 +5,12 @@ flow-matching forward+backward at each resolution with GC toggled — reporting 
 This is the datapoint that justifies Slice 1 and sizes Slice 2 (block swap): if GC reclaims little here, stop
 and investigate before adding block swap.
 
+This is the **model forward/backward peak** — a LOWER BOUND on the full-trainer peak. It omits optimizer state
+and keeps LoRA params in bf16 (the real trainer allocates Adam moments and generally keeps adapters in fp32). A
+real cached 1024 trainer smoke (GC + adamw, rank 32, real ~93-token DLAY captions, optimizer state) measured
+**~15.3 GB peak / 32 GB** — i.e. ~3 GB above this harness's 1024 number (12.3 GB), but still ~16 GB under budget.
+Conclusion: GC ALONE comfortably enables native 1024 (batch=1) on a 32 GB 5090; block swap is optional headroom.
+
 Peak memory is hit in the first backward, so a couple of steps suffice — no long training run needed.
 
     ./venv314/bin/python tests/manual/measure_ideogram4_gc_memory.py \
