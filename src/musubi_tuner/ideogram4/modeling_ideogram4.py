@@ -12,8 +12,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.ideogram4.constants import LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR, QWEN3_VL_ACTIVATION_LAYERS
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 # LOAD-BEARING IMPORT — do NOT delete as "unused" (that is why it carries noqa, not an alias use).
 # Importing modules.attention runs a process-wide guard that disables the cuDNN SDPA backend on
@@ -210,7 +212,37 @@ class Ideogram4TransformerBlock(nn.Module):
 
         self.adaln_modulation = nn.Linear(adanln_dim, 4 * hidden_size, bias=True)
 
+        self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
+        self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
+
+    def disable_gradient_checkpointing(self) -> None:
+        self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+
     def forward(
+        self,
+        x: torch.Tensor,
+        segment_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        adaln_input: torch.Tensor,
+    ) -> torch.Tensor:
+        # Block-internal gradient checkpointing. Gate on torch.is_grad_enabled() (NOT self.training): this
+        # recomputes the block in backward to save activation VRAM, and must NOT fire under any no_grad() path
+        # (sampling, debug probes). use_reentrant=False is mandatory — the base DiT is frozen and only the LoRA
+        # adapters inside the nn.Linear forwards are trainable; the reentrant path would drop their gradients.
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            fn = self._forward
+            if self.activation_cpu_offloading:
+                fn = create_cpu_offloading_wrapper(fn, self.feed_forward.w1.weight.device)
+            return checkpoint(fn, x, segment_ids, cos, sin, adaln_input, use_reentrant=False)
+        return self._forward(x, segment_ids, cos, sin, adaln_input)
+
+    def _forward(
         self,
         x: torch.Tensor,
         segment_ids: torch.Tensor,
@@ -320,6 +352,24 @@ class Ideogram4Transformer(nn.Module):
             out_channels=config.in_channels,
             adanln_dim=config.adanln_dim,
         )
+
+        self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False) -> None:
+        # Base trainer calls this with args.gradient_checkpointing_cpu_offload (trainer_base.py:1661). The
+        # Ideogram trainer rejects --gradient_checkpointing_cpu_offload for now, so cpu_offload is False in
+        # practice; the per-block wrapper is wired for when a dedicated CPU-offload backward test lands.
+        self.gradient_checkpointing = True
+        self.activation_cpu_offloading = cpu_offload
+        for block in self.layers:
+            block.enable_gradient_checkpointing(activation_cpu_offloading=cpu_offload)
+
+    def disable_gradient_checkpointing(self) -> None:
+        self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+        for block in self.layers:
+            block.disable_gradient_checkpointing()
 
     @property
     def device(self) -> torch.device:

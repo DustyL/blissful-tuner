@@ -93,10 +93,19 @@ def test_handle_model_specific_args_rejects_use_mask_loss_at_setup():
         trainer.handle_model_specific_args(SimpleNamespace(use_mask_loss=True))
 
 
-def test_handle_model_specific_args_rejects_gradient_checkpointing():
+def test_handle_model_specific_args_accepts_gradient_checkpointing():
+    # GC is supported now — it must NOT raise (the rejection moved to the cpu_offload variant).
     trainer = Ideogram4NetworkTrainer()
-    with pytest.raises(ValueError, match="gradient_checkpointing"):
-        trainer.handle_model_specific_args(SimpleNamespace(gradient_checkpointing=True))
+    args = SimpleNamespace(gradient_checkpointing=True, mixed_precision="bf16")
+    trainer.handle_model_specific_args(args)  # no raise
+    assert trainer.dit_dtype == torch.bfloat16
+
+
+def test_handle_model_specific_args_rejects_gradient_checkpointing_cpu_offload():
+    # The CPU-offload variant is still rejected (deferred until a dedicated CUDA backward test lands).
+    trainer = Ideogram4NetworkTrainer()
+    with pytest.raises(ValueError, match="cpu_offload"):
+        trainer.handle_model_specific_args(SimpleNamespace(gradient_checkpointing_cpu_offload=True))
 
 
 def test_handle_model_specific_args_rejects_blocks_to_swap():

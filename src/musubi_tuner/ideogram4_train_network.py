@@ -160,11 +160,11 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "Ideogram 4 does not support --use_mask_loss yet (the latent cache writes no mask_weights). "
                 "Remove --use_mask_loss, or add mask caching + token-grid mask patchify first."
             )
-        if getattr(args, "gradient_checkpointing", False):
+        if getattr(args, "gradient_checkpointing_cpu_offload", False):
             raise ValueError(
-                "Ideogram 4 does not support --gradient_checkpointing yet: the vendored modeling_ideogram4 has "
-                "no checkpointing hooks (base training would call transformer.enable_gradient_checkpointing()). "
-                "Remove the flag and train at a lower resolution, or add checkpointing to modeling_ideogram4."
+                "Ideogram 4 supports --gradient_checkpointing, but not --gradient_checkpointing_cpu_offload yet: "
+                "the CPU-offload backward path needs a dedicated CUDA test before it can be trusted in training "
+                "(and its return-device interaction with block swap is unvalidated). Use --gradient_checkpointing alone."
             )
         if getattr(args, "blocks_to_swap", 0):
             raise ValueError(
