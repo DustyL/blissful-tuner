@@ -135,6 +135,9 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument(
         "--ideogram4_timestep_std", type=float, default=1.0, help="logit-normal schedule std for training timesteps"
     )
+    # Ideogram 4 weights are always fp8 (loaded via the pre-quantized shim), so these are accepted for base-loop
+    # compatibility but do not change the load path; the DiT is fp8 regardless.
+    parser.add_argument("--fp8_scaled", action="store_true", help="accepted for compatibility (Ideogram DiT is fp8)")
     return parser
 
 
