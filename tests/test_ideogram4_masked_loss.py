@@ -253,7 +253,14 @@ def test_process_batch_returns_masked_loss_telemetry():
     # Stub out ideogram4_flow_matching_target + the resolution scheduler so we don't load the real DiT.
     import musubi_tuner.ideogram4_train_network as itn
 
-    accelerator_stub = SimpleNamespace(device=torch.device("cpu"), trackers=[object()])  # nonempty -> stats on
+    # unwrap_model identity-returns: matches Accelerator on non-DDP single device, lets the
+    # disable_accelerate_forward_autocast helper invoked inside process_batch no-op cleanly
+    # (no _original_forward exists on the mocked transformer).
+    accelerator_stub = SimpleNamespace(
+        device=torch.device("cpu"),
+        trackers=[object()],  # nonempty -> stats on
+        unwrap_model=lambda m: m,
+    )
     model_pred_tokens = torch.zeros(1, gh * gw, 128)
     target_tokens = torch.full((1, gh * gw, 128), 0.5)
 

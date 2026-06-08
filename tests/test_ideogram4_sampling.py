@@ -17,7 +17,10 @@ from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
 
 
 def _cpu_accel():
-    return SimpleNamespace(device=torch.device("cpu"))
+    # unwrap_model returns the model unchanged: matches Accelerator's behavior on a non-DDP single-
+    # device setup, and lets disable_accelerate_forward_autocast operate on the same model the
+    # caller passed in (it then no-ops because no _original_forward attribute exists on test mocks).
+    return SimpleNamespace(device=torch.device("cpu"), unwrap_model=lambda model: model)
 
 
 def test_process_sample_prompts_dedupes_attaches_and_frees(monkeypatch):

@@ -29,6 +29,7 @@ from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.mask_loss import apply_masked_loss_with_prior, require_mask_weights_if_enabled
 from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.accelerate_utils import disable_accelerate_forward_autocast
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -150,12 +151,16 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         )
         timesteps = schedule(torch.rand(latents.shape[0], device=device))
 
-        # Keep training numerically aligned with standalone generation. Accelerator bf16 autocast changes
-        # Ideogram's fp8/non-Linear forward path enough to train a different effective model.
-        with torch.autocast(device_type=device.type, enabled=False):
-            model_pred, target = ideogram4_flow_matching_target(
-                transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
-            )
+        # Keep training numerically aligned with standalone generation. Accelerator bf16 autocast
+        # changes Ideogram's fp8/non-Linear forward path enough to train a different effective
+        # model. Two autocast installation paths must be defeated together: the explicit
+        # torch.autocast(enabled=False) covers ordinary outer context managers; the helper restores
+        # _original_forward to defeat the forward-method wrapper accelerator.prepare installs.
+        with disable_accelerate_forward_autocast(accelerator, transformer):
+            with torch.autocast(device_type=device.type, enabled=False):
+                model_pred, target = ideogram4_flow_matching_target(
+                    transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
+                )
 
         if not getattr(args, "use_mask_loss", False):
             loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
@@ -404,25 +409,28 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # resident through a 1024 decode peaks ~30 GB and OOMs a 32 GB card; freeing first caps the peak ~21 GB
         # (cond = unwrapped training transformer, LoRA ACTIVE — so samples reflect the current adapter).
         #
-        # Match standalone generation: the full Ideogram denoise/decode path must bypass any accelerator
-        # autocast wrapper, not just the fp8 Linear matmuls.
-        with torch.autocast(device_type=device.type, enabled=False):
-            z, grid_h, grid_w = denoise_ideogram4_to_tokens(
-                transformer,
-                self._sample_unconditional_dit,
-                text_features,
-                height=height,
-                width=width,
-                preset=preset,
-                device=device,
-                compute_dtype=dit_dtype,
-                generator=generator,
-            )
-            self._sample_unconditional_dit = None
-            gc.collect()
-            clean_memory_on_device(device)
-            with torch.no_grad():
-                pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
+        # Match standalone generation: the full Ideogram denoise/decode path must bypass BOTH
+        # autocast mechanisms — the torch.autocast(enabled=False) covers ordinary context-manager
+        # autocast, and the helper restores _original_forward to defeat the forward-method wrapper
+        # that accelerator.prepare installs on the conditional DiT.
+        with disable_accelerate_forward_autocast(accelerator, transformer):
+            with torch.autocast(device_type=device.type, enabled=False):
+                z, grid_h, grid_w = denoise_ideogram4_to_tokens(
+                    transformer,
+                    self._sample_unconditional_dit,
+                    text_features,
+                    height=height,
+                    width=width,
+                    preset=preset,
+                    device=device,
+                    compute_dtype=dit_dtype,
+                    generator=generator,
+                )
+                self._sample_unconditional_dit = None
+                gc.collect()
+                clean_memory_on_device(device)
+                with torch.no_grad():
+                    pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
         return pixels.unsqueeze(2).cpu()  # (B, 3, 1, H, W) — the base saver keys on shape[2] == 1
 
     # NOTE: the unconditional DiT is loaded LAZILY inside do_inference (not on_before_sample_images): the base

@@ -106,7 +106,10 @@ def test_process_batch_disables_enclosing_autocast(monkeypatch):
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         loss, stats = trainer.process_batch(
             args,
-            SimpleNamespace(device=torch.device("cpu")),
+            # unwrap_model identity-returns: matches Accelerator on non-DDP single device, lets the
+            # helper invoked inside process_batch operate without an AttributeError. The mocked
+            # transformer ("TRANSFORMER") has no _original_forward, so the helper still no-ops.
+            SimpleNamespace(device=torch.device("cpu"), unwrap_model=lambda m: m, trackers=[]),
             "TRANSFORMER",
             None,
             batch,
