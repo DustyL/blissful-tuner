@@ -375,7 +375,22 @@ def grid_to_dit_tokens(grid: torch.Tensor) -> torch.Tensor:
     return grid.permute(0, 2, 3, 1).reshape(batch_size, grid_h * grid_w, channels)
 
 
-def preflight_ideogram4_latent_cache(latent_cache_path: str) -> None:
+def dit_tokens_to_grid(tokens: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+    """EXACT inverse of grid_to_dit_tokens: DiT tokens ``(B, gh*gw, 128)`` -> grid ``(B, 128, gh, gw)``.
+
+    Used by the masked-loss path to put per-token loss back on the spatial grid so a ``(B, 1, gh, gw)`` mask
+    aligns. Must mirror grid_to_dit_tokens' ``permute(0,2,3,1).reshape(...)`` exactly (reshape to (B,gh,gw,C)
+    then permute to (B,C,gh,gw)) — a transpose here would silently apply the mask to the wrong spatial region.
+    """
+    if tokens.ndim != 3 or tokens.shape[-1] != IDEOGRAM4_TOKEN_CHANNELS:
+        raise ValueError(f"expected DiT tokens (B, gh*gw, {IDEOGRAM4_TOKEN_CHANNELS}), got {tuple(tokens.shape)}")
+    batch_size, num_tokens, channels = tokens.shape
+    if num_tokens != grid_h * grid_w:
+        raise ValueError(f"token count {num_tokens} != grid_h*grid_w ({grid_h}*{grid_w}={grid_h * grid_w})")
+    return tokens.reshape(batch_size, grid_h, grid_w, channels).permute(0, 3, 1, 2)
+
+
+def preflight_ideogram4_latent_cache(latent_cache_path: str, *, require_mask_weights: bool = False) -> None:
     """Reader-side guard: reject stale / raw / fork-format Ideogram latent caches BEFORE training.
 
     blissful's shared latent reader (bucket.py) loads tensors via load_file() and NEVER inspects safetensors
@@ -383,10 +398,16 @@ def preflight_ideogram4_latent_cache(latent_cache_path: str) -> None:
     grid-native normalized contract on BOTH metadata and the tensor itself, so copied/stale metadata can't
     approve a semantically wrong file. Call it during dataset/cache validation or before the first training
     step — write-time guarding alone misses old or foreign caches.
+
+    require_mask_weights: when True (training with --use_mask_loss), also require a mask_weights_* tensor, so a
+    stale UNMASKED cache fails before the 8B DiT loads rather than erroring at the first step. Off by default so
+    normal unmasked runs still accept maskless caches.
     """
     with safe_open(latent_cache_path, framework="pt") as f:
         metadata = f.metadata() or {}
-        latent_keys = [k for k in f.keys() if k.startswith("latents_")]
+        keys = list(f.keys())
+        latent_keys = [k for k in keys if k.startswith("latents_")]
+        mask_keys = [k for k in keys if k.startswith("mask_weights_")]
         shapes = {k: tuple(f.get_slice(k).get_shape()) for k in latent_keys}
 
     def _fail(reason: str) -> None:
@@ -421,3 +442,31 @@ def preflight_ideogram4_latent_cache(latent_cache_path: str) -> None:
         _fail(f"malformed latent key {key!r} (expected latents_{{gh}}x{{gw}}_{{dtype}})")
     if (key_gh, key_gw) != (shape[1], shape[2]):
         _fail(f"key {key!r} grid {key_gh}x{key_gw} != tensor grid {shape[1]}x{shape[2]}")
+
+    # 3) Mask contract (only when training with --use_mask_loss): exactly one mask_weights_* tensor, shaped
+    # (1, 1, gh, gw), whose key grid matches the latent grid. Mere presence is not enough — a stale cache with
+    # mask_weights_128x128 paired with latents_64x64 would otherwise pass preflight, load the 8B DiT, then crash
+    # at the first loss reduction (shape mismatch in apply_masked_loss_with_prior). Catch it here, BEFORE the load.
+    if require_mask_weights:
+        if not mask_keys:
+            _fail(
+                "no mask_weights_* tensor, but --use_mask_loss is set. Recache with ideogram4_cache_latents.py "
+                "and a mask_directory (or alpha_mask) in the dataset config, into a FRESH cache_directory."
+            )
+        if len(mask_keys) != 1:
+            _fail(f"expected exactly one mask_weights_* tensor, got {sorted(mask_keys)}")
+        mask_key = mask_keys[0]
+        mask_reso = mask_key[len("mask_weights_") :].split("_", 1)[0]  # "{gh}x{gw}" from mask_weights_{gh}x{gw}_{dtype}
+        try:
+            m_gh, m_gw = (int(x) for x in mask_reso.split("x"))
+        except ValueError:
+            _fail(f"malformed mask key {mask_key!r} (expected mask_weights_{{gh}}x{{gw}}_{{dtype}})")
+        if (m_gh, m_gw) != (shape[1], shape[2]):
+            _fail(
+                f"mask key {mask_key!r} grid {m_gh}x{m_gw} != latent grid {shape[1]}x{shape[2]} — stale cache "
+                "from a different resolution? Recache into a FRESH cache_directory."
+            )
+        with safe_open(latent_cache_path, framework="pt") as f:
+            mask_shape = tuple(f.get_slice(mask_key).get_shape())
+        if mask_shape != (1, 1, m_gh, m_gw):
+            _fail(f"mask {mask_key!r} expected shape (1, 1, {m_gh}, {m_gw}), got {mask_shape}")

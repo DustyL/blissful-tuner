@@ -2,6 +2,7 @@ import logging
 from typing import List
 
 import torch
+import torch.nn.functional as F
 
 from musubi_tuner import cache_latents
 from musubi_tuner.dataset import config_utils
@@ -19,7 +20,7 @@ def preprocess_contents(batch: List[ItemInfo]) -> torch.Tensor:
     contents = []
     for item in batch:
         content = item.content[0] if isinstance(item.content, list) else item.content
-        contents.append(torch.from_numpy(content[..., :3]))  # drop alpha if present (no mask support yet)
+        contents.append(torch.from_numpy(content[..., :3]))  # RGB for the VAE; masks come from item.mask_content
     contents = torch.stack(contents, dim=0).permute(0, 3, 1, 2).contiguous()
     return contents.to(torch.float32) / 255.0
 
@@ -33,8 +34,27 @@ def encode_and_save_batch(autoencoder, batch: List[ItemInfo]):
 
     for b, item in enumerate(batch):
         latent = grid[b].detach().to(torch.bfloat16).cpu()  # (128, gh, gw)
-        logger.info(f"Saving Ideogram 4 latent cache for {item.item_key}: {tuple(latent.shape)}")
-        save_latent_cache_ideogram4(item, latent)
+
+        # Mask-weighted loss: downsample the per-item weighted mask to the DiT-token grid (gh, gw) — the SAME
+        # spatial dims as the cached latent — and stash it compact (1, 1, gh, gw). Only gamma/min_weight are
+        # baked at cache time; blur/area-beta etc. stay at training time. Mirrors flux_2_cache_latents.
+        mask_weights = None
+        if item.mask_content is not None:
+            mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0).float() / 255.0  # (1,1,H,W)
+            mask = mask.clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
+            gh, gw = latent.shape[-2:]
+            mask_weights = F.interpolate(mask, size=(gh, gw), mode="area")  # (1, 1, gh, gw)
+
+        logger.info(
+            f"Saving Ideogram 4 latent cache for {item.item_key}: {tuple(latent.shape)}"
+            + (f" + mask {tuple(mask_weights.shape)}" if mask_weights is not None else "")
+        )
+        save_latent_cache_ideogram4(item, latent, mask_weights=mask_weights)
 
 
 def main():
@@ -67,9 +87,8 @@ def main():
     def encode(batch: List[ItemInfo]):
         encode_and_save_batch(autoencoder, batch)
 
-    # supports_alpha=False: Ideogram 4 mask-weighted loss is NOT supported yet — no mask_weights are written
-    # to the cache (RGB-only above). CONTRACT for the training slice: ideogram4_train_network must REJECT
-    # --use_mask_loss at setup validation until mask cache writing exists, never silently train unmasked.
+    # supports_alpha=False: the VAE encodes RGB (pixel alpha dropped); weighted masks come from item.mask_content
+    # (mask_directory / alpha_mask), downsampled per-item in encode_and_save_batch and written as mask_weights_*.
     cache_latents.encode_datasets(datasets, encode, args, supports_alpha=False)
 
 
