@@ -1,4 +1,5 @@
 import argparse
+import gc
 import logging
 import os
 from typing import Optional
@@ -12,10 +13,21 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
 )
 from musubi_tuner.ideogram4 import ideogram4_utils
+from musubi_tuner.ideogram4.caption_verifier import verify_caption
+from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
+from musubi_tuner.ideogram4.sampler_configs import PRESETS
 from musubi_tuner.ideogram4.scheduler import get_schedule_for_resolution
 from musubi_tuner.ideogram4.sequence import IDEOGRAM4_IMAGE_PATCH
+from musubi_tuner.ideogram4.text_encoder import (
+    TEXT_ENCODER_FORMATS,
+    encode_prompt_to_features,
+    load_ideogram4_text_encoder,
+    load_ideogram4_tokenizer,
+)
 from musubi_tuner.ideogram4.training import ideogram4_flow_matching_target
+from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +54,7 @@ def neutralize_unused_fp8_args(args) -> bool:
 class Ideogram4NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+        self._sample_unconditional_dit = None  # loaded only during sampling (on_before/after_sample_images)
 
     def _validate_args_and_init(self, args) -> bool:
         # Neutralize the no-op fp8 flags BEFORE the base fp8 assert (which lives inside the base
@@ -180,6 +193,28 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "added later (see docs/plans/2026-06-07-ideogram4-native-1024-gc-blockswap.md)."
             )
 
+        # Sampling-during-training needs resources normal training doesn't load (Qwen3-VL encoder, the separate
+        # unconditional DiT, the VAE). Require them up front — only when --sample_prompts is set — so a misconfig
+        # fails before the run instead of at the first sample interval.
+        if getattr(args, "sample_prompts", None):
+            missing = [
+                flag
+                for flag, val in (
+                    ("--vae", getattr(args, "vae", None)),
+                    ("--unconditional_dit", getattr(args, "unconditional_dit", None)),
+                    ("--text_encoder", getattr(args, "text_encoder", None)),
+                    ("--text_encoder_config", getattr(args, "text_encoder_config", None)),
+                    ("--tokenizer", getattr(args, "tokenizer", None)),
+                )
+                if not val
+            ]
+            if missing:
+                raise ValueError(
+                    f"Ideogram 4 sampling (--sample_prompts) requires {', '.join(missing)}: the Qwen3-VL encoder "
+                    "(--text_encoder/--text_encoder_config/--tokenizer), the separate --unconditional_dit, and the "
+                    "--vae for decode. Samples degenerate below ~1024 — set width/height=1024 in the prompt file."
+                )
+
         # args.mixed_precision is filled from the accelerate config LATER (trainer_base.py:1516); when this
         # hook runs it is still None if the CLI omitted it. Default the omitted case to bf16 — fp32 would OOM
         # the 8B DiT AND split the loaded-model dtype (self.dit_dtype) from the training-loop dtype (the local
@@ -253,10 +288,107 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         raise NotImplementedError("Ideogram 4 computes loss in process_batch; call_dit is not used.")
 
     def process_sample_prompts(self, args, accelerator, sample_prompts):
-        raise NotImplementedError(
-            "Sampling-during-training is not yet wired for Ideogram 4. Train without --sample_prompts and "
-            "generate with ideogram4_generate_image.py instead."
+        # Encode each UNIQUE sample prompt once through Qwen3-VL, attach CPU float32 features as
+        # i4_llm_features, then free the TE so the ~8.78 GB encoder stays out of the training loop.
+        logger.info(f"Ideogram 4: encoding sample prompts from {sample_prompts}")
+        prompts = load_prompts(sample_prompts)
+        device = accelerator.device
+        text_encoder = load_ideogram4_text_encoder(
+            args.text_encoder,
+            args.text_encoder_config,
+            text_encoder_format=args.text_encoder_format,
+            dtype=self.dit_dtype,
+            loading_device=device,
         )
+        tokenizer = load_ideogram4_tokenizer(args.tokenizer)
+        features_by_prompt: dict[str, torch.Tensor] = {}
+        for prompt_dict in prompts:
+            prompt = prompt_dict.get("prompt", "")
+            verify_caption(prompt, strict=getattr(args, "strict_caption_verifier", False))
+            if prompt not in features_by_prompt:
+                feats = encode_prompt_to_features(tokenizer, text_encoder, prompt, device)  # (L, 53248)
+                features_by_prompt[prompt] = feats.to(device="cpu", dtype=torch.float32)
+            prompt_dict["i4_llm_features"] = features_by_prompt[prompt]
+        del text_encoder, tokenizer
+        clean_memory_on_device(device)
+        logger.info(f"Ideogram 4: encoded {len(features_by_prompt)} unique prompt(s) for sampling")
+        return prompts
+
+    def do_inference(
+        self,
+        accelerator,
+        args,
+        sample_parameter,
+        vae,
+        dit_dtype,
+        transformer,
+        discrete_flow_shift,
+        sample_steps,
+        width,
+        height,
+        frame_count,
+        generator,
+        do_classifier_free_guidance,
+        guidance_scale,
+        cfg_scale,
+        image_path=None,
+        control_video_path=None,
+    ):
+        # Ideogram uses a named preset (resolution-aware schedule + guidance schedule) and a SEPARATE
+        # unconditional DiT, so the generic discrete_flow_shift / sample_steps / guidance_scale / cfg_scale /
+        # negative_prompt knobs do not apply. width/height/seed (via generator) work normally.
+        if sample_parameter.get("negative_prompt"):
+            logger.warning(
+                "Ideogram 4 ignores negative_prompt: it uses the separate unconditional DiT (asymmetric CFG), "
+                "not a negative text prompt."
+            )
+        device = accelerator.device
+        vae.to(device)  # base loads the VAE on CPU and returns it there afterward (trainer_base.py:1051)
+        preset = PRESETS[args.sampler_preset]
+        text_features = sample_parameter["i4_llm_features"].to(device=device, dtype=dit_dtype)
+        # Lazy-load the unconditional DiT HERE (not on_before) so the risky 9.4 GB load is inside the base's
+        # sampling try/finally — an OOM here still reaches on_after cleanup. Freed per-prompt before decode, so a
+        # later prompt in the same interval reloads it.
+        if self._sample_unconditional_dit is None:
+            self._sample_unconditional_dit = ideogram4_utils.load_ideogram4_transformer(
+                args.unconditional_dit, dtype=self.dit_dtype, loading_device=device
+            )
+        # Denoise with both DiTs, then FREE the unconditional DiT BEFORE the VAE decode. Keeping both 9.4 GB DiTs
+        # resident through a 1024 decode peaks ~30 GB and OOMs a 32 GB card; freeing first caps the peak ~21 GB
+        # (cond = unwrapped training transformer, LoRA ACTIVE — so samples reflect the current adapter).
+        z, grid_h, grid_w = denoise_ideogram4_to_tokens(
+            transformer,
+            self._sample_unconditional_dit,
+            text_features,
+            height=height,
+            width=width,
+            preset=preset,
+            device=device,
+            compute_dtype=dit_dtype,
+            generator=generator,
+        )
+        self._sample_unconditional_dit = None
+        gc.collect()
+        clean_memory_on_device(device)
+        with torch.no_grad():
+            pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
+        return pixels.unsqueeze(2).cpu()  # (B, 3, 1, H, W) — the base saver keys on shape[2] == 1
+
+    # NOTE: the unconditional DiT is loaded LAZILY inside do_inference (not on_before_sample_images): the base
+    # calls on_before OUTSIDE its sampling try/finally (trainer_base.py:2035), so a 9.4 GB load that OOMs there
+    # would skip on_after cleanup. Loading inside do_inference puts the risky load under the base try/finally.
+
+    def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        # Runs in the base `finally` (trainer_base.py:2041). Free the unconditional DiT if a sample raised before
+        # do_inference freed it (the happy path frees it pre-decode), and return the VAE to CPU defensively — the
+        # base does this on success (trainer_base.py:1051) but NOT if do_inference raised. Keeps the tight ~30 GB
+        # sample peak from leaking into the rest of training.
+        if getattr(self, "_sample_unconditional_dit", None) is not None:
+            self._sample_unconditional_dit = None
+        if vae is not None:
+            vae.to("cpu")
+        gc.collect()
+        clean_memory_on_device(accelerator.device)
 
     # endregion
 
@@ -274,6 +406,22 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument(
         "--fp8_scaled", action="store_true", help="no-op for Ideogram 4 (DiT is fp8 via the shim); accepted for compatibility"
     )
+    # Sampling-during-training (only used when --sample_prompts is set). --vae is a base arg, reused for decode.
+    parser.add_argument(
+        "--unconditional_dit", type=str, default=None, help="unconditional DiT weights for sampling (asymmetric CFG)"
+    )
+    parser.add_argument("--text_encoder", type=str, default=None, help="Qwen3-VL TE weights for sample-prompt encoding")
+    parser.add_argument("--text_encoder_config", type=str, default=None, help="local Qwen3-VL config dir for sampling")
+    parser.add_argument("--tokenizer", type=str, default=None, help="local Qwen3-VL tokenizer dir for sampling")
+    parser.add_argument("--text_encoder_format", type=str, default="hf_full", choices=TEXT_ENCODER_FORMATS)
+    parser.add_argument(
+        "--sampler_preset",
+        type=str,
+        default="V4_TURBO_12",
+        choices=list(PRESETS),
+        help="named sampler preset for training samples (default V4_TURBO_12, a fast health check)",
+    )
+    parser.add_argument("--strict_caption_verifier", action="store_true", help="error (not warn) on caption-format issues")
     return parser
 
 

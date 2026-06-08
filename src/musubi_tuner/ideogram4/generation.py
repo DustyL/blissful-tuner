@@ -10,8 +10,15 @@ from __future__ import annotations
 
 import torch
 
-from musubi_tuner.ideogram4.scheduler import LogitNormalSchedule, make_step_intervals
-from musubi_tuner.ideogram4.sequence import Ideogram4Sequence, build_image_input, extract_image_tokens
+from musubi_tuner.ideogram4.sampler_configs import SamplerParameters
+from musubi_tuner.ideogram4.scheduler import LogitNormalSchedule, get_schedule_for_resolution, make_step_intervals
+from musubi_tuner.ideogram4.sequence import (
+    Ideogram4Sequence,
+    build_ideogram4_conditioning,
+    build_image_input,
+    extract_image_tokens,
+    image_grid_dims,
+)
 
 IDEOGRAM4_LATENT_DIM = 128  # DiT in_channels (patchified token channels)
 
@@ -84,3 +91,39 @@ def denoise_ideogram4_tokens(
         z = z + v * (s_val - t_val)  # canonical: integrate toward clean (delta > 0), noise@t~0 -> clean@t~1
 
     return z
+
+
+def denoise_ideogram4_to_tokens(
+    conditional_model,
+    unconditional_model,
+    text_features: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    preset: SamplerParameters,
+    device: torch.device | str,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, int, int]:
+    """Build conditioning -> asymmetric-CFG denoise -> (z normalized DiT tokens, grid_h, grid_w).
+
+    The SINGLE source of the validated B5 t-convention for BOTH manual generation and sampling-during-training,
+    so it can never drift between them. Decode is a SEPARATE call (decode_dit_tokens_to_pixels) so a caller can
+    free the unconditional DiT BEFORE the VAE decode — keeping both 9.4 GB DiTs resident through a 1024 decode
+    peaks ~30 GB, which OOMs sampling on a 32 GB card. ``text_features`` is one prompt's (L, 53248) features.
+    """
+    grid_h, grid_w = image_grid_dims(height, width)
+    sequence = build_ideogram4_conditioning([text_features], grid_h, grid_w, device=device, dtype=compute_dtype)
+    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
+    z = denoise_ideogram4_tokens(
+        conditional_model,
+        unconditional_model,
+        sequence,
+        num_steps=preset.num_steps,
+        guidance_schedule=preset.guidance_schedule,
+        schedule=schedule,
+        device=device,
+        compute_dtype=compute_dtype,
+        generator=generator,
+    )
+    return z, grid_h, grid_w

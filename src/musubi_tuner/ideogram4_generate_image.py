@@ -6,15 +6,13 @@ import torch
 from PIL import Image
 
 from musubi_tuner.ideogram4.caption_verifier import verify_caption
-from musubi_tuner.ideogram4.generation import denoise_ideogram4_tokens
+from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
 from musubi_tuner.ideogram4.ideogram4_utils import (
     decode_dit_tokens_to_pixels,
     load_ideogram4_autoencoder,
     load_ideogram4_transformer,
 )
 from musubi_tuner.ideogram4.sampler_configs import PRESETS
-from musubi_tuner.ideogram4.scheduler import get_schedule_for_resolution
-from musubi_tuner.ideogram4.sequence import build_ideogram4_conditioning, image_grid_dims
 from musubi_tuner.ideogram4.text_encoder import (
     TEXT_ENCODER_FORMATS,
     encode_prompt_to_features,
@@ -58,7 +56,6 @@ def main():
     dtype = str_to_dtype(args.dtype)
     height, width = args.image_size
     preset = PRESETS[args.sampler_preset]
-    grid_h, grid_w = image_grid_dims(height, width)
 
     # 1. Encode the prompt, then free the text encoder before loading the (large) DiTs.
     verify_caption(args.prompt, strict=args.strict_caption_verifier)  # H4: warn-only by default
@@ -76,23 +73,21 @@ def main():
     del text_encoder, tokenizer
     _empty_cache(device)
 
-    sequence = build_ideogram4_conditioning([features], grid_h, grid_w, device=device, dtype=dtype)
-
-    # 2. Load both DiTs, run the asymmetric-CFG denoise, then free them before decoding.
+    # 2. Load both DiTs, denoise (the single source of the B5 t-convention), then FREE them before loading the
+    #    VAE for decode — denoise needs both DiTs, decode needs only the VAE, so freeing first keeps the peak low.
     logger.info("Loading conditional + unconditional DiTs")
     conditional = load_ideogram4_transformer(args.dit, dtype=dtype, loading_device=device)
     unconditional = load_ideogram4_transformer(args.unconditional_dit, dtype=dtype, loading_device=device)
 
-    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     logger.info(f"Denoising: {preset.num_steps} steps, preset {args.sampler_preset}")
-    z = denoise_ideogram4_tokens(
+    z, grid_h, grid_w = denoise_ideogram4_to_tokens(
         conditional,
         unconditional,
-        sequence,
-        num_steps=preset.num_steps,
-        guidance_schedule=preset.guidance_schedule,
-        schedule=schedule,
+        features,
+        height=height,
+        width=width,
+        preset=preset,
         device=device,
         compute_dtype=dtype,
         generator=generator,
