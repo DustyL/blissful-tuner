@@ -568,8 +568,16 @@ class LoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
+        # Explicit dtype harmonization for the LoRA matmul. Under autocast (the common case)
+        # these casts are no-ops because autocast already inserted them at the F.linear boundary.
+        # Without autocast (e.g., Ideogram 4 disables it at do_inference / process_batch to keep
+        # training-inference parity — see src/musubi_tuner/utils/accelerate_utils.py), the base
+        # model's input dtype (bf16) and the LoRA weight dtype (fp32 by default) don't match, and
+        # F.linear raises "expected mat1 and mat2 to have the same dtype". The explicit cast makes
+        # LoRA forward correct regardless of the caller's autocast state.
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lora_dtype = self.lora_down.weight.dtype
+            lx = self.lora_down(x.to(lora_dtype) if x.dtype != lora_dtype else x)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -592,15 +600,22 @@ class LoRAModule(torch.nn.Module):
             lx = self.lora_up(lx)
 
             if self.use_dora and self.dora_layer is not None:
-                # DoRA: compute delta and add to base
+                # DoRA: compute delta and add to base. Cast lora_result to base's dtype so the
+                # mixed-precision math inside _dora_delta is consistent and the output preserves
+                # the module's expected dtype.
                 if scale * self.multiplier == 0:
                     return org_forwarded
-                dora_delta = self._dora_delta(org_forwarded, lx, scale)
+                dora_delta = self._dora_delta(org_forwarded, lx.to(org_forwarded.dtype), scale)
                 return org_forwarded + dora_delta
             else:
-                return org_forwarded + lx * self.multiplier * scale
+                # Cast back to base's dtype before adding so addition doesn't promote the
+                # output dtype (e.g., fp32 LoRA output + bf16 base would otherwise become fp32).
+                return org_forwarded + lx.to(org_forwarded.dtype) * self.multiplier * scale
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            # All sub-loras share the same dtype (created together with the same nn.Linear default).
+            lora_dtype = self.lora_down[0].weight.dtype
+            x_for_lora = x.to(lora_dtype) if x.dtype != lora_dtype else x
+            lxs = [lora_down(x_for_lora) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -628,7 +643,8 @@ class LoRAModule(torch.nn.Module):
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
-            return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+            # Cast concatenated LoRA result back to base's dtype to preserve output dtype.
+            return org_forwarded + torch.cat(lxs, dim=-1).to(org_forwarded.dtype) * self.multiplier * scale
 
 
 class LoRAInfModule(LoRAModule):
