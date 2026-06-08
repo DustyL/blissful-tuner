@@ -192,12 +192,21 @@ def save_latent_cache_flux_2(
     save_latent_cache_common(item_info, sd, arch_full)
 
 
-def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor, arch_full: str = ARCHITECTURE_IDEOGRAM4_FULL):
+def save_latent_cache_ideogram4(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    arch_full: str = ARCHITECTURE_IDEOGRAM4_FULL,
+    mask_weights: Optional[torch.Tensor] = None,
+):
     """Ideogram 4: persist the already-patchified + latent_norm'd DiT-token GRID as (128, gh, gw) under the
     native key latents_{gh}x{gw}_{dtype}, so blissful's grid-native reader loads it unchanged. The trainer
     flattens (ideogram4_utils.grid_to_dit_tokens) and must NOT patchify or latent_norm again. Metadata flags
     mark it training-ready; the shared reader ignores metadata, so an Ideogram-specific preflight
     (ideogram4_utils.preflight_ideogram4_latent_cache) enforces them before training.
+
+    mask_weights: optional (1, 1, gh, gw) weighted mask in DiT-token grid space (already downsampled to the
+    latent grid), written as mask_weights_{gh}x{gw}_float16 — the same compact convention as FLUX.2, so the
+    shared reader stacks it to (B, 1, 1, gh, gw) for apply_masked_loss_with_prior (layout="video").
     """
     assert latent.dim() == 3 and latent.shape[0] == 128, (
         f"Ideogram 4 latent must be the (128, gh, gw) token grid, got {tuple(latent.shape)}"
@@ -205,6 +214,9 @@ def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor, arch_
     _, gh, gw = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{gh}x{gw}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if mask_weights is not None:
+        sd[f"mask_weights_{gh}x{gw}_{dtype_to_str(torch.float16)}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     extra_metadata = {
         ideogram4_constants.IDEOGRAM4_LATENT_NORM_METADATA_KEY: "true",

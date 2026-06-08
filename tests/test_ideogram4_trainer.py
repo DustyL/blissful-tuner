@@ -78,19 +78,22 @@ def test_trainer_architecture_names():
     assert trainer.architecture_full_name == "ideogram4"
 
 
-def test_trainer_rejects_use_mask_loss():
-    # Backstop: the mask-loss guard still fires inside process_batch (no mask cache exists for Ideogram yet).
+def test_process_batch_requires_mask_weights_when_enabled():
+    # Masked loss is supported now; process_batch fails fast if --use_mask_loss is set but the batch has no
+    # mask_weights (stale unmasked cache), via require_mask_weights_if_enabled.
     trainer = Ideogram4NetworkTrainer()
     args = SimpleNamespace(use_mask_loss=True)
-    with pytest.raises(ValueError, match="use_mask_loss"):
-        trainer.process_batch(args, None, None, None, None, None, None, None, None, None, None, None)
+    with pytest.raises(ValueError, match="mask_weights"):
+        trainer.process_batch(args, None, None, None, {}, None, None, None, None, None, None, None)
 
 
-def test_handle_model_specific_args_rejects_use_mask_loss_at_setup():
-    # Authoritative fail-fast: rejection happens at setup (handle_model_specific_args), before the model load.
+def test_handle_model_specific_args_accepts_use_mask_loss():
+    # Masked loss is supported now — setup must NOT reject it (the per-batch mask requirement is enforced in
+    # process_batch + the cache preflight instead).
     trainer = Ideogram4NetworkTrainer()
-    with pytest.raises(ValueError, match="use_mask_loss"):
-        trainer.handle_model_specific_args(SimpleNamespace(use_mask_loss=True))
+    args = SimpleNamespace(use_mask_loss=True, mixed_precision="bf16")
+    trainer.handle_model_specific_args(args)  # no raise
+    assert trainer.dit_dtype == torch.bfloat16
 
 
 def test_handle_model_specific_args_accepts_gradient_checkpointing():

@@ -25,6 +25,8 @@ from musubi_tuner.ideogram4.text_encoder import (
     load_ideogram4_tokenizer,
 )
 from musubi_tuner.ideogram4.training import ideogram4_flow_matching_target
+from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
+from musubi_tuner.modules.mask_loss import apply_masked_loss_with_prior, require_mask_weights_if_enabled
 from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
@@ -69,14 +71,15 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # metadata, so a stale / raw / fork-format cache would otherwise enter training silently. This runs
         # after dataset construction (trainer_base.py:1362) and before model load (1365).
         result = super()._build_dataset(args)
-        self._preflight_latent_caches(result[0])
+        self._preflight_latent_caches(result[0], require_mask_weights=getattr(args, "use_mask_loss", False))
         return result
 
-    def _preflight_latent_caches(self, train_dataset_group) -> int:
+    def _preflight_latent_caches(self, train_dataset_group, require_mask_weights: bool = False) -> int:
         """Validate every ACTIVE Ideogram latent cache (norm-applied, grid layout, dit-token space, shape).
 
         Raises ValueError (from preflight_ideogram4_latent_cache) on the first stale / raw / fork-format cache,
-        aborting before the model load. Returns the number of distinct cache files validated.
+        aborting before the model load. Returns the number of distinct cache files validated. When
+        require_mask_weights is set (training with --use_mask_loss), also require a mask_weights_* tensor.
 
         Active set only: the cached-dataset path (image_video_dataset.py:644) skips any latent cache that has
         no paired text-encoder cache, so preflight mirrors that pairing — otherwise a stale orphan
@@ -101,7 +104,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                     skipped_orphans += 1
                     continue
                 seen.add(cache_path)
-                ideogram4_utils.preflight_ideogram4_latent_cache(cache_path)
+                ideogram4_utils.preflight_ideogram4_latent_cache(cache_path, require_mask_weights=require_mask_weights)
         msg = f"Ideogram 4 latent-cache preflight passed: {len(seen)} active cache file(s) validated."
         if skipped_orphans:
             msg += f" ({skipped_orphans} orphan latent cache(s) without a paired TE cache skipped — training ignores them.)"
@@ -128,13 +131,13 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         latents: cached grid (B, 128, gh, gw), already patchified + latent_norm'd (scale_shift_latents is a
         no-op). batch["i4_llm_features"]: varlen list of (L_text_i, 53248) cached Qwen3-VL features.
         """
-        # Backstop only — the authoritative fail-fast rejection is in handle_model_specific_args (setup time,
-        # before the model load). Kept here so a direct process_batch caller (test/future path) still errors.
-        if getattr(args, "use_mask_loss", False):
-            raise ValueError(
-                "Ideogram 4 does not support --use_mask_loss yet (the latent cache writes no mask_weights). "
-                "Remove --use_mask_loss, or add mask caching + token-grid mask patchify first."
-            )
+        # Fail fast if --use_mask_loss is set but this batch has no masks (stale unmasked cache). The preflight
+        # already catches this before the model load; this is the per-batch backstop.
+        require_mask_weights_if_enabled(
+            batch,
+            args,
+            cache_hint="Recache Ideogram latents with ideogram4_cache_latents.py and a mask_directory/alpha_mask, into a FRESH cache_directory.",
+        )
 
         device = accelerator.device
         text_features = batch["i4_llm_features"]
@@ -150,7 +153,30 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         model_pred, target = ideogram4_flow_matching_target(
             transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
         )
-        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
+
+        if not getattr(args, "use_mask_loss", False):
+            loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
+            return loss, {}
+
+        # Mask-weighted loss: put per-token pred/target back on the spatial grid (B, 128, gh, gw) — the exact
+        # inverse of grid_to_dit_tokens — so the cached (B, 1, 1, gh, gw) mask aligns, then reduce via the shared
+        # weighted-mean reducer. Target-only: prior preservation is deferred to Slice 2 (it needs the Ideogram
+        # t=cleanness -> noise remap), so prior_loss_unreduced=None. No SD3 weighting (matches the unmasked path).
+        model_pred_grid = ideogram4_utils.dit_tokens_to_grid(model_pred.to(network_dtype), grid_h, grid_w)
+        target_grid = ideogram4_utils.dit_tokens_to_grid(target.to(network_dtype), grid_h, grid_w)
+        loss_unreduced = compute_unreduced_target_loss(
+            model_pred_grid,
+            target_grid,
+            loss_type=getattr(args, "loss_type", "mse"),
+            loss_delta=getattr(args, "loss_delta", 1.0),
+        )
+        loss = apply_masked_loss_with_prior(
+            loss_unreduced,
+            batch.get("mask_weights"),
+            prior_loss_unreduced=None,
+            args=args,
+            layout="video",
+        )
         return loss, {}
 
     # region model specific
@@ -168,11 +194,6 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # accelerator setup / model load — so it is the right place to fail fast on unsupported config and to
         # pin the compute dtype, rather than discovering the problem deep in the training loop.
 
-        if getattr(args, "use_mask_loss", False):
-            raise ValueError(
-                "Ideogram 4 does not support --use_mask_loss yet (the latent cache writes no mask_weights). "
-                "Remove --use_mask_loss, or add mask caching + token-grid mask patchify first."
-            )
         if getattr(args, "gradient_checkpointing_cpu_offload", False):
             raise ValueError(
                 "Ideogram 4 supports --gradient_checkpointing, but not --gradient_checkpointing_cpu_offload yet: "
