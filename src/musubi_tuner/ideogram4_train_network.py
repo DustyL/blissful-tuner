@@ -170,14 +170,25 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             loss_type=getattr(args, "loss_type", "mse"),
             loss_delta=getattr(args, "loss_delta", 1.0),
         )
+        # Surface mask telemetry to TensorBoard so a long likeness run can confirm the mask is active and
+        # non-degenerate (all-zero / all-one would still produce plausible loss numbers). Gate on trackers to
+        # avoid the .item() syncs when nothing consumes them. Mirrors the namespace in mask_loss_process_batch.py.
+        stats_enabled = len(accelerator.trackers) > 0
+        mask_loss_stats: dict[str, torch.Tensor] | None = {} if stats_enabled else None
         loss = apply_masked_loss_with_prior(
             loss_unreduced,
             batch.get("mask_weights"),
             prior_loss_unreduced=None,
+            stats=mask_loss_stats,
             args=args,
             layout="video",
         )
-        return loss, {}
+        loss_metrics: dict[str, float] = {}
+        if stats_enabled and mask_loss_stats:
+            for k, v in mask_loss_stats.items():
+                if isinstance(v, torch.Tensor):
+                    loss_metrics[f"masked_loss/{k}"] = float(v.detach().float().item())
+        return loss, loss_metrics
 
     # region model specific
 
@@ -212,6 +223,18 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "default raises NotImplementedError (trainer_base.py:1127) only AFTER accelerator.prepare — a "
                 "confusing late crash. Remove --compile; a compile_transformer over [transformer.layers] can be "
                 "added later (see docs/plans/2026-06-07-ideogram4-native-1024-gc-blockswap.md)."
+            )
+
+        # Slice-1 masked loss is TARGET-ONLY: process_batch passes prior_loss_unreduced=None unconditionally.
+        # The shared validator (modules/mask_loss.py:226) only rejects prior_weight>0 without --use_mask_loss,
+        # so a config with BOTH set would slip past and train target-only while logs/state claim prior is active.
+        # Fail fast so the user notices instead of burning GPU-days on a silently-degraded run. Remove when the
+        # Ideogram prior branch lands in Slice 2 (needs the t=cleanness -> noise remap, (1-t)*1000).
+        if getattr(args, "use_mask_loss", False) and float(getattr(args, "prior_preservation_weight", 0.0)) > 0:
+            raise ValueError(
+                "Ideogram 4 masked loss currently supports target-only weighting. "
+                "--prior_preservation_weight > 0 is deferred until Ideogram prior preservation is implemented "
+                "(Slice 2: t=cleanness -> noise remap)."
             )
 
         # Sampling-during-training needs resources normal training doesn't load (Qwen3-VL encoder, the separate

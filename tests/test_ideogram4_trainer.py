@@ -96,6 +96,27 @@ def test_handle_model_specific_args_accepts_use_mask_loss():
     assert trainer.dit_dtype == torch.bfloat16
 
 
+def test_handle_model_specific_args_rejects_prior_preservation_with_mask_loss():
+    # Slice-1 masked loss is target-only (process_batch passes prior_loss_unreduced=None unconditionally). If
+    # the user sets --use_mask_loss --prior_preservation_weight 1.0, the shared validator would let it through
+    # (it only rejects prior>0 WITHOUT use_mask_loss), and training would silently run target-only. Fail fast.
+    trainer = Ideogram4NetworkTrainer()
+    args = SimpleNamespace(use_mask_loss=True, prior_preservation_weight=1.0, mixed_precision="bf16")
+    with pytest.raises(ValueError, match="prior_preservation_weight"):
+        trainer.handle_model_specific_args(args)
+
+    # prior_preservation_weight == 0 (default-ish) is fine.
+    trainer2 = Ideogram4NetworkTrainer()
+    trainer2.handle_model_specific_args(SimpleNamespace(use_mask_loss=True, prior_preservation_weight=0.0, mixed_precision="bf16"))
+
+    # use_mask_loss=False + prior_preservation_weight>0 is the shared-validator's domain; this trainer-level
+    # check must not steal that error from the shared validator (different message, different fix).
+    trainer3 = Ideogram4NetworkTrainer()
+    trainer3.handle_model_specific_args(
+        SimpleNamespace(use_mask_loss=False, prior_preservation_weight=1.0, mixed_precision="bf16")
+    )  # no raise here; shared validator handles this case
+
+
 def test_handle_model_specific_args_accepts_gradient_checkpointing():
     # GC is supported now — it must NOT raise (the rejection moved to the cpu_offload variant).
     trainer = Ideogram4NetworkTrainer()

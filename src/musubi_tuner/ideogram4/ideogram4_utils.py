@@ -443,9 +443,30 @@ def preflight_ideogram4_latent_cache(latent_cache_path: str, *, require_mask_wei
     if (key_gh, key_gw) != (shape[1], shape[2]):
         _fail(f"key {key!r} grid {key_gh}x{key_gw} != tensor grid {shape[1]}x{shape[2]}")
 
-    # 3) Mask contract (only when training with --use_mask_loss): a mask_weights_* tensor must be present.
-    if require_mask_weights and not mask_keys:
-        _fail(
-            "no mask_weights_* tensor, but --use_mask_loss is set. Recache with ideogram4_cache_latents.py and a "
-            "mask_directory (or alpha_mask) in the dataset config, into a FRESH cache_directory."
-        )
+    # 3) Mask contract (only when training with --use_mask_loss): exactly one mask_weights_* tensor, shaped
+    # (1, 1, gh, gw), whose key grid matches the latent grid. Mere presence is not enough — a stale cache with
+    # mask_weights_128x128 paired with latents_64x64 would otherwise pass preflight, load the 8B DiT, then crash
+    # at the first loss reduction (shape mismatch in apply_masked_loss_with_prior). Catch it here, BEFORE the load.
+    if require_mask_weights:
+        if not mask_keys:
+            _fail(
+                "no mask_weights_* tensor, but --use_mask_loss is set. Recache with ideogram4_cache_latents.py "
+                "and a mask_directory (or alpha_mask) in the dataset config, into a FRESH cache_directory."
+            )
+        if len(mask_keys) != 1:
+            _fail(f"expected exactly one mask_weights_* tensor, got {sorted(mask_keys)}")
+        mask_key = mask_keys[0]
+        mask_reso = mask_key[len("mask_weights_") :].split("_", 1)[0]  # "{gh}x{gw}" from mask_weights_{gh}x{gw}_{dtype}
+        try:
+            m_gh, m_gw = (int(x) for x in mask_reso.split("x"))
+        except ValueError:
+            _fail(f"malformed mask key {mask_key!r} (expected mask_weights_{{gh}}x{{gw}}_{{dtype}})")
+        if (m_gh, m_gw) != (shape[1], shape[2]):
+            _fail(
+                f"mask key {mask_key!r} grid {m_gh}x{m_gw} != latent grid {shape[1]}x{shape[2]} — stale cache "
+                "from a different resolution? Recache into a FRESH cache_directory."
+            )
+        with safe_open(latent_cache_path, framework="pt") as f:
+            mask_shape = tuple(f.get_slice(mask_key).get_shape())
+        if mask_shape != (1, 1, m_gh, m_gw):
+            _fail(f"mask {mask_key!r} expected shape (1, 1, {m_gh}, {m_gw}), got {mask_shape}")

@@ -216,6 +216,12 @@ def save_latent_cache_ideogram4(
     sd = {f"latents_{gh}x{gw}_{dtype_str}": latent.detach().cpu().contiguous()}
 
     if mask_weights is not None:
+        # Docstring promises (1, 1, gh, gw) at the DiT-token grid — the trainer's compact mask convention.
+        # Assert it at write time so a future caller can't plant a malformed mask that the preflight then has to
+        # field. Belt-and-suspenders with preflight_ideogram4_latent_cache(require_mask_weights=True).
+        assert tuple(mask_weights.shape) == (1, 1, gh, gw), (
+            f"Ideogram 4 mask_weights must be (1, 1, {gh}, {gw}), got {tuple(mask_weights.shape)}"
+        )
         sd[f"mask_weights_{gh}x{gw}_{dtype_to_str(torch.float16)}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     extra_metadata = {

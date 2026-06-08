@@ -131,3 +131,151 @@ def test_preflight_requires_mask_only_when_enabled(tmp_path):
     masked = _item(tmp_path, key="masked")
     save_latent_cache_ideogram4(masked, torch.randn(128, 4, 6).to(torch.bfloat16), mask_weights=torch.rand(1, 1, 4, 6))
     preflight_ideogram4_latent_cache(masked.latent_cache_path, require_mask_weights=True)  # ok with a mask
+
+
+def _write_cache_with_extra_tensors(latent_cache_path, latent, mask_overrides):
+    """Bypass the write-side shape assert by writing through safetensors directly — used to forge the kinds of
+    stale/foreign caches that the preflight has to catch on read. Mirrors save_latent_cache_ideogram4's keys."""
+    from safetensors.torch import save_file
+
+    from musubi_tuner.ideogram4 import constants as i4c
+
+    _, gh, gw = latent.shape
+    sd = {f"latents_{gh}x{gw}_bfloat16": latent.contiguous()}
+    for key, tensor in mask_overrides.items():
+        sd[key] = tensor
+    save_file(
+        sd,
+        str(latent_cache_path),
+        metadata={
+            i4c.IDEOGRAM4_LATENT_NORM_METADATA_KEY: "true",
+            i4c.IDEOGRAM4_LATENT_LAYOUT_KEY: i4c.IDEOGRAM4_LATENT_LAYOUT_GRID_CHW,
+            i4c.IDEOGRAM4_LATENT_SPACE_KEY: i4c.IDEOGRAM4_LATENT_SPACE_DIT_TOKENS,
+            "architecture": "ideogram4",
+        },
+    )
+
+
+def test_preflight_rejects_mask_grid_mismatch(tmp_path):
+    # The fail-fast headline scenario: a stale 128x128 mask paired with a fresh 4x6 latent (different
+    # resolution, different cache). Without this check, preflight passes, the 8B DiT loads, and training
+    # crashes at the first loss reduction inside apply_masked_loss_with_prior. We want the abort BEFORE load.
+    path = tmp_path / "mismatch_4x6_i4.safetensors"
+    _write_cache_with_extra_tensors(
+        path,
+        torch.zeros(128, 4, 6, dtype=torch.bfloat16),
+        {"mask_weights_128x128_float16": torch.zeros(1, 1, 128, 128, dtype=torch.float16)},
+    )
+    with pytest.raises(ValueError, match=r"grid 128x128 != latent grid 4x6"):
+        preflight_ideogram4_latent_cache(str(path), require_mask_weights=True)
+
+
+def test_preflight_rejects_multiple_mask_tensors(tmp_path):
+    # A cache should hold exactly one mask. Two is either a writer bug or a corrupted manual edit; either way
+    # apply_masked_loss_with_prior only reads the one the shared bucket reader picks first, so the others are
+    # ghosts. Refuse to train against ambiguous state.
+    path = tmp_path / "dual_4x6_i4.safetensors"
+    _write_cache_with_extra_tensors(
+        path,
+        torch.zeros(128, 4, 6, dtype=torch.bfloat16),
+        {
+            "mask_weights_4x6_float16": torch.zeros(1, 1, 4, 6, dtype=torch.float16),
+            "mask_weights_8x12_float16": torch.zeros(1, 1, 8, 12, dtype=torch.float16),
+        },
+    )
+    with pytest.raises(ValueError, match="exactly one mask_weights"):
+        preflight_ideogram4_latent_cache(str(path), require_mask_weights=True)
+
+
+def test_preflight_rejects_malformed_mask_key(tmp_path):
+    # A non-parseable mask key (no "x" in the geometry token) is a corrupted writer or a foreign file. Reject
+    # explicitly so the error points at the key, not at a downstream tensor op three layers deep.
+    path = tmp_path / "malformed_4x6_i4.safetensors"
+    _write_cache_with_extra_tensors(
+        path,
+        torch.zeros(128, 4, 6, dtype=torch.bfloat16),
+        {"mask_weights_GARBAGE_float16": torch.zeros(1, 1, 4, 6, dtype=torch.float16)},
+    )
+    with pytest.raises(ValueError, match="malformed mask key"):
+        preflight_ideogram4_latent_cache(str(path), require_mask_weights=True)
+
+
+def test_preflight_rejects_wrong_mask_tensor_shape(tmp_path):
+    # The mask must be (1, 1, gh, gw). A (1, 1, gh, gw, 1) etc. shape (cache corruption / partial write) would
+    # broadcast unpredictably inside apply_masked_loss_with_prior. Catch it at preflight so the abort message
+    # names "mask shape," not "loss reduction shape mismatch."
+    path = tmp_path / "wrongshape_4x6_i4.safetensors"
+    _write_cache_with_extra_tensors(
+        path,
+        torch.zeros(128, 4, 6, dtype=torch.bfloat16),
+        {"mask_weights_4x6_float16": torch.zeros(4, 6, dtype=torch.float16)},  # 2D, missing (1, 1, ...) prefix
+    )
+    with pytest.raises(ValueError, match=r"expected shape \(1, 1, 4, 6\)"):
+        preflight_ideogram4_latent_cache(str(path), require_mask_weights=True)
+
+
+def test_save_latent_cache_asserts_mask_shape(tmp_path):
+    # The write-side guard: docstring promises (1, 1, gh, gw); enforce it at write time so a future caller can
+    # not plant a malformed mask that the preflight then has to field. Belt-and-suspenders with preflight.
+    item = _item(tmp_path, key="badwrite")
+    with pytest.raises(AssertionError, match=r"\(1, 1, 4, 6\)"):
+        save_latent_cache_ideogram4(item, torch.zeros(128, 4, 6).to(torch.bfloat16), mask_weights=torch.zeros(4, 6))
+
+
+def test_process_batch_returns_masked_loss_telemetry():
+    # When trackers are wired, process_batch must return loss_metrics with masked_loss/* keys so TensorBoard
+    # can confirm the mask is active and non-degenerate during long likeness runs. Without this, the only
+    # signal is the loss number itself, which looks plausible even with an all-zero or all-one mask.
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    trainer = Ideogram4NetworkTrainer()
+    args = SimpleNamespace(
+        use_mask_loss=True,
+        mask_gamma=1.0,
+        mask_min_weight=0.0,
+        mask_blur_kernel_size=0,
+        mask_blur_radius=0.0,
+        mask_area_scale_beta=0.0,
+        normalize_per_sample=False,
+        prior_preservation_weight=0.0,
+        loss_type="mse",
+        loss_delta=1.0,
+        ideogram4_timestep_mu=None,
+        ideogram4_timestep_std=1.0,
+    )
+
+    gh, gw = 4, 6
+    latents = torch.zeros(1, 128, gh, gw)
+    mask = torch.ones(1, 1, 1, gh, gw)  # (B, 1, F=1, gh, gw), what the bucket reader stacks to
+    batch = {"mask_weights": mask, "i4_llm_features": [torch.zeros(1, 53248)]}
+
+    # Stub out ideogram4_flow_matching_target + the resolution scheduler so we don't load the real DiT.
+    import musubi_tuner.ideogram4_train_network as itn
+
+    accelerator_stub = SimpleNamespace(device=torch.device("cpu"), trackers=[object()])  # nonempty -> stats on
+    model_pred_tokens = torch.zeros(1, gh * gw, 128)
+    target_tokens = torch.full((1, gh * gw, 128), 0.5)
+
+    def _flow(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        return model_pred_tokens.to(network_dtype), target_tokens.to(network_dtype)
+
+    def _schedule(reso, *, known_mean, std):
+        return lambda u: u  # identity; timesteps shape is what matters
+
+    orig_flow = itn.ideogram4_flow_matching_target
+    orig_sched = itn.get_schedule_for_resolution
+    itn.ideogram4_flow_matching_target = _flow
+    itn.get_schedule_for_resolution = _schedule
+    try:
+        loss, metrics = trainer.process_batch(
+            args, accelerator_stub, None, None, batch, latents, None, None, torch.float32, torch.float32, None, 0
+        )
+    finally:
+        itn.ideogram4_flow_matching_target = orig_flow
+        itn.get_schedule_for_resolution = orig_sched
+
+    assert torch.is_tensor(loss)
+    assert any(k.startswith("masked_loss/") for k in metrics), f"expected masked_loss/* telemetry, got {sorted(metrics)}"
+    assert "masked_loss/target" in metrics
+    assert "masked_loss/mask/raw_mean" in metrics  # uniform-one mask -> raw_mean == 1.0
+    assert abs(metrics["masked_loss/mask/raw_mean"] - 1.0) < 1e-6
