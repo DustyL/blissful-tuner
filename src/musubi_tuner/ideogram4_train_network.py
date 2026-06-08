@@ -24,9 +24,11 @@ from musubi_tuner.ideogram4.text_encoder import (
     load_ideogram4_text_encoder,
     load_ideogram4_tokenizer,
 )
-from musubi_tuner.ideogram4.training import ideogram4_flow_matching_target
+from blissful_tuner.mask_loss_process_batch import prior_model_context
+from musubi_tuner.ideogram4.training import ideogram4_cleanness_to_noise_timestep, ideogram4_flow_matching_target
 from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.mask_loss import apply_masked_loss_with_prior, require_mask_weights_if_enabled
+from musubi_tuner.modules.prior_scheduling import compute_prior_weight_per_sample
 from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.accelerate_utils import disable_accelerate_forward_autocast
@@ -112,6 +114,21 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         logger.info(msg)
         return len(seen)
 
+    def _run_i4_flow_forward(self, accelerator, transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        """Run ``ideogram4_flow_matching_target`` under both autocast bypasses (helper + explicit off).
+
+        The training forward and the prior-teacher forward MUST go through the same numerical path:
+        if one runs under accelerator's autocast wrapper and the other doesn't, they evaluate
+        different effective models — the same parity failure mode the v1-v3 sample/train split hit
+        (see commit 55e4d79). Centralizing the autocast handling here makes drift between caller
+        sites a refactor away, not a copy-paste-divergence-prone hazard.
+        """
+        with disable_accelerate_forward_autocast(accelerator, transformer):
+            with torch.autocast(device_type=device.type, enabled=False):
+                return ideogram4_flow_matching_target(
+                    transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
+                )
+
     def process_batch(
         self,
         args,
@@ -131,6 +148,14 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
 
         latents: cached grid (B, 128, gh, gw), already patchified + latent_norm'd (scale_shift_latents is a
         no-op). batch["i4_llm_features"]: varlen list of (L_text_i, 53248) cached Qwen3-VL features.
+
+        Supports optional prior preservation (Slice 2): when ``--prior_preservation_weight > 0`` and
+        ``--use_mask_loss`` is set, runs a no-grad teacher forward with LoRA disabled to anchor
+        background regions to base-model behavior. The shared scheduler/gating args
+        (``--prior_decay_*``, ``--prior_preservation_timestep_threshold``) operate in the traditional
+        t = noise-level [0, 1000] convention; Ideogram's t = cleanness is mapped via
+        ``ideogram4_cleanness_to_noise_timestep`` so user-facing pivot/threshold values keep their
+        FLUX.2-trained meaning.
         """
         # Fail fast if --use_mask_loss is set but this batch has no masks (stale unmasked cache). The preflight
         # already catches this before the model load; this is the per-batch backstop.
@@ -151,25 +176,83 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         )
         timesteps = schedule(torch.rand(latents.shape[0], device=device))
 
-        # Keep training numerically aligned with standalone generation. Accelerator bf16 autocast
-        # changes Ideogram's fp8/non-Linear forward path enough to train a different effective
-        # model. Two autocast installation paths must be defeated together: the explicit
-        # torch.autocast(enabled=False) covers ordinary outer context managers; the helper restores
-        # _original_forward to defeat the forward-method wrapper accelerator.prepare installs.
-        with disable_accelerate_forward_autocast(accelerator, transformer):
-            with torch.autocast(device_type=device.type, enabled=False):
-                model_pred, target = ideogram4_flow_matching_target(
-                    transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
-                )
+        # --- Decide whether prior preservation applies for this batch -----------------------------
+        use_mask_loss = bool(getattr(args, "use_mask_loss", False))
+        prior_preservation_weight = float(getattr(args, "prior_preservation_weight", 0.0))
+        mask_weights = batch.get("mask_weights")
+        need_prior_base = prior_preservation_weight > 0.0 and use_mask_loss and mask_weights is not None
 
-        if not getattr(args, "use_mask_loss", False):
+        # T-convention remap: Ideogram t=cleanness [0,1] -> shared scheduler t=noise level [0,1000].
+        # Computed once and reused for both per-sample weight scheduling and timestep threshold gating
+        # so user-facing args keep their FLUX.2-trained meaning (--prior_decay_timestep_start=300 fires
+        # at high-noise structural timesteps).
+        traditional_t = ideogram4_cleanness_to_noise_timestep(timesteps) if need_prior_base else None
+
+        # Optional: timestep-adaptive per-sample prior weight scheduling (linear/cosine decay).
+        prior_decay_schedule = str(getattr(args, "prior_decay_schedule", "constant"))
+        prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
+        prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
+        prior_schedule_enabled = (prior_decay_schedule != "constant") or (prior_decay_warmup_ratio > 0.0)
+        prior_decay_warmup_steps = (
+            int(args.max_train_steps * prior_decay_warmup_ratio) if prior_decay_warmup_ratio > 0 else 0
+        )
+        prior_weight_per_sample = None
+        if need_prior_base and prior_schedule_enabled:
+            prior_weight_per_sample = compute_prior_weight_per_sample(
+                traditional_t,
+                base_weight=prior_preservation_weight,
+                schedule=prior_decay_schedule,
+                pivot_timestep=prior_decay_timestep_start,
+                global_step=global_step,
+                warmup_steps=prior_decay_warmup_steps,
+            )
+
+        # Per-sample structural gating via the (remapped) timestep threshold. The shared masked-loss
+        # reducer also gates application of the prior term per-sample so a teacher forward triggered
+        # for ANY sample in the batch is the natural granularity here.
+        prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+        prior_sample_mask = None
+        need_prior = need_prior_base
+        if need_prior and (prior_timestep_threshold is not None or prior_weight_per_sample is not None):
+            if prior_timestep_threshold is not None:
+                do_prior = traditional_t > float(prior_timestep_threshold)  # (B,)
+            else:
+                do_prior = torch.ones_like(traditional_t, dtype=torch.bool)
+            if prior_weight_per_sample is not None:
+                do_prior = do_prior & (prior_weight_per_sample > 0)
+            prior_sample_mask = do_prior
+            need_prior = bool(do_prior.any().item())
+
+        # --- Prior-teacher no-grad forward (must precede the student forward) ---------------------
+        prior_pred = None
+        if need_prior:
+            with torch.no_grad():
+                # Unwrap so set_enabled() reaches the actual LoRA modules (skip accelerate/DDP wrappers).
+                unwrapped_network = accelerator.unwrap_model(network)
+                with prior_model_context(unwrapped_network):
+                    teacher_pred, _ = self._run_i4_flow_forward(
+                        accelerator, transformer, latents, text_features, noise, timesteps,
+                        network_dtype=network_dtype, device=device,
+                    )
+                    prior_pred = teacher_pred.detach()
+            # Block-swap restore intentionally omitted: Ideogram 4 rejects --blocks_to_swap (see
+            # handle_model_specific_args), so the teacher no-grad forward never strands CPU blocks.
+            # Add the restore call here when block swap support lands (backlog P1-2).
+
+        # --- Student forward (LoRA active, gradients flow) ----------------------------------------
+        model_pred, target = self._run_i4_flow_forward(
+            accelerator, transformer, latents, text_features, noise, timesteps,
+            network_dtype=network_dtype, device=device,
+        )
+
+        if not use_mask_loss:
             loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
             return loss, {}
 
-        # Mask-weighted loss: put per-token pred/target back on the spatial grid (B, 128, gh, gw) — the exact
-        # inverse of grid_to_dit_tokens — so the cached (B, 1, 1, gh, gw) mask aligns, then reduce via the shared
-        # weighted-mean reducer. Target-only: prior preservation is deferred to Slice 2 (it needs the Ideogram
-        # t=cleanness -> noise remap), so prior_loss_unreduced=None. No SD3 weighting (matches the unmasked path).
+        # Mask-weighted loss: put per-token pred/target/prior back on the spatial grid (B, 128, gh, gw)
+        # — the exact inverse of grid_to_dit_tokens — so the cached (B, 1, 1, gh, gw) mask aligns. The
+        # shared reducer expects layout="video" with grid-shaped (not token-shaped) tensors; passing
+        # token-shape losses would broadcast the mask incorrectly.
         model_pred_grid = ideogram4_utils.dit_tokens_to_grid(model_pred.to(network_dtype), grid_h, grid_w)
         target_grid = ideogram4_utils.dit_tokens_to_grid(target.to(network_dtype), grid_h, grid_w)
         loss_unreduced = compute_unreduced_target_loss(
@@ -178,24 +261,51 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             loss_type=getattr(args, "loss_type", "mse"),
             loss_delta=getattr(args, "loss_delta", 1.0),
         )
-        # Surface mask telemetry to TensorBoard so a long likeness run can confirm the mask is active and
-        # non-degenerate (all-zero / all-one would still produce plausible loss numbers). Gate on trackers to
-        # avoid the .item() syncs when nothing consumes them. Mirrors the namespace in mask_loss_process_batch.py.
+
+        prior_loss_unreduced = None
+        if prior_pred is not None:
+            prior_pred_grid = ideogram4_utils.dit_tokens_to_grid(prior_pred.to(network_dtype), grid_h, grid_w)
+            prior_loss_unreduced = compute_unreduced_target_loss(
+                model_pred_grid,
+                prior_pred_grid,
+                loss_type=getattr(args, "loss_type", "mse"),
+                loss_delta=getattr(args, "loss_delta", 1.0),
+            )
+
+        # Surface mask telemetry to TensorBoard so a long likeness run can confirm the mask is active
+        # and non-degenerate (all-zero / all-one would still produce plausible loss numbers). Gate on
+        # trackers to avoid .item() syncs when nothing consumes them.
         stats_enabled = len(accelerator.trackers) > 0
         mask_loss_stats: dict[str, torch.Tensor] | None = {} if stats_enabled else None
         loss = apply_masked_loss_with_prior(
             loss_unreduced,
-            batch.get("mask_weights"),
-            prior_loss_unreduced=None,
+            mask_weights,
+            prior_loss_unreduced=prior_loss_unreduced,
+            prior_sample_mask=prior_sample_mask,
+            prior_weight_per_sample=prior_weight_per_sample,
             stats=mask_loss_stats,
             args=args,
             layout="video",
         )
+
         loss_metrics: dict[str, float] = {}
         if stats_enabled and mask_loss_stats:
             for k, v in mask_loss_stats.items():
                 if isinstance(v, torch.Tensor):
                     loss_metrics[f"masked_loss/{k}"] = float(v.detach().float().item())
+            # Prior preservation telemetry: traditional-t stats let the user reason about gate/schedule
+            # behavior in the FLUX.2 convention regardless of Ideogram's t-cleanness internals.
+            if need_prior_base:
+                loss_metrics["prior/teacher_ran"] = float(prior_pred is not None)
+                if traditional_t is not None:
+                    tt = traditional_t.detach().to(dtype=torch.float32)
+                    loss_metrics["prior/traditional_t_mean"] = float(tt.mean().item())
+                    loss_metrics["prior/traditional_t_min"] = float(tt.min().item())
+                    loss_metrics["prior/traditional_t_max"] = float(tt.max().item())
+                if prior_sample_mask is not None and isinstance(prior_sample_mask, torch.Tensor):
+                    loss_metrics["prior/gate_frac"] = float(
+                        prior_sample_mask.detach().to(dtype=torch.float32).mean().item()
+                    )
         return loss, loss_metrics
 
     # region model specific
@@ -233,16 +343,20 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "added later (see docs/plans/2026-06-07-ideogram4-native-1024-gc-blockswap.md)."
             )
 
-        # Slice-1 masked loss is TARGET-ONLY: process_batch passes prior_loss_unreduced=None unconditionally.
-        # The shared validator (modules/mask_loss.py:226) only rejects prior_weight>0 without --use_mask_loss,
-        # so a config with BOTH set would slip past and train target-only while logs/state claim prior is active.
-        # Fail fast so the user notices instead of burning GPU-days on a silently-degraded run. Remove when the
-        # Ideogram prior branch lands in Slice 2 (needs the t=cleanness -> noise remap, (1-t)*1000).
-        if getattr(args, "use_mask_loss", False) and float(getattr(args, "prior_preservation_weight", 0.0)) > 0:
+        # Prior preservation (Slice 2): base-mode teacher with t-remapped scheduling/gating is supported.
+        # EMA teacher mode is deferred to a follow-up PR (needs on_post_optimizer_step override + lazy
+        # init semantics). Reject `prior_teacher_mode="ema"` LOUDLY rather than silently falling through
+        # to base — the global parser accepts the flag, and a silent fallback would be exactly the
+        # "looks configured, does the wrong thing" bug class that bit v1-v3 (see commit 55e4d79).
+        if (
+            getattr(args, "use_mask_loss", False)
+            and float(getattr(args, "prior_preservation_weight", 0.0)) > 0.0
+            and str(getattr(args, "prior_teacher_mode", "base")).lower() == "ema"
+        ):
             raise ValueError(
-                "Ideogram 4 masked loss currently supports target-only weighting. "
-                "--prior_preservation_weight > 0 is deferred until Ideogram prior preservation is implemented "
-                "(Slice 2: t=cleanness -> noise remap)."
+                "Ideogram 4 prior preservation supports prior_teacher_mode='base' only in this release. "
+                "EMA teacher mode is deferred to a follow-up PR (needs on_post_optimizer_step override + "
+                "LoRAEmaTeacher lazy-init wiring). Set --prior_teacher_mode=base or omit the flag."
             )
 
         # Sampling-during-training needs resources normal training doesn't load (Qwen3-VL encoder, the separate

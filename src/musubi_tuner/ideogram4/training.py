@@ -17,6 +17,22 @@ from musubi_tuner.ideogram4.ideogram4_utils import grid_to_dit_tokens
 from musubi_tuner.ideogram4.sequence import build_ideogram4_conditioning, build_image_input, extract_image_tokens
 
 
+def ideogram4_cleanness_to_noise_timestep(t: torch.Tensor) -> torch.Tensor:
+    """Adapt Ideogram 4's t=cleanness in [0, 1] to the shared scheduler's t=noise level in [0, 1000].
+
+    Ideogram 4 uses t = cleanness (noise@t=0, clean@t=1), but the shared masked-loss infrastructure
+    in modules/prior_scheduling.py:compute_prior_weight_per_sample and the
+    --prior_preservation_timestep_threshold gate both assume the traditional t = noise level in
+    [0, 1000] (high t = high noise = structural denoising step). This helper is the named adapter
+    between the two conventions, so the user's FLUX.2-trained mental model
+    (--prior_decay_timestep_start=300 means "prior fires at high-noise structural timesteps") keeps
+    its semantics when applied to Ideogram 4.
+
+    Tested in tests/test_ideogram4_prior_preservation.py — t=[0.0, 0.3, 1.0] -> [1000, 700, 0].
+    """
+    return (1.0 - t.to(torch.float32)) * 1000.0
+
+
 def ideogram4_flow_matching_target(
     conditional_model,
     latents: torch.Tensor,

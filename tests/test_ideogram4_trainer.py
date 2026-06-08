@@ -136,25 +136,42 @@ def test_handle_model_specific_args_accepts_use_mask_loss():
     assert trainer.dit_dtype == torch.bfloat16
 
 
-def test_handle_model_specific_args_rejects_prior_preservation_with_mask_loss():
-    # Slice-1 masked loss is target-only (process_batch passes prior_loss_unreduced=None unconditionally). If
-    # the user sets --use_mask_loss --prior_preservation_weight 1.0, the shared validator would let it through
-    # (it only rejects prior>0 WITHOUT use_mask_loss), and training would silently run target-only. Fail fast.
+def test_handle_model_specific_args_rejects_ema_teacher_for_prior_preservation():
+    # Slice-2 update: base-mode prior preservation is supported, but EMA teacher mode is deferred to
+    # a follow-up PR. Reject EMA loudly rather than silently fall through to base — the global parser
+    # accepts --prior_teacher_mode=ema (it's registered for the shared masked-loss infrastructure),
+    # so an Ideogram-side silent fallback would be the exact "looks configured, does the wrong thing"
+    # failure class commit 55e4d79 killed. (Previous Slice-1 test rejected ALL prior_weight>0 combos;
+    # that fail-fast was removed when teacher forward + t-remap landed.)
     trainer = Ideogram4NetworkTrainer()
-    args = SimpleNamespace(use_mask_loss=True, prior_preservation_weight=1.0, mixed_precision="bf16")
-    with pytest.raises(ValueError, match="prior_preservation_weight"):
+    args = SimpleNamespace(
+        use_mask_loss=True,
+        prior_preservation_weight=1.0,
+        prior_teacher_mode="ema",
+        mixed_precision="bf16",
+    )
+    with pytest.raises(ValueError, match=r"EMA teacher mode is deferred"):
         trainer.handle_model_specific_args(args)
 
-    # prior_preservation_weight == 0 (default-ish) is fine.
+    # base teacher mode (default) is now ACCEPTED with prior_weight>0 + use_mask_loss=True.
     trainer2 = Ideogram4NetworkTrainer()
-    trainer2.handle_model_specific_args(SimpleNamespace(use_mask_loss=True, prior_preservation_weight=0.0, mixed_precision="bf16"))
+    trainer2.handle_model_specific_args(
+        SimpleNamespace(
+            use_mask_loss=True,
+            prior_preservation_weight=1.0,
+            prior_teacher_mode="base",
+            mixed_precision="bf16",
+        )
+    )  # no raise — proves Slice-2 enables the previously-blocked combination
 
-    # use_mask_loss=False + prior_preservation_weight>0 is the shared-validator's domain; this trainer-level
-    # check must not steal that error from the shared validator (different message, different fix).
+    # prior_preservation_weight == 0 is unconditionally fine regardless of mode.
     trainer3 = Ideogram4NetworkTrainer()
-    trainer3.handle_model_specific_args(
-        SimpleNamespace(use_mask_loss=False, prior_preservation_weight=1.0, mixed_precision="bf16")
-    )  # no raise here; shared validator handles this case
+    trainer3.handle_model_specific_args(SimpleNamespace(use_mask_loss=True, prior_preservation_weight=0.0, mixed_precision="bf16"))
+
+    # use_mask_loss=False + prior_preservation_weight>0 is the shared-validator's domain; this
+    # trainer-level check must not steal that error (different message, different fix).
+    trainer4 = Ideogram4NetworkTrainer()
+    trainer4.handle_model_specific_args(SimpleNamespace(use_mask_loss=False, prior_preservation_weight=1.0, mixed_precision="bf16"))
 
 
 def test_handle_model_specific_args_accepts_gradient_checkpointing():
