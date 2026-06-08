@@ -41,3 +41,7 @@ configs/compiled/
 configs/meta/machines/default.toml
 configs/meta/overrides/.draft_*
 .env.local
+
+# Stray Node artifacts (this is a Python project; npm sometimes invoked accidentally)
+package-lock.json
+node_modules/
