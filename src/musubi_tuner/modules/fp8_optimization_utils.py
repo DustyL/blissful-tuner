@@ -405,25 +405,25 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return o.to(out_dtype)
 
     else:
-        # Dequantize the weight
-        original_dtype = self.scale_weight.dtype
-        if self.scale_weight.ndim < 3:
-            # per-tensor or per-channel quantization, we can broadcast
-            dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
-        else:
-            # block-wise quantization, need to reshape weight to match scale shape for broadcasting
-            out_features, num_blocks, _ = self.scale_weight.shape
-            dequantized_weight = self.weight.to(original_dtype).contiguous().view(out_features, num_blocks, -1)
-            dequantized_weight = dequantized_weight * self.scale_weight
-            dequantized_weight = dequantized_weight.view(self.weight.shape)
+        # Dequantize the weight, then F.linear with autocast disabled. CUDA AMP can
+        # mis-handle fp8 source weights here; explicit casts keep this path invariant
+        # whether an enclosing trainer/generator autocast context is active or not.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            linear_dtype = x.dtype if x.is_floating_point() else self.scale_weight.dtype
+            scale_in_dtype = self.scale_weight.to(linear_dtype)
+            if self.scale_weight.ndim < 3:
+                # per-tensor (scale shape [1]) or per-row (shape [out, 1]) — broadcast works in both
+                dequantized_weight = self.weight.to(linear_dtype) * scale_in_dtype
+            else:
+                # block-wise quantization: reshape weight to match scale shape for broadcasting
+                out_features, num_blocks, _ = self.scale_weight.shape
+                dequantized_weight = self.weight.to(linear_dtype).contiguous().view(out_features, num_blocks, -1)
+                dequantized_weight = dequantized_weight * scale_in_dtype
+                dequantized_weight = dequantized_weight.view(self.weight.shape)
 
-        # Perform linear transformation
-        if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
-        else:
-            output = F.linear(x, dequantized_weight)
-
-        return output
+            # Cast bias to match the explicit dequant dtype.
+            bias = self.bias.to(linear_dtype) if self.bias is not None else None
+            return F.linear(x, dequantized_weight, bias)
 
 
 def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, exclude_ffn_from_scaled_mm=False):

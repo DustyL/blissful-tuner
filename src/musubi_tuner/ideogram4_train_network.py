@@ -150,9 +150,12 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         )
         timesteps = schedule(torch.rand(latents.shape[0], device=device))
 
-        model_pred, target = ideogram4_flow_matching_target(
-            transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
-        )
+        # Keep training numerically aligned with standalone generation. Accelerator bf16 autocast changes
+        # Ideogram's fp8/non-Linear forward path enough to train a different effective model.
+        with torch.autocast(device_type=device.type, enabled=False):
+            model_pred, target = ideogram4_flow_matching_target(
+                transformer, latents, text_features, noise, timesteps, network_dtype=network_dtype, device=device
+            )
 
         if not getattr(args, "use_mask_loss", False):
             loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
@@ -400,22 +403,26 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # Denoise with both DiTs, then FREE the unconditional DiT BEFORE the VAE decode. Keeping both 9.4 GB DiTs
         # resident through a 1024 decode peaks ~30 GB and OOMs a 32 GB card; freeing first caps the peak ~21 GB
         # (cond = unwrapped training transformer, LoRA ACTIVE — so samples reflect the current adapter).
-        z, grid_h, grid_w = denoise_ideogram4_to_tokens(
-            transformer,
-            self._sample_unconditional_dit,
-            text_features,
-            height=height,
-            width=width,
-            preset=preset,
-            device=device,
-            compute_dtype=dit_dtype,
-            generator=generator,
-        )
-        self._sample_unconditional_dit = None
-        gc.collect()
-        clean_memory_on_device(device)
-        with torch.no_grad():
-            pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
+        #
+        # Match standalone generation: the full Ideogram denoise/decode path must bypass any accelerator
+        # autocast wrapper, not just the fp8 Linear matmuls.
+        with torch.autocast(device_type=device.type, enabled=False):
+            z, grid_h, grid_w = denoise_ideogram4_to_tokens(
+                transformer,
+                self._sample_unconditional_dit,
+                text_features,
+                height=height,
+                width=width,
+                preset=preset,
+                device=device,
+                compute_dtype=dit_dtype,
+                generator=generator,
+            )
+            self._sample_unconditional_dit = None
+            gc.collect()
+            clean_memory_on_device(device)
+            with torch.no_grad():
+                pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
         return pixels.unsqueeze(2).cpu()  # (B, 3, 1, H, W) — the base saver keys on shape[2] == 1
 
     # NOTE: the unconditional DiT is loaded LAZILY inside do_inference (not on_before_sample_images): the base
