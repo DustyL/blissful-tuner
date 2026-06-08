@@ -87,6 +87,43 @@ def test_process_batch_requires_mask_weights_when_enabled():
         trainer.process_batch(args, None, None, None, {}, None, None, None, None, None, None, None)
 
 
+def test_process_batch_disables_enclosing_autocast(monkeypatch):
+    captured = {}
+
+    def fake_flow_matching_target(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        captured["autocast"] = torch.is_autocast_enabled(torch.device(device).type)
+        return torch.zeros(1, 4, 128), torch.ones(1, 4, 128)
+
+    import musubi_tuner.ideogram4_train_network as train_mod
+
+    monkeypatch.setattr(train_mod, "ideogram4_flow_matching_target", fake_flow_matching_target)
+    trainer = Ideogram4NetworkTrainer()
+    args = SimpleNamespace(use_mask_loss=False, ideogram4_timestep_mu=0.0, ideogram4_timestep_std=1.0)
+    batch = {"i4_llm_features": [torch.zeros(2, 53248)]}
+    latents = torch.zeros(1, 128, 2, 2)
+    noise = torch.ones_like(latents)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss, stats = trainer.process_batch(
+            args,
+            SimpleNamespace(device=torch.device("cpu")),
+            "TRANSFORMER",
+            None,
+            batch,
+            latents,
+            noise,
+            None,
+            torch.bfloat16,
+            torch.float32,
+            None,
+            0,
+        )
+
+    assert captured["autocast"] is False, "training forward must bypass accelerator autocast"
+    assert loss.item() == pytest.approx(1.0)
+    assert stats == {}
+
+
 def test_handle_model_specific_args_accepts_use_mask_loss():
     # Masked loss is supported now — setup must NOT reject it (the per-batch mask requirement is enforced in
     # process_batch + the cache preflight instead).

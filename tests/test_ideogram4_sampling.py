@@ -64,10 +64,12 @@ def test_do_inference_frees_unconditional_before_decode_and_shape(monkeypatch):
 
     def fake_denoise(cond, uncond, tf, *, height, width, preset, device, compute_dtype, generator):
         captured.update(cond=cond, uncond=uncond, tf=tf)
+        captured["denoise_autocast"] = torch.is_autocast_enabled(device.type)
         return torch.zeros(1, (height // 16) * (width // 16), 128), height // 16, width // 16
 
     def fake_decode(ae, z, *, grid_h, grid_w):
         captured["decoded"] = True
+        captured["decode_autocast"] = torch.is_autocast_enabled(z.device.type)
         return torch.rand(1, 3, grid_h * 16, grid_w * 16)  # [0, 1]
 
     monkeypatch.setattr(m, "denoise_ideogram4_to_tokens", fake_denoise)
@@ -84,28 +86,31 @@ def test_do_inference_frees_unconditional_before_decode_and_shape(monkeypatch):
     sample_parameter = {"i4_llm_features": torch.randn(7, 53248), "negative_prompt": "blurry"}
     args = SimpleNamespace(sampler_preset="V4_TURBO_12", unconditional_dit="u.safetensors")
 
-    out = trainer.do_inference(
-        _cpu_accel(),
-        args,
-        sample_parameter,
-        vae,
-        torch.bfloat16,
-        "COND",
-        None,
-        None,
-        64,
-        64,
-        1,
-        None,
-        False,
-        None,
-        None,
-    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        out = trainer.do_inference(
+            _cpu_accel(),
+            args,
+            sample_parameter,
+            vae,
+            torch.bfloat16,
+            "COND",
+            None,
+            None,
+            64,
+            64,
+            1,
+            None,
+            False,
+            None,
+            None,
+        )
 
     assert out.shape == (1, 3, 1, 64, 64), "pixels.unsqueeze(2) -> (B,C,1,H,W) for the base saver"
     assert out.device.type == "cpu" and 0.0 <= float(out.min()) and float(out.max()) <= 1.0
     assert captured["cond"] == "COND" and captured["uncond"] == "UNCOND", "LoRA-active cond + separate uncond DiT"
     assert captured["tf"].shape == (7, 53248), "i4_llm_features extracted from sample_parameter"
+    assert captured["denoise_autocast"] is False, "sampling denoise must bypass accelerator autocast"
+    assert captured["decode_autocast"] is False, "sample decode must bypass accelerator autocast"
     assert vae_dev["d"] == torch.device("cpu"), "vae.to(device) before decode (the base leaves it on CPU)"
     assert trainer._sample_unconditional_dit is None, "unconditional DiT freed BEFORE decode (the 1024 memory fix)"
     assert captured.get("decoded"), "decode ran (after the free)"
