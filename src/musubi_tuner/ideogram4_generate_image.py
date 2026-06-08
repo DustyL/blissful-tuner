@@ -6,15 +6,9 @@ import torch
 from PIL import Image
 
 from musubi_tuner.ideogram4.caption_verifier import verify_caption
-from musubi_tuner.ideogram4.generation import denoise_ideogram4_tokens
-from musubi_tuner.ideogram4.ideogram4_utils import (
-    decode_dit_tokens_to_pixels,
-    load_ideogram4_autoencoder,
-    load_ideogram4_transformer,
-)
+from musubi_tuner.ideogram4.generation import generate_ideogram4_pixels
+from musubi_tuner.ideogram4.ideogram4_utils import load_ideogram4_autoencoder, load_ideogram4_transformer
 from musubi_tuner.ideogram4.sampler_configs import PRESETS
-from musubi_tuner.ideogram4.scheduler import get_schedule_for_resolution
-from musubi_tuner.ideogram4.sequence import build_ideogram4_conditioning, image_grid_dims
 from musubi_tuner.ideogram4.text_encoder import (
     TEXT_ENCODER_FORMATS,
     encode_prompt_to_features,
@@ -58,7 +52,6 @@ def main():
     dtype = str_to_dtype(args.dtype)
     height, width = args.image_size
     preset = PRESETS[args.sampler_preset]
-    grid_h, grid_w = image_grid_dims(height, width)
 
     # 1. Encode the prompt, then free the text encoder before loading the (large) DiTs.
     verify_caption(args.prompt, strict=args.strict_caption_verifier)  # H4: warn-only by default
@@ -76,34 +69,27 @@ def main():
     del text_encoder, tokenizer
     _empty_cache(device)
 
-    sequence = build_ideogram4_conditioning([features], grid_h, grid_w, device=device, dtype=dtype)
-
-    # 2. Load both DiTs, run the asymmetric-CFG denoise, then free them before decoding.
-    logger.info("Loading conditional + unconditional DiTs")
+    # 2. Load both DiTs + the VAE, then generate via the shared helper — the single source of the validated
+    #    B5 t-convention (same path as sampling-during-training). All three resident; ~21 GB peak on the 5090.
+    logger.info("Loading conditional + unconditional DiTs + VAE")
     conditional = load_ideogram4_transformer(args.dit, dtype=dtype, loading_device=device)
     unconditional = load_ideogram4_transformer(args.unconditional_dit, dtype=dtype, loading_device=device)
+    autoencoder = load_ideogram4_autoencoder(args.vae, dtype=dtype, device=device)
 
-    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     logger.info(f"Denoising: {preset.num_steps} steps, preset {args.sampler_preset}")
-    z = denoise_ideogram4_tokens(
+    pixels = generate_ideogram4_pixels(
         conditional,
         unconditional,
-        sequence,
-        num_steps=preset.num_steps,
-        guidance_schedule=preset.guidance_schedule,
-        schedule=schedule,
+        autoencoder,
+        features,
+        height=height,
+        width=width,
+        preset=preset,
         device=device,
         compute_dtype=dtype,
         generator=generator,
-    )
-    del conditional, unconditional
-    _empty_cache(device)
-
-    # 3. Decode via the raw VAE decoder (latent_denorm -> unpatchify -> decoder; never BN).
-    autoencoder = load_ideogram4_autoencoder(args.vae, dtype=dtype, device=device)
-    with torch.no_grad():
-        pixels = decode_dit_tokens_to_pixels(autoencoder, z, grid_h=grid_h, grid_w=grid_w)  # (B, 3, H, W) in [0, 1]
+    )  # (B, 3, H, W) in [0, 1]
 
     image = (pixels[0].clamp(0.0, 1.0).float().cpu().permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     Image.fromarray(image).save(args.save_path)

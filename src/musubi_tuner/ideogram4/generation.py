@@ -10,8 +10,16 @@ from __future__ import annotations
 
 import torch
 
-from musubi_tuner.ideogram4.scheduler import LogitNormalSchedule, make_step_intervals
-from musubi_tuner.ideogram4.sequence import Ideogram4Sequence, build_image_input, extract_image_tokens
+from musubi_tuner.ideogram4.ideogram4_utils import decode_dit_tokens_to_pixels
+from musubi_tuner.ideogram4.sampler_configs import SamplerParameters
+from musubi_tuner.ideogram4.scheduler import LogitNormalSchedule, get_schedule_for_resolution, make_step_intervals
+from musubi_tuner.ideogram4.sequence import (
+    Ideogram4Sequence,
+    build_ideogram4_conditioning,
+    build_image_input,
+    extract_image_tokens,
+    image_grid_dims,
+)
 
 IDEOGRAM4_LATENT_DIM = 128  # DiT in_channels (patchified token channels)
 
@@ -84,3 +92,42 @@ def denoise_ideogram4_tokens(
         z = z + v * (s_val - t_val)  # canonical: integrate toward clean (delta > 0), noise@t~0 -> clean@t~1
 
     return z
+
+
+def generate_ideogram4_pixels(
+    conditional_model,
+    unconditional_model,
+    autoencoder,
+    text_features: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    preset: SamplerParameters,
+    device: torch.device | str,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Single-prompt generate: build conditioning -> asymmetric-CFG denoise -> raw VAE decode.
+
+    The SINGLE source of the validated B5 t-convention for BOTH manual generation (ideogram4_generate_image)
+    and sampling-during-training (Ideogram4NetworkTrainer.do_inference), so the convention can never drift
+    between them. Requires the conditional (LoRA-active at training time), unconditional, and autoencoder all
+    resident; callers manage load/free. ``denoise_ideogram4_tokens`` is already ``@torch.no_grad()``; decode is
+    wrapped here. ``text_features`` is one prompt's (L, 53248) features. Returns pixels (B, 3, H, W) in [0, 1].
+    """
+    grid_h, grid_w = image_grid_dims(height, width)
+    sequence = build_ideogram4_conditioning([text_features], grid_h, grid_w, device=device, dtype=compute_dtype)
+    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
+    z = denoise_ideogram4_tokens(
+        conditional_model,
+        unconditional_model,
+        sequence,
+        num_steps=preset.num_steps,
+        guidance_schedule=preset.guidance_schedule,
+        schedule=schedule,
+        device=device,
+        compute_dtype=compute_dtype,
+        generator=generator,
+    )
+    with torch.no_grad():
+        return decode_dit_tokens_to_pixels(autoencoder, z, grid_h=grid_h, grid_w=grid_w)
