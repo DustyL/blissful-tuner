@@ -94,6 +94,42 @@ def denoise_ideogram4_tokens(
     return z
 
 
+def denoise_ideogram4_to_tokens(
+    conditional_model,
+    unconditional_model,
+    text_features: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    preset: SamplerParameters,
+    device: torch.device | str,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, int, int]:
+    """Build conditioning -> asymmetric-CFG denoise -> (z normalized DiT tokens, grid_h, grid_w).
+
+    The SINGLE source of the validated B5 t-convention for BOTH manual generation and sampling-during-training,
+    so it can never drift between them. Decode is a SEPARATE call (decode_dit_tokens_to_pixels) so a caller can
+    free the unconditional DiT BEFORE the VAE decode — keeping both 9.4 GB DiTs resident through a 1024 decode
+    peaks ~30 GB, which OOMs sampling on a 32 GB card. ``text_features`` is one prompt's (L, 53248) features.
+    """
+    grid_h, grid_w = image_grid_dims(height, width)
+    sequence = build_ideogram4_conditioning([text_features], grid_h, grid_w, device=device, dtype=compute_dtype)
+    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
+    z = denoise_ideogram4_tokens(
+        conditional_model,
+        unconditional_model,
+        sequence,
+        num_steps=preset.num_steps,
+        guidance_schedule=preset.guidance_schedule,
+        schedule=schedule,
+        device=device,
+        compute_dtype=compute_dtype,
+        generator=generator,
+    )
+    return z, grid_h, grid_w
+
+
 def generate_ideogram4_pixels(
     conditional_model,
     unconditional_model,
@@ -107,24 +143,17 @@ def generate_ideogram4_pixels(
     compute_dtype: torch.dtype = torch.bfloat16,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Single-prompt generate: build conditioning -> asymmetric-CFG denoise -> raw VAE decode.
-
-    The SINGLE source of the validated B5 t-convention for BOTH manual generation (ideogram4_generate_image)
-    and sampling-during-training (Ideogram4NetworkTrainer.do_inference), so the convention can never drift
-    between them. Requires the conditional (LoRA-active at training time), unconditional, and autoencoder all
-    resident; callers manage load/free. ``denoise_ideogram4_tokens`` is already ``@torch.no_grad()``; decode is
-    wrapped here. ``text_features`` is one prompt's (L, 53248) features. Returns pixels (B, 3, H, W) in [0, 1].
+    """Full single-prompt generate (denoise + decode) with all models resident. Returns pixels (B,3,H,W) in
+    [0,1]. Used by manual generation; sampling-during-training calls denoise_ideogram4_to_tokens + decode
+    separately so it can free the unconditional DiT before the (memory-heavy at 1024) VAE decode.
     """
-    grid_h, grid_w = image_grid_dims(height, width)
-    sequence = build_ideogram4_conditioning([text_features], grid_h, grid_w, device=device, dtype=compute_dtype)
-    schedule = get_schedule_for_resolution((height, width), known_mean=preset.mu, std=preset.std)
-    z = denoise_ideogram4_tokens(
+    z, grid_h, grid_w = denoise_ideogram4_to_tokens(
         conditional_model,
         unconditional_model,
-        sequence,
-        num_steps=preset.num_steps,
-        guidance_schedule=preset.guidance_schedule,
-        schedule=schedule,
+        text_features,
+        height=height,
+        width=width,
+        preset=preset,
         device=device,
         compute_dtype=compute_dtype,
         generator=generator,

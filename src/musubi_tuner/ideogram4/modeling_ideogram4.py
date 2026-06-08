@@ -371,6 +371,15 @@ class Ideogram4Transformer(nn.Module):
         for block in self.layers:
             block.disable_gradient_checkpointing()
 
+    def switch_block_swap_for_inference(self) -> None:
+        # No-op: Ideogram rejects --blocks_to_swap (no block-swap hooks yet), but the base sampler calls these
+        # UNCONDITIONALLY around sample generation (trainer_base.py:868/911). Provide them so sampling-during-
+        # training doesn't AttributeError. These become the real implementations when Slice 2 (block swap) lands.
+        pass
+
+    def switch_block_swap_for_training(self) -> None:
+        pass
+
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
