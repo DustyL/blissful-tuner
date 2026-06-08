@@ -11,7 +11,7 @@ import torch
 
 import musubi_tuner.ideogram4_generate_image as gen_mod
 import musubi_tuner.ideogram4_train_network as m
-from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens, generate_ideogram4_pixels
+from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
 from musubi_tuner.ideogram4.modeling_ideogram4 import Ideogram4Config, Ideogram4Transformer
 from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
 
@@ -156,25 +156,29 @@ def test_block_swap_switches_are_noops_so_sampler_does_not_crash():
     assert model.switch_block_swap_for_training() is None  # round-trip, no crash
 
 
-def test_on_after_unloads_unconditional_dit_and_is_idempotent(monkeypatch):
+def test_on_after_unloads_unconditional_dit_moves_vae_to_cpu_and_is_idempotent(monkeypatch):
     cleaned = []
     monkeypatch.setattr(m, "clean_memory_on_device", lambda d: cleaned.append(d))
     trainer = Ideogram4NetworkTrainer()
     trainer._sample_unconditional_dit = "BIG_MODEL"
+    vae_dev = {}
+    vae = SimpleNamespace(to=lambda d: vae_dev.__setitem__("d", d))
 
-    trainer.on_after_sample_images(_cpu_accel(), None, None, None, None, None, None, None, None)
+    # on_after signature: (accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
+    trainer.on_after_sample_images(_cpu_accel(), None, None, None, vae, None, None, None, None)
     assert trainer._sample_unconditional_dit is None, "unconditional DiT freed after sampling"
+    assert vae_dev["d"] == "cpu", "VAE returned to CPU defensively (covers a do_inference raise the base misses)"
     assert cleaned, "CUDA cache cleaned so VRAM doesn't ratchet across intervals"
 
-    # Safe when on_before never loaded it (partial/OOM'd load) — no AttributeError masking the real failure.
+    # Safe when nothing was loaded (a partial/OOM'd lazy load) and vae is None — no AttributeError masks the failure.
     trainer.on_after_sample_images(_cpu_accel(), None, None, None, None, None, None, None, None)
 
 
 def test_standalone_and_training_share_one_denoise_core():
-    # The validated B5 t-convention lives ONLY in denoise_ideogram4_to_tokens. The trainer's do_inference uses
-    # it directly; the standalone's generate_ideogram4_pixels wraps it. Neither can fork the convention.
+    # The validated B5 t-convention lives ONLY in denoise_ideogram4_to_tokens; both the standalone and the
+    # trainer call it (then decode separately), so neither can fork the convention.
     assert m.denoise_ideogram4_to_tokens is denoise_ideogram4_to_tokens
-    assert gen_mod.generate_ideogram4_pixels is generate_ideogram4_pixels
+    assert gen_mod.denoise_ideogram4_to_tokens is denoise_ideogram4_to_tokens
 
 
 def test_setup_parser_adds_sampling_args():

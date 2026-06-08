@@ -346,7 +346,9 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         vae.to(device)  # base loads the VAE on CPU and returns it there afterward (trainer_base.py:1051)
         preset = PRESETS[args.sampler_preset]
         text_features = sample_parameter["i4_llm_features"].to(device=device, dtype=dit_dtype)
-        # The unconditional DiT is loaded in on_before_sample_images; reload it if a prior prompt freed it.
+        # Lazy-load the unconditional DiT HERE (not on_before) so the risky 9.4 GB load is inside the base's
+        # sampling try/finally — an OOM here still reaches on_after cleanup. Freed per-prompt before decode, so a
+        # later prompt in the same interval reloads it.
         if self._sample_unconditional_dit is None:
             self._sample_unconditional_dit = ideogram4_utils.load_ideogram4_transformer(
                 args.unconditional_dit, dtype=self.dit_dtype, loading_device=device
@@ -372,20 +374,21 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             pixels = ideogram4_utils.decode_dit_tokens_to_pixels(vae, z, grid_h=grid_h, grid_w=grid_w)  # (B,3,H,W) [0,1]
         return pixels.unsqueeze(2).cpu()  # (B, 3, 1, H, W) — the base saver keys on shape[2] == 1
 
-    def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
-        # Load the unconditional DiT only during sampling (~9.4 GB fp8; resident all run would waste headroom).
-        # Freed in on_after_sample_images, which the base runs in a `finally`.
-        logger.info(f"Ideogram 4: loading unconditional DiT for sampling from {args.unconditional_dit}")
-        self._sample_unconditional_dit = ideogram4_utils.load_ideogram4_transformer(
-            args.unconditional_dit, dtype=self.dit_dtype, loading_device=accelerator.device
-        )
+    # NOTE: the unconditional DiT is loaded LAZILY inside do_inference (not on_before_sample_images): the base
+    # calls on_before OUTSIDE its sampling try/finally (trainer_base.py:2035), so a 9.4 GB load that OOMs there
+    # would skip on_after cleanup. Loading inside do_inference puts the risky load under the base try/finally.
 
     def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
-        # Free the unconditional DiT even if sampling raised (guard a partial/OOM'd on_before load), so VRAM
-        # does not ratchet across sample intervals.
+        # Runs in the base `finally` (trainer_base.py:2041). Free the unconditional DiT if a sample raised before
+        # do_inference freed it (the happy path frees it pre-decode), and return the VAE to CPU defensively — the
+        # base does this on success (trainer_base.py:1051) but NOT if do_inference raised. Keeps the tight ~30 GB
+        # sample peak from leaking into the rest of training.
         if getattr(self, "_sample_unconditional_dit", None) is not None:
             self._sample_unconditional_dit = None
-            clean_memory_on_device(accelerator.device)
+        if vae is not None:
+            vae.to("cpu")
+        gc.collect()
+        clean_memory_on_device(accelerator.device)
 
     # endregion
 

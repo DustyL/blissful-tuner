@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import torch
 
-from musubi_tuner.ideogram4.ideogram4_utils import decode_dit_tokens_to_pixels
 from musubi_tuner.ideogram4.sampler_configs import SamplerParameters
 from musubi_tuner.ideogram4.scheduler import LogitNormalSchedule, get_schedule_for_resolution, make_step_intervals
 from musubi_tuner.ideogram4.sequence import (
@@ -128,35 +127,3 @@ def denoise_ideogram4_to_tokens(
         generator=generator,
     )
     return z, grid_h, grid_w
-
-
-def generate_ideogram4_pixels(
-    conditional_model,
-    unconditional_model,
-    autoencoder,
-    text_features: torch.Tensor,
-    *,
-    height: int,
-    width: int,
-    preset: SamplerParameters,
-    device: torch.device | str,
-    compute_dtype: torch.dtype = torch.bfloat16,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    """Full single-prompt generate (denoise + decode) with all models resident. Returns pixels (B,3,H,W) in
-    [0,1]. Used by manual generation; sampling-during-training calls denoise_ideogram4_to_tokens + decode
-    separately so it can free the unconditional DiT before the (memory-heavy at 1024) VAE decode.
-    """
-    z, grid_h, grid_w = denoise_ideogram4_to_tokens(
-        conditional_model,
-        unconditional_model,
-        text_features,
-        height=height,
-        width=width,
-        preset=preset,
-        device=device,
-        compute_dtype=compute_dtype,
-        generator=generator,
-    )
-    with torch.no_grad():
-        return decode_dit_tokens_to_pixels(autoencoder, z, grid_h=grid_h, grid_w=grid_w)
