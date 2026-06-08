@@ -32,7 +32,7 @@ ruff check --fix
 ruff format src tests
 ```
 
-Avoid broad refactors/formatting in vendored code (`src/blissful_tuner/codeformer/`, `gfpgan/`, `gimmvfi/`, `swinir/`, `esrgan/`) and Ruff-excluded upstream model directories (see `pyproject.toml` `tool.ruff.extend-exclude`).
+Avoid broad refactors/formatting in Ruff-excluded upstream model directories (see `pyproject.toml` `tool.ruff.extend-exclude`).
 
 ## Python Environment
 
@@ -204,7 +204,7 @@ blissful-tuner/
 │   │   ├── networks/           # LoRA/LoHa/LoKr implementations + architecture registry
 │   │   ├── modules/            # Shared modules (see below)
 │   │   └── utils/              # Utilities (device, model loading, training helpers)
-│   └── blissful_tuner/         # Blissful-specific extensions
+│   └── blissful_tuner/         # Blissful-specific extensions (19 files, no nested packages)
 │       ├── blissful_core.py    # Args + global behavior injection
 │       ├── blissful_logger.py  # BlissfulLogger (Rich-based colored logging)
 │       ├── guidance.py         # CFGZero*, NAG, perpendicular CFG
@@ -214,17 +214,17 @@ blissful-tuner/
 │       ├── fp8_optimization.py # FP8 quantization support
 │       ├── advanced_rope.py    # RoPE positional embedding extensions
 │       ├── hvw_posemb_layers.py # Positional embedding layers (used by advanced_rope)
+│       ├── mask_loss_process_batch.py # Masked-loss reducer wrapper (shared by WAN/FLUX.2/Z/Qwen/K5/HV1.5)
 │       ├── model_utility.py    # Model loading/conversion helpers
 │       ├── common_extensions.py # Shared extension utilities (V2V, I2I noise prep)
 │       ├── extract_lora.py     # Generic LoRA extraction by SVD diff between two models
 │       ├── profiling.py        # VRAM profiling and tracking utilities
 │       ├── utils.py            # General utility functions (random, hashing, tensor helpers)
 │       ├── video_processing_common.py # BlissfulVideoProcessor (ffmpeg/PIL helpers)
-│       ├── video_to_png.py     # CLI tool: extract N frames from video as PNGs
-│       ├── metaview.py         # PySide6 GUI to display bt_ metadata from MKV/PNG
-│       ├── facefix.py, upscaler.py, GIMMVFI.py, yolo_blur.py  # Post-processing
-│       ├── taehv.py, taesd.py  # Tiny autoencoder decoders for previews
-│       └── codeformer/, gfpgan/, gimmvfi/, swinir/, esrgan/   # Vendored post-processing
+│       └── taehv.py, taesd.py  # Tiny autoencoder decoders for previews
+│       # NOTE: post-processing modules (codeformer/, gfpgan/, gimmvfi/, swinir/, esrgan/, facefix.py,
+│       # metaview.py, upscaler.py, video_to_png.py, yolo_blur.py, GIMMVFI.py) were removed by PR #8
+│       # (v0.3.0 deadweight pass). Pre-removal snapshot preserved at tag `archive/pre-v030-deadweight`.
 ├── tools/                      # Standalone tools
 │   ├── create_instance_masks.py               # FaceID + instance segmentation for group photos
 │   ├── apply_instance_mask_to_weighted_mask.py # Multiply weighted × instance masks
@@ -545,14 +545,19 @@ bug — it's just the topmost place a CPU `weight` gets touched.
 Two restore mechanisms exist; new no-grad forward paths must use one:
 
 - **`NetworkTrainer.restore_block_swap_after_no_grad_forward(accelerator, transformer)`**
-  (`hv_train_network.py:623`) — for the prior-teacher no-grad forward.
-  Called at `hv_train_network.py:2791` after the teacher `call_dit(...)`
-  but before the student `call_dit(...)`. Internally calls
-  `prepare_block_swap_before_forward()` on the unwrapped transformer when
-  `blocks_to_swap > 0`. No-op when block swap is disabled.
+  (`src/musubi_tuner/training/trainer_base.py:737` after the v0.3.0 base-trainer
+  extraction; was previously inline in `hv_train_network.py`) — for the
+  prior-teacher no-grad forward. Called after the teacher `call_dit(...)`
+  but before the student `call_dit(...)` (grep for it in the trainer that
+  consumes the prior path, e.g. `mask_loss_process_batch.py`). Internally
+  calls `prepare_block_swap_before_forward()` on the unwrapped transformer
+  when `blocks_to_swap > 0`. No-op when block swap is disabled.
 
 - **`transformer.switch_block_swap_for_inference()` / `..._for_training()`**
-  pair (`hv_train_network.py:1410` / `:1451`) — for sample generation.
+  pair — for sample generation. Defined per-model on the transformer itself,
+  not on the trainer: `src/musubi_tuner/flux/flux_models.py:1009/1016`,
+  `src/musubi_tuner/hunyuan_model/models.py:731/738`,
+  `src/musubi_tuner/hunyuan_video_1_5/hunyuan_video_1_5_models.py:174/180`.
   `sample_images()` wraps the no-grad sampling loop in a `try:` with a
   nested `finally:` that runs both RNG restore and `..._for_training()`,
   so block-swap layout is restored even if RNG restoration or sampling
@@ -767,7 +772,6 @@ blissful-tuner is a heavily-diverged fork (~1300 commits ahead of `kohya-ss/musu
 
 - You have my explicit permission to use any and all available resources at your disposal to assist you with any of your tasks whether that be launching as many mutliple parallel Claude OPUS sub-agents, MCP servers, plug-ins, etc at any time.
 - Please feel free to ask me preliminary or follow-up questions to achieve a better result.
-- Root-level `.py` files are thin wrappers that import from `src/musubi_tuner/`
 - Commit messages follow Conventional Commits: `feat:`, `fix(scope):`, `chore:`, `doc:`, `format:`
 - Breaking changes may occur during development
 - For issues, use this repo's issues section (not upstream Musubi Tuner)
