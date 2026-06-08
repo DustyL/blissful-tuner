@@ -214,11 +214,12 @@ def test_preflight_rejects_wrong_mask_tensor_shape(tmp_path):
         preflight_ideogram4_latent_cache(str(path), require_mask_weights=True)
 
 
-def test_save_latent_cache_asserts_mask_shape(tmp_path):
+def test_save_latent_cache_rejects_bad_mask_shape(tmp_path):
     # The write-side guard: docstring promises (1, 1, gh, gw); enforce it at write time so a future caller can
-    # not plant a malformed mask that the preflight then has to field. Belt-and-suspenders with preflight.
+    # not plant a malformed mask that the preflight then has to field. ValueError (not assert) so python -O
+    # cannot strip the data-integrity contract at this I/O boundary.
     item = _item(tmp_path, key="badwrite")
-    with pytest.raises(AssertionError, match=r"\(1, 1, 4, 6\)"):
+    with pytest.raises(ValueError, match=r"\(1, 1, 4, 6\)"):
         save_latent_cache_ideogram4(item, torch.zeros(128, 4, 6).to(torch.bfloat16), mask_weights=torch.zeros(4, 6))
 
 
