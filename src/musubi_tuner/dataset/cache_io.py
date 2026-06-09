@@ -23,7 +23,7 @@ from musubi_tuner.dataset.architectures import (
 # though importing ideogram4_utils would cycle (it -> flux2_utils -> image_video_dataset -> cache_io).
 from musubi_tuner.ideogram4 import constants as ideogram4_constants
 from musubi_tuner.utils import safetensors_utils
-from musubi_tuner.utils.model_utils import dtype_to_str
+from musubi_tuner.utils.model_utils import dtype_to_str, strip_dtype_suffix
 
 if TYPE_CHECKING:
     # Runtime import would be circular (image_video_dataset imports cache_io); these are only
@@ -594,8 +594,14 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
         # load existing cache and update metadata
         with safetensors_utils.MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path) as f:
             existing_metadata = f.metadata()
+            # Compare existing keys against fresh keys on their dtype-stripped base. Without this, a
+            # re-cache at a different precision (e.g. toggling --fp8_te) leaves both *_bfloat16 and
+            # *_float8_e4m3fn variants of the same logical key in the merged file. bucket.py then strips
+            # the dtype suffix and groups them under one logical key, and the collator silently
+            # duplicates the field per batch sample — corrupted batches with no error.
+            fresh_bases = {strip_dtype_suffix(k) for k in sd}
             for key in f.keys():
-                if key not in sd:  # avoid overwriting by existing cache, we keep the new one
+                if strip_dtype_suffix(key) not in fresh_bases:  # fresh dtype variant supersedes existing
                     sd[key] = f.get_tensor(key)
 
         assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"
