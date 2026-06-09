@@ -107,10 +107,16 @@ def _base_args(**overrides):
 
 def _make_batch(gh=4, gw=6, *, masked=True):
     """Latent batch shaped like the bucket reader produces. mask_weights is (B, 1, F=1, gh, gw); when
-    `masked=True` the mask is all ones (active, non-degenerate). The shape MUST match the latent grid
-    or apply_masked_loss_with_prior broadcasts incorrectly."""
+    `masked=True` the mask defaults to a PARTIAL mask (left half background = 0, right half foreground = 1)
+    so the no-prior-region skip optimization doesn't fire and teacher tests can observe teacher behavior.
+    The all-ones-mask case (which exercises the skip) is tested explicitly in
+    test_teacher_skipped_when_all_ones_mask_continuous_mode."""
     latents = torch.zeros(1, 128, gh, gw)
-    mask = torch.ones(1, 1, 1, gh, gw) if masked else None
+    if masked:
+        mask = torch.ones(1, 1, 1, gh, gw)
+        mask[..., :, : gw // 2] = 0.0  # left half background — guarantees a prior region exists
+    else:
+        mask = None
     batch = {"i4_llm_features": [torch.zeros(1, 53248)]}
     if mask is not None:
         batch["mask_weights"] = mask
@@ -491,3 +497,281 @@ def test_base_teacher_mode_accepted_with_prior_weight():
 
     # Must not raise — proves the v1 fail-fast was removed
     trainer.handle_model_specific_args(args)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Test 10 — prior_teacher_eval honored (reviewer finding #1)
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_prior_teacher_eval_toggles_model_mode(monkeypatch):
+    """The shared masked path honors --prior_teacher_eval by calling transformer.eval() around the
+    teacher forward, restoring train() in finally (mask_loss_process_batch.py:255-258). Ideogram 4
+    must implement the same toggle. The flag is a harmless no-op for Ideogram's DiT today (no
+    dropout/BN), but silently no-oping a CLI-accepted knob is the "looks configured, does the wrong
+    thing" failure class commit 55e4d79 was killing.
+
+    We assert transformer.training is False during the teacher forward and True after, given the
+    transformer entered process_batch in train() mode."""
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    class _ModeTrackingTransformer(torch.nn.Module):
+        """Records transformer.training state at every flow call. We pass this object as the
+        `transformer` arg to process_batch and let the flow stub introspect it."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_modes: list[bool] = []
+
+        def forward(self, *a, **kw):
+            return torch.zeros(1)  # never called; the flow stub captures `transformer`
+
+    trf = _ModeTrackingTransformer()
+    trf.train()  # the trainer's outer loop sets this; mimic it
+
+    def _flow_capturing_mode(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        trf.observed_modes.append(transformer.training)
+        gh, gw = int(latents.shape[2]), int(latents.shape[3])
+        return (
+            torch.zeros(1, gh * gw, 128, dtype=network_dtype),
+            torch.full((1, gh * gw, 128), 0.5, dtype=network_dtype),
+        )
+
+    _install_stubs(monkeypatch, _flow_capturing_mode)
+
+    trainer = Ideogram4NetworkTrainer()
+    args = _base_args(prior_preservation_weight=0.5, prior_teacher_eval=True)
+    latents, batch = _make_batch()
+    network = _RecordingNetwork()
+
+    trainer.process_batch(args, _make_accel(), trf, network, batch, latents, None, None, torch.float32, torch.float32, None, 0)
+
+    # Order is teacher then student. The student call should see transformer.training=True (restored
+    # after the teacher's eval() toggle); the teacher should see training=False.
+    assert trf.observed_modes == [False, True], (
+        f"Expected [teacher in eval, student in train], got {trf.observed_modes}. Either the eval "
+        "toggle didn't fire (knob silently ignored) or the restore in finally didn't run (subsequent "
+        "training steps would silently train in eval mode after the first sample-with-eval)."
+    )
+    # After process_batch returns, transformer.training must be True (the trainer's outer loop expects this).
+    assert trf.training is True, (
+        "transformer.train() restoration missing after process_batch — every step after the first prior teacher would run in eval mode"
+    )
+
+
+def test_prior_teacher_eval_restores_train_mode_on_exception(monkeypatch):
+    """Failure-path correctness: if the teacher forward raises, transformer.train() MUST still be
+    restored. Without the finally block, an exception in the teacher would strand the transformer in
+    eval mode for the rest of training — every subsequent step would silently train with eval-mode
+    semantics. The finally guard is the only thing standing between a transient teacher failure
+    (e.g., transient OOM) and a corrupted training run."""
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    class _ModeTrackingTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+
+        def forward(self, *a, **kw):
+            return torch.zeros(1)
+
+    trf = _ModeTrackingTransformer()
+    trf.train()
+
+    def _flow_that_raises(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        # Detect we're in the teacher path (LoRA disabled) and raise. The teacher path runs first
+        # so this fires on the first call.
+        raise RuntimeError("simulated teacher OOM")
+
+    _install_stubs(monkeypatch, _flow_that_raises)
+
+    trainer = Ideogram4NetworkTrainer()
+    args = _base_args(prior_preservation_weight=0.5, prior_teacher_eval=True)
+    latents, batch = _make_batch()
+
+    with pytest.raises(RuntimeError, match="simulated teacher OOM"):
+        trainer.process_batch(
+            args, _make_accel(), trf, _RecordingNetwork(), batch, latents, None, None, torch.float32, torch.float32, None, 0
+        )
+
+    # Without the finally, transformer.training would be False here and every subsequent step would
+    # silently run in eval mode.
+    assert trf.training is True, (
+        "transformer.train() not restored after teacher raised — subsequent training steps would run in eval mode"
+    )
+
+
+# ---------------------------------------------------------------------------------------------------
+# Test 11 — Teacher forward skipped when no prior region exists (reviewer finding #2)
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_teacher_skipped_when_all_ones_mask_continuous_mode(monkeypatch):
+    """When mask_weights is all-ones (full mask, no background), prior_mask = 1 - mask_processed
+    = 0 everywhere — the reducer would weight prior_loss by zero, contributing nothing to the
+    scalar loss. Running the teacher forward in this case is pure waste and pollutes telemetry
+    (prior/teacher_ran=1 while masked_loss/prior=0 looks like "prior is configured but
+    ineffective" when actually it's "running pointlessly"). Mirrors the shared path's optimization
+    at mask_loss_process_batch.py:241-251."""
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    flow, calls = _make_flow_target()
+    _install_stubs(monkeypatch, flow)
+
+    trainer = Ideogram4NetworkTrainer()
+    args = _base_args(prior_preservation_weight=0.5)
+    latents, batch = _make_batch()
+    # OVERRIDE the default partial mask with an actual all-ones mask — this test's whole point is
+    # to exercise the all-ones skip path; the helper default is partial precisely so OTHER tests
+    # observe the teacher firing on the common-case workload.
+    batch["mask_weights"] = torch.ones_like(batch["mask_weights"])
+    assert float(batch["mask_weights"].min()) >= (1.0 - 1e-6), "test precondition: mask must be all-ones"
+
+    trainer.process_batch(
+        args, _make_accel(), None, _RecordingNetwork(), batch, latents, None, None, torch.float32, torch.float32, None, 0
+    )
+
+    assert len(calls) == 1, (
+        f"All-ones mask should skip the teacher (no prior region exists). Got {len(calls)} forwards. "
+        "This is a wasted full DiT forward per step and clutters telemetry; the shared path mirrors "
+        "this optimization at mask_loss_process_batch.py:241-251."
+    )
+
+
+def test_teacher_skipped_when_threshold_mode_no_background(monkeypatch):
+    """Threshold-mode variant: with --prior_mask_threshold=0.1 and a mask where every pixel >= 0.1,
+    the prior region (raw_mask < threshold) is empty — teacher should skip. This catches the case
+    where a user enables threshold mode on a small persona dataset whose masks happen to be high
+    everywhere (e.g., portraits where the face mask covers a large fraction)."""
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    flow, calls = _make_flow_target()
+    _install_stubs(monkeypatch, flow)
+
+    trainer = Ideogram4NetworkTrainer()
+    args = _base_args(prior_preservation_weight=0.5, prior_mask_threshold=0.1)
+    latents, batch = _make_batch()
+    # Mask with min=0.5: every pixel >= threshold=0.1, so prior region is empty
+    batch["mask_weights"] = torch.full_like(batch["mask_weights"], 0.5)
+
+    trainer.process_batch(
+        args, _make_accel(), None, _RecordingNetwork(), batch, latents, None, None, torch.float32, torch.float32, None, 0
+    )
+
+    assert len(calls) == 1, (
+        f"With prior_mask_threshold=0.1 and mask.min()=0.5 (every pixel >= threshold), no background "
+        f"region exists. Got {len(calls)} forwards instead of 1 (student only). Wasted teacher pass."
+    )
+
+
+def test_teacher_still_runs_when_partial_mask_continuous_mode(monkeypatch):
+    """Inverse of the all-ones test: with a mask that has background regions (min < 1.0), the
+    teacher MUST run. Catches the case where the skip optimization is too aggressive and
+    inadvertently disables prior preservation on the normal use case."""
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    flow, calls = _make_flow_target()
+    _install_stubs(monkeypatch, flow)
+
+    trainer = Ideogram4NetworkTrainer()
+    args = _base_args(prior_preservation_weight=0.5)
+    latents, batch = _make_batch()
+    # Mask with background: half ones, half zeros
+    mask = batch["mask_weights"].clone()
+    mask[..., :, : mask.shape[-1] // 2] = 0.0
+    batch["mask_weights"] = mask
+    assert float(batch["mask_weights"].min()) < (1.0 - 1e-6), "test precondition: mask must have background"
+
+    trainer.process_batch(
+        args, _make_accel(), None, _RecordingNetwork(), batch, latents, None, None, torch.float32, torch.float32, None, 0
+    )
+
+    assert len(calls) == 2, (
+        f"With a partial mask (background present), teacher must run. Got {len(calls)} forwards. "
+        "If 1, the skip optimization is too aggressive — it's disabling prior preservation on the "
+        "normal-case workload, defeating the whole point of this PR."
+    )
+
+
+# ---------------------------------------------------------------------------------------------------
+# Test 12 — _run_i4_flow_forward defeats a real Accelerator-prepared forward wrapper (reviewer finding #3)
+# ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Accelerator's autocast wrapper is installed only on CUDA-aware setups with native_amp.",
+)
+def test_run_i4_flow_forward_defeats_real_accelerator_wrapper():
+    """Direct test of _run_i4_flow_forward against a real Accelerator(mixed_precision="bf16").prepare()
+    canary. The earlier autocast bypass test wrapped process_batch in a torch.autocast context manager,
+    which is NOT the same mechanism Accelerator uses (Accelerator replaces model.forward with an
+    autocast-wrapping callable; torch.autocast nesting CAN'T defeat that — proven by
+    tests/test_accelerate_autocast_helper.py).
+
+    The new private helper _run_i4_flow_forward inside process_batch is the integration point where
+    that fix must propagate. Without this test, a future refactor that drops the
+    disable_accelerate_forward_autocast wrap from _run_i4_flow_forward would pass the existing
+    integration tests (which use fake accelerators) while silently re-introducing the v1-v3 broken
+    sample/train parity. This test fails loudly in that scenario.
+
+    The actual forward we run is the Ideogram-specific ideogram4_flow_matching_target with a canary
+    transformer that records the autocast state observed inside its forward; we pass it as the
+    'conditional_model' arg, so the autocast-bypass path either reaches the canary's forward or it
+    doesn't."""
+    from accelerate import Accelerator
+
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    class _AutocastCanary(torch.nn.Module):
+        """Records autocast state observed during its forward. Used as the conditional model in
+        ideogram4_flow_matching_target — the latter passes (x, t, llm_features, position_ids,
+        segment_ids, indicator) and expects a tensor back at image positions."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_autocast: list[bool] = []
+            # Trivial linear so accelerator.prepare has something to attach to
+            self.linear = torch.nn.Linear(128, 128).to(torch.bfloat16)
+
+        def forward(self, *, x, t, llm_features, position_ids, segment_ids, indicator):
+            self.observed_autocast.append(torch.is_autocast_enabled("cuda"))
+            # Return a tensor shaped like the joint sequence — ideogram4_flow_matching_target's
+            # extract_image_tokens then takes image positions. Easier to just return x unchanged
+            # (after the linear, to exercise some compute under whatever dtype regime is active).
+            return self.linear(x.to(torch.bfloat16))
+
+    accelerator = Accelerator(mixed_precision="bf16")
+    canary = _AutocastCanary().cuda()
+    prepared_canary = accelerator.prepare(canary)
+
+    trainer = Ideogram4NetworkTrainer()
+    # Build minimal valid inputs for ideogram4_flow_matching_target — this is the real function,
+    # not a stub. We're proving _run_i4_flow_forward's autocast bypass plumbs through to a real
+    # forward call on a real Accelerator-prepared model.
+    gh, gw = 4, 6
+    latents = torch.zeros(1, 128, gh, gw, device="cuda", dtype=torch.bfloat16)
+    text_features = [torch.zeros(1, 53248, device="cuda", dtype=torch.bfloat16)]
+    noise = torch.ones_like(latents)
+    timesteps = torch.tensor([0.5], device="cuda")
+
+    # Call _run_i4_flow_forward directly under an outer-set autocast context (simulating accelerator's
+    # outer training loop). The helper should defeat BOTH the outer torch.autocast AND the inner
+    # accelerate forward wrapper, so the canary observes autocast_enabled=False.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        trainer._run_i4_flow_forward(
+            accelerator,
+            prepared_canary,
+            latents,
+            text_features,
+            noise,
+            timesteps,
+            network_dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+        )
+
+    assert canary.observed_autocast == [False], (
+        f"Expected canary forward to observe autocast disabled (observed={canary.observed_autocast}). "
+        "If True, _run_i4_flow_forward's disable_accelerate_forward_autocast call is missing or not "
+        "reaching the prepared forward — this is the v3 sample-time parity failure mode applied to "
+        "training-time prior preservation, EXACTLY the bug class commit 55e4d79 fixed."
+    )

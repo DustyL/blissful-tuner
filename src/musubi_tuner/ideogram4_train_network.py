@@ -193,9 +193,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         prior_decay_timestep_start = float(getattr(args, "prior_decay_timestep_start", 300.0))
         prior_decay_warmup_ratio = float(getattr(args, "prior_decay_warmup_ratio", 0.0))
         prior_schedule_enabled = (prior_decay_schedule != "constant") or (prior_decay_warmup_ratio > 0.0)
-        prior_decay_warmup_steps = (
-            int(args.max_train_steps * prior_decay_warmup_ratio) if prior_decay_warmup_ratio > 0 else 0
-        )
+        prior_decay_warmup_steps = int(args.max_train_steps * prior_decay_warmup_ratio) if prior_decay_warmup_ratio > 0 else 0
         prior_weight_per_sample = None
         if need_prior_base and prior_schedule_enabled:
             prior_weight_per_sample = compute_prior_weight_per_sample(
@@ -223,26 +221,70 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             prior_sample_mask = do_prior
             need_prior = bool(do_prior.any().item())
 
+        # Optimization: skip the teacher forward when there's no prior region to apply it to. Avoids
+        # a full extra DiT forward AND removes confusing telemetry (prior/teacher_ran=1 while
+        # masked_loss/prior=0 would otherwise look like "prior is wired but ineffective"). Mirrors
+        # the shared mask_loss_process_batch.py optimization at lines 217-251 to keep parity.
+        if need_prior and mask_weights is not None:
+            mask_min = float(mask_weights.min())
+            prior_mask_threshold = getattr(args, "prior_mask_threshold", None)
+            if prior_mask_threshold is not None:
+                # Threshold mode: prior applies only where raw mask < threshold; if every pixel is
+                # >= threshold (fully masked), there's no background region for the teacher to
+                # contribute to and the masked reducer would weight prior_loss by zero.
+                if mask_min >= float(prior_mask_threshold):
+                    need_prior = False
+            else:
+                # Continuous mode: prior_mask = 1 - mask_processed, so an all-ones mask leaves no
+                # background. Use 1 - 1e-6 (not exact 1.0) to avoid bf16-precision false negatives.
+                if mask_min >= (1.0 - 1e-6):
+                    need_prior = False
+
         # --- Prior-teacher no-grad forward (must precede the student forward) ---------------------
+        # Optionally toggle transformer.eval() around the teacher forward. The shared masked path
+        # honors --prior_teacher_eval the same way at mask_loss_process_batch.py:255-258. The flag
+        # is harmless no-op for Ideogram 4 today (no dropout/BN in the DiT), but honoring it keeps
+        # the "accepted CLI knobs must do what they say" invariant — silently no-oping a recognized
+        # flag is the same failure class commit 55e4d79 was killing.
         prior_pred = None
         if need_prior:
-            with torch.no_grad():
-                # Unwrap so set_enabled() reaches the actual LoRA modules (skip accelerate/DDP wrappers).
-                unwrapped_network = accelerator.unwrap_model(network)
-                with prior_model_context(unwrapped_network):
-                    teacher_pred, _ = self._run_i4_flow_forward(
-                        accelerator, transformer, latents, text_features, noise, timesteps,
-                        network_dtype=network_dtype, device=device,
-                    )
-                    prior_pred = teacher_pred.detach()
-            # Block-swap restore intentionally omitted: Ideogram 4 rejects --blocks_to_swap (see
-            # handle_model_specific_args), so the teacher no-grad forward never strands CPU blocks.
-            # Add the restore call here when block swap support lands (backlog P1-2).
+            prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
+            transformer_was_training = transformer.training if prior_teacher_eval else None
+            if prior_teacher_eval:
+                transformer.eval()
+            try:
+                with torch.no_grad():
+                    # Unwrap so set_enabled() reaches the actual LoRA modules (skip accelerate/DDP wrappers).
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    with prior_model_context(unwrapped_network):
+                        teacher_pred, _ = self._run_i4_flow_forward(
+                            accelerator,
+                            transformer,
+                            latents,
+                            text_features,
+                            noise,
+                            timesteps,
+                            network_dtype=network_dtype,
+                            device=device,
+                        )
+                        prior_pred = teacher_pred.detach()
+            finally:
+                # Block-swap restore intentionally omitted: Ideogram 4 rejects --blocks_to_swap (see
+                # handle_model_specific_args), so the teacher no-grad forward never strands CPU blocks.
+                # Add the restore call here when block swap support lands (backlog P1-2).
+                if prior_teacher_eval and transformer_was_training:
+                    transformer.train()
 
         # --- Student forward (LoRA active, gradients flow) ----------------------------------------
         model_pred, target = self._run_i4_flow_forward(
-            accelerator, transformer, latents, text_features, noise, timesteps,
-            network_dtype=network_dtype, device=device,
+            accelerator,
+            transformer,
+            latents,
+            text_features,
+            noise,
+            timesteps,
+            network_dtype=network_dtype,
+            device=device,
         )
 
         if not use_mask_loss:
@@ -303,9 +345,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                     loss_metrics["prior/traditional_t_min"] = float(tt.min().item())
                     loss_metrics["prior/traditional_t_max"] = float(tt.max().item())
                 if prior_sample_mask is not None and isinstance(prior_sample_mask, torch.Tensor):
-                    loss_metrics["prior/gate_frac"] = float(
-                        prior_sample_mask.detach().to(dtype=torch.float32).mean().item()
-                    )
+                    loss_metrics["prior/gate_frac"] = float(prior_sample_mask.detach().to(dtype=torch.float32).mean().item())
         return loss, loss_metrics
 
     # region model specific
