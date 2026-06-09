@@ -217,35 +217,47 @@ def test_teacher_does_not_fire_when_prior_weight_zero(monkeypatch):
 
 
 def test_lora_disabled_only_around_teacher_forward(monkeypatch):
-    """The sequence MUST be: set_enabled(False) -> teacher forward -> set_enabled(True) -> student
-    forward. If the student runs with LoRA disabled, it computes against the base model and the
-    LoRA receives no gradient signal — training appears to proceed but the adapter never learns.
-    If LoRA is never disabled, the teacher computes against the LoRA-active model and the prior
-    target becomes "what the LoRA already predicts," collapsing the prior loss to ~0 and
-    eliminating the preservation effect.
+    """The teacher MUST observe enabled=False (LoRA contribution numerically zero) and the student
+    MUST observe enabled=True (LoRA contribution active). This is the actual numerical contract
+    that prior preservation depends on — NOT just the call ordering.
 
-    We check ordering by interleaving network.set_enabled() calls with forward records."""
+    The previous version of this test asserted the call PATTERN (set_enabled(False), forward,
+    set_enabled(True), forward) and would have passed even when LoRAModule.forward silently
+    ignored self.enabled — which was the actual production bug discovered 2026-06-09 via DLAY v5
+    telemetry (masked_loss/prior = 0 across 2145 steps despite prior_weight = 0.5). The numerical
+    test below catches both the call-pattern failure AND the LoRAModule-doesn't-respect-enabled
+    failure that the lora.py + loha.py fixes resolved.
+
+    Mechanism: the flow stub captures network.enabled at call time. The teacher pass must see
+    enabled=False (so its forward returns the base output, becoming the "what would the model
+    predict without LoRA" reference); the student pass must see enabled=True (so its forward
+    includes the LoRA contribution and gradients flow). If either observation is wrong, prior
+    preservation is silently broken — exactly the v5 failure mode."""
     from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
 
     network = _RecordingNetwork()
-    events: list[str] = []
+    # Add the enabled attribute that LoRANetwork.set_enabled would propagate; our _RecordingNetwork
+    # only tracks calls, so we extend it inline to also expose the numerical state via .enabled.
+    network.enabled = True  # type: ignore[attr-defined]
+    original_set_enabled = network.set_enabled
+
+    def _stateful_set_enabled(enabled: bool) -> None:
+        network.enabled = enabled  # type: ignore[attr-defined]
+        original_set_enabled(enabled)
+
+    network.set_enabled = _stateful_set_enabled  # type: ignore[method-assign]
+
+    observed_enabled: list[bool] = []
 
     def _flow(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        # Capture the network.enabled state at the time of each forward — this is the actual
+        # numerical signal the model would have seen during the real forward.
+        observed_enabled.append(network.enabled)  # type: ignore[attr-defined]
         gh, gw = int(latents.shape[2]), int(latents.shape[3])
-        events.append("forward")
         return (
             torch.zeros(1, gh * gw, 128, dtype=network_dtype),
             torch.full((1, gh * gw, 128), 0.5, dtype=network_dtype),
         )
-
-    # Wrap network so set_enabled call interleaves with forward events
-    original_set_enabled = network.set_enabled
-
-    def _recording_set_enabled(enabled: bool) -> None:
-        events.append(f"set_enabled({enabled})")
-        original_set_enabled(enabled)
-
-    network.set_enabled = _recording_set_enabled  # type: ignore[method-assign]
 
     _install_stubs(monkeypatch, _flow)
 
@@ -255,10 +267,19 @@ def test_lora_disabled_only_around_teacher_forward(monkeypatch):
 
     trainer.process_batch(args, _make_accel(), None, network, batch, latents, None, None, torch.float32, torch.float32, None, 0)
 
-    assert events == ["set_enabled(False)", "forward", "set_enabled(True)", "forward"], (
-        f"Unexpected event order: {events}. The teacher must run with LoRA disabled and the student "
-        "with LoRA enabled — any other interleaving silently breaks either the prior target (LoRA "
-        "leaks into prior) or the student gradient (no LoRA to learn)."
+    # Two forwards expected: teacher (enabled=False), then student (enabled=True).
+    assert observed_enabled == [False, True], (
+        f"Expected [teacher in enabled=False, student in enabled=True], got {observed_enabled}. "
+        "If [True, True], prior_model_context's set_enabled(False) didn't take effect numerically "
+        "— the bug discovered via DLAY v5 telemetry where prior preservation silently did nothing. "
+        "If [False, False], the student is running with LoRA disabled — no gradient signal would "
+        "flow and training would be a no-op."
+    )
+    # After process_batch returns, enabled must be restored to True (the trainer's outer loop
+    # state assumption) — otherwise the NEXT step would run student with LoRA disabled.
+    assert network.enabled is True, (  # type: ignore[attr-defined]
+        "set_enabled(True) not restored after process_batch returned. Subsequent training steps "
+        "would silently run with LoRA disabled — no gradient updates would flow to the adapter."
     )
 
 

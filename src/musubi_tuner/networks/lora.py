@@ -462,6 +462,10 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # Adapter enable flag: LoRANetwork.set_enabled(...) propagates here, and forward() consults
+        # it. Mirrors the LoRAInfModule attribute (lora.py:666). Default True so the standard
+        # training forward unchanged when set_enabled is never called.
+        self.enabled = True
 
         # Detect layer type - DoRA only for Linear (not Conv)
         is_linear = org_module.__class__.__name__ == "Linear"
@@ -561,6 +565,17 @@ class LoRAModule(torch.nn.Module):
 
         # Project convention: multiplier=0 should be a true no-op.
         if self.multiplier == 0:
+            return org_forwarded
+
+        # Project convention: set_enabled(False) on the parent LoRANetwork (lora.py:1309) must produce
+        # a true no-op forward. LoRAInfModule.forward checks this at line 844 for inference; the
+        # training forward MUST do the same so prior_model_context (which calls set_enabled(False)
+        # around the teacher pass in mask_loss_process_batch.py + ideogram4_train_network.py) actually
+        # disables the LoRA contribution. Without this check, the teacher forward computes against
+        # the LoRA-active model, prior_loss_unreduced = MSE(student, teacher) = 0, and prior
+        # preservation silently does nothing — confirmed empirically in DLAY v5 training where
+        # masked_loss/prior = 0 across all 2145 steps despite prior_weight=0.5.
+        if not self.enabled:
             return org_forwarded
 
         # module dropout

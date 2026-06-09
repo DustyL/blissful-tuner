@@ -149,3 +149,113 @@ def test_lora_forward_with_dora_handles_dtype_mismatch():
         "the DoRA branch is missing or stripped — _dora_delta's mag_norm_scale (fp32) will promote "
         "the delta and the final addition will widen the output dtype."
     )
+
+
+# ---------------------------------------------------------------------------------------------------
+# LoRAModule.forward must honor self.enabled — NUMERICAL-effect test
+# ---------------------------------------------------------------------------------------------------
+#
+# Discovered 2026-06-09 via DLAY v5 training telemetry: masked_loss/prior = 0 across 2145 steps
+# despite prior_preservation_weight = 0.5 and prior/teacher_ran = 1. Root cause: LoRANetwork.set_enabled
+# (lora.py:1309) sets `lora.enabled = is_enabled` on every wrapped LoRAModule, but the training-time
+# LoRAModule.forward was only consulting `self.multiplier == 0` — it never checked `self.enabled`.
+# So `prior_model_context` (in mask_loss_process_batch.py) calling `set_enabled(False)` around the
+# teacher pass became a silent no-op: teacher and student forwards saw the same LoRA-active model,
+# their predictions were identical, and `prior_loss_unreduced = MSE(student, teacher) = 0`.
+#
+# Affects ALL architectures using the shared `prior_model_context` — WAN, FLUX.2, HV1.5, Qwen,
+# Z-Image, Ideogram 4. LoHaModule had the same bug; LoKrModule was already correct.
+#
+# The pre-existing call-pattern tests (test_ideogram4_prior_preservation::test_lora_disabled_only_
+# around_teacher_forward, test_masked_process_batch's _FakeNetwork.history assertions) verified the
+# set_enabled CALLS but not their numerical effect. This new test exists specifically to catch the
+# numerical contract: when enabled=False, LoRA contribution is exactly zero regardless of training
+# state.
+
+
+def test_lora_forward_respects_enabled_flag_numerical_effect():
+    """LoRAModule.forward with self.enabled=False must produce IDENTICAL output to org_forward.
+
+    Critical: this test must use TRAINED (non-zero) LoRA weights, not the zeros-init state, because
+    the buggy code path is invisible at init (lora_up=0 makes the contribution zero anyway). We
+    manually populate lora_up.weight with non-zero values to simulate post-training state, then
+    assert the forward output equals org_forward output (bit-identical) when enabled=False, AND
+    that they DIFFER when enabled=True. This dual assertion catches both directions of the bug —
+    a forward that ignores enabled (the actual bug) AND a forward that always returns org_forwarded
+    (the over-correction that would silently disable LoRA training entirely)."""
+    base, lora = _make_lora(in_dim=16, out_dim=32, rank=4)
+
+    # Simulate trained LoRA: non-zero lora_up so the contribution is detectable.
+    with torch.no_grad():
+        lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.1)
+    assert torch.any(lora.lora_up.weight != 0.0), "test precondition: lora_up must be non-zero (trained state)"
+
+    x = torch.randn(2, 8, 16, dtype=torch.float32)
+    base_out = lora.org_forward(x)  # the pre-patched Linear forward (no LoRA add)
+
+    # With enabled=True (default), forward includes LoRA contribution — output must differ from base.
+    out_enabled = base(x)
+    assert not torch.equal(out_enabled, base_out), (
+        "LoRA enabled=True with trained weights should produce output != base. If they're equal, "
+        "either the LoRA contribution is being silently dropped (the over-correction failure mode) "
+        "or lora_up.weight wasn't actually populated."
+    )
+
+    # With enabled=False, forward MUST equal org_forward bit-identically.
+    lora.enabled = False
+    out_disabled = base(x)
+    assert torch.equal(out_disabled, base_out), (
+        f"LoRA enabled=False must produce output IDENTICAL to org_forward. Max diff: "
+        f"{(out_disabled - base_out).abs().max().item():.3e}. If non-zero, LoRAModule.forward is "
+        "ignoring self.enabled — this is the DLAY v5 prior preservation silent-no-op bug. "
+        "prior_model_context's set_enabled(False) call would have no numerical effect on training, "
+        "making teacher and student forwards identical, collapsing masked_loss/prior to 0."
+    )
+
+    # Restore and verify the toggle is reversible (no state corruption).
+    lora.enabled = True
+    out_re_enabled = base(x)
+    assert torch.equal(out_re_enabled, out_enabled), (
+        "Re-enabling must restore the same output as before disable. If different, set_enabled toggles "
+        "have side effects on internal state — a serious correctness issue beyond the original bug."
+    )
+
+
+def test_lora_network_set_enabled_propagates_to_module_forward():
+    """LoRANetwork.set_enabled(False) iterates `lora.enabled = False` across all wrapped modules
+    (lora.py:1309). Verify the network-level call propagates to per-module forward behavior, not
+    just the attribute. This is the API contract `prior_model_context` actually exercises."""
+    from musubi_tuner.networks.lora import LoRANetwork
+
+    # Build a tiny network with one wrapped Linear so we can exercise set_enabled end-to-end.
+    base, lora = _make_lora()
+    with torch.no_grad():
+        lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.1)
+
+    # Construct a minimal LoRANetwork shell. We only need set_enabled to iterate one entry.
+    class _NetShell:
+        def __init__(self, lora_module):
+            self.text_encoder_loras = []
+            self.unet_loras = [lora_module]
+
+        # Bind the real method by class reference so we exercise the production code path.
+        set_enabled = LoRANetwork.set_enabled
+
+    net = _NetShell(lora)
+    x = torch.randn(2, 8, 16, dtype=torch.float32)
+    base_out = lora.org_forward(x)
+
+    out_initial = base(x)
+    assert not torch.equal(out_initial, base_out), "test precondition: trained LoRA must contribute non-zero"
+
+    net.set_enabled(False)
+    out_off = base(x)
+    assert torch.equal(out_off, base_out), (
+        "Network-level set_enabled(False) must propagate to per-module forward — the contract "
+        "prior_model_context depends on. If this fails, every architecture's prior preservation is "
+        "silently broken."
+    )
+
+    net.set_enabled(True)
+    out_on = base(x)
+    assert torch.equal(out_on, out_initial), "Re-enable via network must restore original output"

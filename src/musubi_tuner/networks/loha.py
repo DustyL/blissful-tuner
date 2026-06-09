@@ -143,6 +143,13 @@ class LoHaModule(torch.nn.Module):
         return org_forwarded + delta * self.multiplier * scale
 
     def forward(self, x):
+        # Mirror LoRAModule.forward's enabled guard: set_enabled(False) on the parent network must
+        # be a true no-op forward so prior_model_context (which disables adapters around the teacher
+        # pass) actually engages. Without this check, teacher and student forwards run the same
+        # LoRA-active model, prior_loss collapses to zero, and prior preservation silently does
+        # nothing — same bug class as the LoRA path discovered via DLAY v5 telemetry.
+        if not self.enabled:
+            return self.org_forward(x)
         return self.default_forward(x)
 
     # return weight for merge
