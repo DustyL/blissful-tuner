@@ -48,9 +48,13 @@ class TestWanDatasetLoading(unittest.TestCase):
         lat_path = os.path.join(self.tmpdir, f"{name}_latent.safetensors")
         te_path = os.path.join(self.tmpdir, f"{name}_te.safetensors")
 
+        # Cache keys must use the canonical torch dtype name (e.g. "bfloat16"), NOT shorthand
+        # like "bf16". Production save paths build keys via dtype_to_str(t.dtype), and the loader
+        # strips suffixes only when they match _CACHE_DTYPE_STRINGS — so "_bf16" would not strip
+        # and the batch would land at e.g. "t5_bf16" / "latents_5x4x4_bf16" instead of "t5" / "latents".
         C, F, H, W = latent_shape
         latent = torch.randn(C, F, H, W, dtype=torch.bfloat16)
-        lat_sd = {f"latents_{F}x{H}x{W}_bf16": latent}
+        lat_sd = {f"latents_{F}x{H}x{W}_bfloat16": latent}
         if mask_weights is not None:
             # Real WAN caches store masks as (1, F, H, W) — add leading dim if needed
             if mask_weights.ndim == 3:
@@ -59,11 +63,11 @@ class TestWanDatasetLoading(unittest.TestCase):
             lat_sd[f"mask_weights_{mF}x{mH}x{mW}_float32"] = mask_weights
         if image_latent is not None:
             iC, iF, iH, iW = image_latent.shape
-            lat_sd[f"latents_image_{iF}x{iH}x{iW}_bf16"] = image_latent
+            lat_sd[f"latents_image_{iF}x{iH}x{iW}_bfloat16"] = image_latent
         save_file(lat_sd, lat_path)
 
         t5_embed = torch.randn(t5_seq_len, 4096, dtype=torch.bfloat16)
-        save_file({"varlen_t5_bf16": t5_embed}, te_path)
+        save_file({"varlen_t5_bfloat16": t5_embed}, te_path)
 
         return lat_path, te_path
 
