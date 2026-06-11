@@ -31,23 +31,24 @@ def _prodigy_groups_with_shared(ds, shared_d, lrs=None, d0=1e-6, k=500, prodigy_
     )
 
 
-def test_shared_d_reported_with_applied_scales(caplog):
-    # The Klein v9 false-alarm cycle: three analyses misread raw per-group d without the shared_d
-    # factor. With split_groups_mean active (shared_d present), the checkpoint INFO must report
-    # shared_d AND the per-group applied scale d*shared_d*lr — the literal v9 values as fixture.
+def test_v9_inflation_is_info_only_not_a_warning(caplog):
+    # The Klein v9 false-alarm post-mortem (2026-06-11): with split_groups_mean a wide raw-d spread
+    # from one group INFLATING is INERT (the raw d cancels in the Adam ratio — tests/test_prodigy_d_inert.py;
+    # an inflated group is never the harmonic minimum, so it never moves shared_d). So the literal v9
+    # step-200 state must emit an INFO reporting shared_d and the per-group APPLIED step (shared_d * lr,
+    # NOT d * shared_d * lr) and NO warning — the original spread warning here WAS the false alarm.
     trainer = _trainer()
     opt = _prodigy_groups_with_shared([1.769, 2.197e-5, 8.798e-4], shared_d=6.43e-5, lrs=[1.0, 12.0, 1.0])
     with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
         trainer._check_optimizer_adaptation_once(opt, ["unet", "unet plus", "unet dora"])
     info = next(r for r in caplog.records if "adaptation checkpoint" in r.message)
     assert "shared_d=6.430e-05" in info.message
-    assert "applied scale" in info.message
-    # spread warning fires (80k spread) but with the split_groups_mean framing, not the
-    # corruption-presumption framing
-    warning = next(r for r in caplog.records if "span" in r.message)
-    assert "split_groups_mean" in warning.message
-    assert "applied scales" in warning.message
-    assert "usually means one group's estimate is corrupted" not in warning.message
+    assert "APPLIED step (shared_d x lr)" in info.message
+    assert "6.430e-05" in info.message  # unet applied = shared_d * 1.0
+    assert "7.716e-04" in info.message  # unet plus applied = shared_d * 12
+    assert "INERT" in info.message
+    # No warning: inflation is inert and no group collapsed toward d0.
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 def test_spread_warning_keeps_corruption_framing_without_shared_d(caplog):
