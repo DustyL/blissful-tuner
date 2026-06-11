@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from blissful_tuner.blissful_logger import BlissfulLogger
+from musubi_tuner.networks.dora_utils import FP8_DTYPES, dequantize_fp8_weight
 from musubi_tuner.networks.dora_utils import dora_weight_norm_materialized as _dora_weight_norm_materialized
 
 if TYPE_CHECKING:
@@ -274,16 +275,28 @@ class DoRALayer(nn.Module):
         self.weight = nn.Parameter(torch.ones(out_features))
 
     def get_weight_norm_materialized(
-        self, weight: torch.Tensor, lora_weight: torch.Tensor, scaling: float, eps: float = 1e-6
+        self,
+        weight: torch.Tensor,
+        lora_weight: torch.Tensor,
+        scaling: float,
+        eps: float = 1e-6,
+        scale_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate row-wise L2 norm by materializing B@A (for init/merge only).
 
         For [out, in] weight matrix, computes ||row_i||_2 for each output row.
+        Pass the module's ``scale_weight`` buffer when the base weight is fp8-prequantized.
         """
-        return _dora_weight_norm_materialized(weight, lora_weight, scaling, eps)
+        return _dora_weight_norm_materialized(weight, lora_weight, scaling, eps, scale_weight=scale_weight)
 
     def get_weight_norm_efficient(
-        self, W: torch.Tensor, A: torch.Tensor, B: torch.Tensor, s: float, eps: float = 1e-6
+        self,
+        W: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        s: float,
+        eps: float = 1e-6,
+        scale_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Calculate row-wise L2 norm WITHOUT materializing B@A (memory efficient).
@@ -296,7 +309,14 @@ class DoRALayer(nn.Module):
             A: [r, in] lora_down.weight
             B: [out, r] lora_up.weight
             s: scaling factor (multiplier * scale)
+            scale_weight: the module's fp8 scale buffer; required when W is fp8-prequantized
         """
+        # fp8 base: dequantize to true weights first. A bare .float() on raw fp8 would NOT crash but
+        # yields quantization-lattice magnitudes (~200x off) — silently wrong norms, wrong DoRA scaling.
+        # After dequant W is float32, so the .to(W.dtype) at the end also stays non-fp8 (an fp8 norm
+        # would crash the downstream magnitude/norm division with the same Float8-promotion error).
+        if W.dtype in FP8_DTYPES:
+            W = dequantize_fp8_weight(W, scale_weight)
         Wf, Af, Bf = W.float(), A.float(), B.float()
 
         # ||W_i||^2 for each row
@@ -317,11 +337,18 @@ class DoRALayer(nn.Module):
         norm_squared = w_norm2 + cross + (s * s) * lora_norm2
         return norm_squared.clamp_min(eps).sqrt().to(W.dtype)
 
-    def update_layer(self, base_weight: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor, scaling: float) -> None:
+    def update_layer(
+        self,
+        base_weight: torch.Tensor,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+        scaling: float,
+        scale_weight: Optional[torch.Tensor] = None,
+    ) -> None:
         """Initialize magnitude from base weights + LoRA (materializes B@A, called once)"""
         with torch.no_grad():
             lora_weight = lora_B @ lora_A
-            weight_norm = self.get_weight_norm_materialized(base_weight, lora_weight, scaling)
+            weight_norm = self.get_weight_norm_materialized(base_weight, lora_weight, scaling, scale_weight=scale_weight)
             # Use copy_() to preserve parameter identity for optimizer/FSDP
             self.weight.copy_(weight_norm.detach())
 
@@ -502,7 +529,10 @@ class LoRAModule(torch.nn.Module):
         base_weight = base_layer.weight.data
         lora_A = self.lora_down.weight
         lora_B = self.lora_up.weight
-        self.dora_layer.update_layer(base_weight, lora_A, lora_B, self.scale * self.multiplier)
+        # fp8-prequantized base (e.g. Ideogram 4): the monkey-patch's scale_weight buffer is needed
+        # to dequantize raw fp8 values to true weights; absent on ordinary bf16/fp32 modules.
+        scale_weight = getattr(base_layer, "scale_weight", None)
+        self.dora_layer.update_layer(base_weight, lora_A, lora_B, self.scale * self.multiplier, scale_weight=scale_weight)
 
     def _get_base_layer(self):
         """Get base layer (for live weight and bias access)"""
@@ -529,7 +559,9 @@ class LoRAModule(torch.nn.Module):
         # Weight norm using efficient computation (no_grad to avoid building compute graph)
         # Detached per DoRA paper section 4.3 - gradients don't flow through the norm
         with torch.no_grad():
-            weight_norm = self.dora_layer.get_weight_norm_efficient(W, A, B, s)
+            weight_norm = self.dora_layer.get_weight_norm_efficient(
+                W, A, B, s, scale_weight=getattr(base_layer, "scale_weight", None)
+            )
 
         # Magnitude / norm scaling - reshape based on output tensor dimensions
         # 2D: [batch, out] -> mag_norm_scale shape [1, out]
@@ -810,7 +842,11 @@ class LoRAInfModule(LoRAModule):
                             )
                             self._warned_uninit_dora_mag = True
                 # Include DoRA scaling in pre-calculated weight (materialization OK here)
-                base_weight = self.org_module_ref[0].weight.data.to(torch.float)
+                # fp8 base: dequantize via scale_weight before the float cast — raw fp8 values are
+                # not true weights and would silently mis-scale the merge.
+                base_weight = dequantize_fp8_weight(
+                    self.org_module_ref[0].weight.data, getattr(self.org_module_ref[0], "scale_weight", None)
+                ).to(torch.float)
                 lora_weight = multiplier * (up_weight @ down_weight) * self.scale
                 weight_norm = self.dora_layer.get_weight_norm_materialized(base_weight, lora_weight, 1.0)
                 dora_factor = mag.to(torch.float) / weight_norm
