@@ -25,7 +25,8 @@ from musubi_tuner.ideogram4.text_encoder import (
     load_ideogram4_text_encoder,
     load_ideogram4_tokenizer,
 )
-from blissful_tuner.mask_loss_process_batch import prior_model_context
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, prior_model_context
+from musubi_tuner.modules.lora_ema_teacher import LoRAEmaTeacher
 from musubi_tuner.ideogram4.training import (
     estimate_prior_gate_skip_rate,
     ideogram4_cleanness_to_noise_timestep,
@@ -66,6 +67,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         super().__init__()
         self._sample_unconditional_dit = None  # loaded only during sampling (on_before/after_sample_images)
         self._prior_gate_rate_logged = False  # one-shot guard for the P0-8b skip-rate estimate
+        self.prior_lora_ema = None  # EMA teacher (P0-6) — lazily created in process_batch after warmup
+        self._ema_warmup_warned = False  # one-shot guard for the can't-init-in-time warning
 
     def _validate_args_and_init(self, args) -> bool:
         # Neutralize the no-op fp8 flags BEFORE the base fp8 assert (which lives inside the base
@@ -211,6 +214,34 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 warmup_steps=prior_decay_warmup_steps,
             )
 
+        # --- EMA teacher (P0-6): config + lazy init, mirroring the shared masked path exactly ------
+        # (mask_loss_process_batch.py:130-197). The teacher runs in BASE mode until the EMA
+        # initializes at max(100, warmup) optimizer steps — eager init at step 0 would anchor the
+        # prior to an effectively random adapter. Updates happen in on_post_optimizer_step via the
+        # shared masked_on_post_optimizer_step helper (sync_gradients-gated).
+        prior_teacher_mode = str(getattr(args, "prior_teacher_mode", "base")).lower()
+        prior_teacher_ema_decay = float(getattr(args, "prior_teacher_ema_decay", 0.999))
+        prior_teacher_ema_min_init_steps = 100
+        prior_teacher_ema_init_step = max(prior_teacher_ema_min_init_steps, prior_decay_warmup_steps)
+
+        if not self._ema_warmup_warned:
+            self._ema_warmup_warned = True
+            if prior_teacher_mode == "ema" and prior_teacher_ema_init_step >= int(args.max_train_steps):
+                logger.warning(
+                    "EMA teacher is enabled, but it will not initialize within this run: "
+                    f"ema_init_step={prior_teacher_ema_init_step} >= max_train_steps={int(args.max_train_steps)}. "
+                    "Teacher will remain in base mode for the entire run."
+                )
+
+        if (
+            need_prior_base
+            and prior_teacher_mode == "ema"
+            and self.prior_lora_ema is None
+            and global_step >= prior_teacher_ema_init_step
+        ):
+            self.prior_lora_ema = LoRAEmaTeacher(decay=prior_teacher_ema_decay)
+            self.prior_lora_ema.init_from(accelerator.unwrap_model(network))
+
         # Per-sample structural gating via the (remapped) timestep threshold. The shared masked-loss
         # reducer also gates application of the prior term per-sample so a teacher forward triggered
         # for ANY sample in the batch is the natural granularity here.
@@ -279,6 +310,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # the "accepted CLI knobs must do what they say" invariant — silently no-oping a recognized
         # flag is the same failure class commit 55e4d79 was killing.
         prior_pred = None
+        prior_teacher_uses_ema = False
         if need_prior:
             prior_teacher_eval = bool(getattr(args, "prior_teacher_eval", False))
             transformer_was_training = transformer.training if prior_teacher_eval else None
@@ -288,7 +320,16 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 with torch.no_grad():
                     # Unwrap so set_enabled() reaches the actual LoRA modules (skip accelerate/DDP wrappers).
                     unwrapped_network = accelerator.unwrap_model(network)
-                    with prior_model_context(unwrapped_network):
+                    # base teacher: LoRA disabled. EMA teacher: LoRA enabled, weights swapped in-place
+                    # to EMA values (graph-safe). Before the EMA initializes, ema mode falls back to
+                    # the base teacher — identical semantics to the shared masked path.
+                    prior_teacher_uses_ema = prior_teacher_mode == "ema" and self.prior_lora_ema is not None
+                    prior_context = (
+                        self.prior_lora_ema.apply_to(unwrapped_network)
+                        if prior_teacher_uses_ema
+                        else prior_model_context(unwrapped_network)
+                    )
+                    with prior_context:
                         teacher_pred, _ = self._run_i4_flow_forward(
                             accelerator,
                             transformer,
@@ -371,6 +412,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             # behavior in the FLUX.2 convention regardless of Ideogram's t-cleanness internals.
             if need_prior_base:
                 loss_metrics["prior/teacher_ran"] = float(prior_pred is not None)
+                loss_metrics["prior/teacher_mode_ema_used"] = float(prior_teacher_uses_ema)
                 if traditional_t is not None:
                     tt = traditional_t.detach().to(dtype=torch.float32)
                     loss_metrics["prior/traditional_t_mean"] = float(tt.mean().item())
@@ -407,22 +449,6 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "block-swap hooks (base training would call transformer.enable_block_swap()). Remove the flag "
                 "and train at a lower resolution, or add block swap to modeling_ideogram4."
             )
-        # Prior preservation (Slice 2): base-mode teacher with t-remapped scheduling/gating is supported.
-        # EMA teacher mode is deferred to a follow-up PR (needs on_post_optimizer_step override + lazy
-        # init semantics). Reject `prior_teacher_mode="ema"` LOUDLY rather than silently falling through
-        # to base — the global parser accepts the flag, and a silent fallback would be exactly the
-        # "looks configured, does the wrong thing" bug class that bit v1-v3 (see commit 55e4d79).
-        if (
-            getattr(args, "use_mask_loss", False)
-            and float(getattr(args, "prior_preservation_weight", 0.0)) > 0.0
-            and str(getattr(args, "prior_teacher_mode", "base")).lower() == "ema"
-        ):
-            raise ValueError(
-                "Ideogram 4 prior preservation supports prior_teacher_mode='base' only in this release. "
-                "EMA teacher mode is deferred to a follow-up PR (needs on_post_optimizer_step override + "
-                "LoRAEmaTeacher lazy-init wiring). Set --prior_teacher_mode=base or omit the flag."
-            )
-
         # Sampling-during-training needs resources normal training doesn't load (Qwen3-VL encoder, the separate
         # unconditional DiT, the VAE). Require them up front — only when --sample_prompts is set — so a misconfig
         # fails before the run instead of at the first sample interval.
@@ -479,6 +505,13 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         self._control_training = False
         self.default_guidance_scale = 7.0  # Ideogram uses asymmetric CFG at inference; unused at train time
         self.default_discrete_flow_shift = 1.0
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        # EMA-teacher update (P0-6): the shared helper fires only on real optimizer steps
+        # (sync_gradients=True) and no-ops until process_batch lazily creates self.prior_lora_ema
+        # after warmup — identical to the FLUX.2/WAN wiring (flux_2_train_network.py:87-90).
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
 
     def compile_transformer(self, args, transformer):
         # Compile each of the 34 transformer blocks individually rather than the root module — Inductor
