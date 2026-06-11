@@ -132,6 +132,39 @@ def test_step_logs_emit_dora_group_lr_keys():
         assert f"lr/{desc}" in logs
         assert f"lr/d*lr/{desc}" in logs
         assert f"lr/d*eff_lr/{desc}" in logs
+    # Without shared_d (split_groups_mean off), the applied-step tags must NOT appear.
+    assert "lr/shared_d" not in logs
+    assert not any(k.startswith("lr/applied_alpha/") for k in logs)
+
+
+def test_step_logs_emit_applied_step_tags_under_split_groups_mean():
+    # Klein v9 lesson (2026-06-11): the raw lr/d*lr tags are NOT the applied step under
+    # split_groups_mean — the ScheduleFree update is ~ d_raw x shared_d x lr (clip-bounded). Pin the
+    # new tags that make the applied scale visible, using the literal v9 telemetry values.
+    from types import SimpleNamespace
+
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    trainer = Ideogram4NetworkTrainer()
+    args = SimpleNamespace(optimizer_type="prodigyplus.ProdigyPlusScheduleFree")
+    descs = ["unet", "unet plus", "unet dora"]
+    shared = 6.43e-5
+    groups = [
+        {"d": d, "d0": 1e-6, "lr": lr, "effective_lr": 0.5, "k": 500, "prodigy_steps": 500, "shared_d": shared}
+        for d, lr in ((1.769, 1.0), (2.197e-5, 12.0), (8.798e-4, 1.0))
+    ]
+    optimizer = SimpleNamespace(param_groups=groups)
+    scheduler = SimpleNamespace(get_last_lr=lambda: [1.0, 12.0, 1.0])
+
+    logs = trainer.generate_step_logs(args, 0.1, 0.1, scheduler, descs, optimizer)
+
+    assert logs["lr/shared_d"] == pytest.approx(shared)
+    assert logs["lr/applied_alpha/unet"] == pytest.approx(1.769 * shared)
+    assert logs["lr/applied_alpha/unet plus"] == pytest.approx(2.197e-5 * shared * 12.0)
+    assert logs["lr/applied_alpha/unet dora"] == pytest.approx(8.798e-4 * shared)
+    assert logs["lr/d_ratio/unet"] == pytest.approx(1.769 / shared)
+    # raw tags unchanged for cross-run continuity with historical dashboards
+    assert logs["lr/d*lr/unet"] == pytest.approx(1.769)
 
 
 def test_prodigy_estimates_independent_d_per_group():
