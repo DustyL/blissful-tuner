@@ -88,6 +88,52 @@ def test_no_dora_grouping_unchanged():
     assert [g["lr"] for g in params] == [1.0, 16.0]
 
 
+def test_old_two_group_optimizer_state_fails_loudly_on_resume():
+    # Safety contract: resuming a pre-change DoRA optimizer state (2 groups: down+magnitudes, up)
+    # into the new 3-group structure must fail LOUDLY at load time, never silently misalign state.
+    # The group-count check lives in upstream torch.optim.Optimizer.load_state_dict (accelerate
+    # delegates to it) — this test makes our safety claim survive torch/accelerate version bumps.
+    torch.manual_seed(0)
+    model, _ = _tiny_model()
+    net = _make_network(model, use_dora=True, loraplus_ratio="16")
+    params, _ = net.prepare_optimizer_params(unet_lr=1.0)
+    params = [{**g, "params": list(g["params"])} for g in params]
+
+    new_opt = torch.optim.AdamW(params)
+    # Simulate the PRE-change grouping: magnitudes merged into the down group.
+    old_style_groups = [
+        {"params": params[0]["params"] + params[2]["params"], "lr": 1.0},
+        {"params": params[1]["params"], "lr": 16.0},
+    ]
+    old_opt = torch.optim.AdamW(old_style_groups)
+
+    with pytest.raises(ValueError, match="parameter groups"):
+        new_opt.load_state_dict(old_opt.state_dict())
+
+
+def test_step_logs_emit_dora_group_lr_keys():
+    # The post-mortem methodology says "watch lr/d*lr/unet dora" — that tag exists only because
+    # generate_step_logs threads lr_descriptions positionally into the TB keys. Pin the full key
+    # set so a logging refactor can't silently drop the watchdog tags.
+    from types import SimpleNamespace
+
+    from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
+
+    trainer = Ideogram4NetworkTrainer()
+    args = SimpleNamespace(optimizer_type="prodigyplus.ProdigyPlusScheduleFree")
+    descs = ["unet", "unet plus", "unet dora"]
+    groups = [{"d": 2e-6, "d0": 1e-6, "lr": lr, "effective_lr": 0.5, "k": 0, "prodigy_steps": 500} for lr in (1.0, 16.0, 1.0)]
+    optimizer = SimpleNamespace(param_groups=groups)
+    scheduler = SimpleNamespace(get_last_lr=lambda: [1.0, 16.0, 1.0])
+
+    logs = trainer.generate_step_logs(args, 0.1, 0.1, scheduler, descs, optimizer)
+
+    for desc in descs:
+        assert f"lr/{desc}" in logs
+        assert f"lr/d*lr/{desc}" in logs
+        assert f"lr/d*eff_lr/{desc}" in logs
+
+
 def test_prodigy_estimates_independent_d_per_group():
     prodigyplus = pytest.importorskip("prodigyplus")
 
