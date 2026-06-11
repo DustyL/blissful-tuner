@@ -142,6 +142,46 @@ def test_main_io_roundtrip(tmp_path):
     assert "sshs_model_hash" in metadata  # hashes recomputed for the converted tensors
 
 
+def test_loha_lokr_checkpoints_rejected():
+    for marker_key in (
+        "lora_unet_layers_0_attention_qkv.hada_w1_a",
+        "lora_unet_layers_0_attention_qkv.lokr_w1",
+    ):
+        src = {marker_key: torch.randn(4, 4)}
+        with pytest.raises(NotImplementedError, match="P1-3"):
+            convert_state_dict(src)
+
+
+def test_reverse_warns_on_blissful_format_input(caplog):
+    import logging
+
+    src = _make_checkpoint(use_dora=True)  # blissful format, fed to --reverse by mistake
+    with caplog.at_level(logging.WARNING):
+        convert_state_dict(src, reverse=True)
+    assert any("blissful-format keys" in r.message for r in caplog.records)
+
+
+def test_output_tensors_do_not_share_storage_with_input():
+    # Mutating a converted DoRA tensor must not corrupt the caller's input dict.
+    src = _make_checkpoint(use_dora=True)
+    original = src["lora_unet_layers_0_attention_qkv.dora_layer.weight"].clone()
+    out, _ = convert_state_dict(src)
+    out["lora_unet_layers_0_attention_qkv.dora_scale"].mul_(0.0)
+    assert torch.equal(src["lora_unet_layers_0_attention_qkv.dora_layer.weight"], original)
+
+
+def test_rslora_mixed_rank_modules_rescale_per_module():
+    # rank_pattern allows per-module ranks; the converter must read rank per-tensor, not globally.
+    src = {}
+    src.update(_make_module("lora_unet_layers_0_attention_qkv", out_dim=18, in_dim=6, rank=4, alpha=4.0))
+    src.update(_make_module("lora_unet_layers_0_feed_forward_w1", out_dim=24, in_dim=6, rank=16, alpha=8.0))
+    src["use_rslora_flag"] = torch.tensor(True)
+    out, stats = convert_state_dict(src)
+    assert stats["alpha_rescaled"] == 2
+    assert out["lora_unet_layers_0_attention_qkv.alpha"].item() == pytest.approx(4.0 * math.sqrt(4))
+    assert out["lora_unet_layers_0_feed_forward_w1.alpha"].item() == pytest.approx(8.0 * math.sqrt(16))
+
+
 @pytest.mark.skipif(not os.path.exists(V7_CHECKPOINT), reason="local v7 DLAY checkpoint not present")
 def test_real_v7_checkpoint_converts():
     state_dict = {}

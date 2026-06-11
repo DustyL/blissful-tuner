@@ -59,13 +59,32 @@ def convert_state_dict(
     sd = dict(state_dict)
     stats = {"flags_stripped": 0, "alpha_rescaled": 0, "dora_converted": 0}
 
+    # LoHa/LoKr have entirely different ComfyUI key conventions and no alpha-baking equivalence;
+    # refuse rather than silently emit a wrong-format file. (Ideogram 4 LoHa/LoKr is backlog P1-3.)
+    foreign = sorted({k.split(".", 1)[0] for k in sd if ".hada_" in k or ".lokr_" in k})
+    if foreign:
+        raise NotImplementedError(
+            f"LoHa/LoKr Ideogram 4 checkpoints are not supported by this converter (found e.g. '{foreign[0]}'). "
+            "Only plain-LoRA checkpoints convert; LoHa/LoKr support arrives with backlog P1-3."
+        )
+
     if reverse:
+        # Operator-error guard: blissful-format markers in a --reverse input mean the file is
+        # already blissful format; converting would emit a quietly malformed checkpoint.
+        blissful_markers = [k for k in sd if k in FLAG_KEYS or k.endswith(BLISSFUL_DORA_SUFFIX)]
+        if blissful_markers:
+            logger.warning(
+                f"--reverse input already contains blissful-format keys (e.g. '{blissful_markers[0]}') — "
+                "this looks like a blissful checkpoint, not a ComfyUI one. Output may be malformed."
+            )
         had_dora = False
         for key in list(sd.keys()):
             if key.endswith(COMFY_DORA_SUFFIX):
                 had_dora = True
                 name = key[: -len(COMFY_DORA_SUFFIX)]
-                sd[f"{name}{BLISSFUL_DORA_SUFFIX}"] = sd.pop(key).reshape(-1)
+                # clone(): reshape returns a storage-sharing view of the caller's tensor; decouple so
+                # no future in-place op on the output can corrupt the input dict.
+                sd[f"{name}{BLISSFUL_DORA_SUFFIX}"] = sd.pop(key).reshape(-1).clone()
                 stats["dora_converted"] += 1
         sd["use_dora_flag"] = torch.tensor(had_dora, dtype=torch.bool)
         sd["use_rslora_flag"] = torch.tensor(False, dtype=torch.bool)
@@ -103,7 +122,8 @@ def convert_state_dict(
             name = key[: -len(BLISSFUL_DORA_SUFFIX)]
             # (out,) -> (out, 1): ComfyUI's weight_decompose divides by an (out, 1) weight_norm; a 1-D
             # magnitude broadcasts that to (out, out) — crash on qkv, silently wrong on square layers.
-            sd[f"{name}{COMFY_DORA_SUFFIX}"] = sd.pop(key).reshape(-1, 1)
+            # clone() decouples the view from the caller's tensor storage.
+            sd[f"{name}{COMFY_DORA_SUFFIX}"] = sd.pop(key).reshape(-1, 1).clone()
             stats["dora_converted"] += 1
 
     if use_dora and stats["dora_converted"] == 0:
