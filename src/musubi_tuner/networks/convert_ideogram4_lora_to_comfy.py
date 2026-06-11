@@ -69,13 +69,18 @@ def convert_state_dict(
         )
 
     if reverse:
-        # Operator-error guard: blissful-format markers in a --reverse input mean the file is
-        # already blissful format; converting would emit a quietly malformed checkpoint.
+        # Operator-error guard: blissful-format markers in a --reverse input mean the file is already
+        # blissful format. Proceeding would OVERWRITE its true use_dora_flag with False while leaving
+        # .dora_layer.weight keys in place — blissful's loader keys off the flag (lora.py), so the
+        # output would load as a plain LoRA with dead DoRA magnitudes. Refuse loudly (same class as
+        # the LoHa/LoKr guard above); legitimate round-trips never hit this because forward output
+        # contains no blissful markers.
         blissful_markers = [k for k in sd if k in FLAG_KEYS or k.endswith(BLISSFUL_DORA_SUFFIX)]
         if blissful_markers:
-            logger.warning(
+            raise ValueError(
                 f"--reverse input already contains blissful-format keys (e.g. '{blissful_markers[0]}') — "
-                "this looks like a blissful checkpoint, not a ComfyUI one. Output may be malformed."
+                "this is a blissful checkpoint, not a ComfyUI one. Converting it would silently disable "
+                "its DoRA magnitudes. Drop --reverse (or pass the correct file)."
             )
         had_dora = False
         for key in list(sd.keys()):

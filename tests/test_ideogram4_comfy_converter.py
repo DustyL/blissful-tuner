@@ -152,13 +152,13 @@ def test_loha_lokr_checkpoints_rejected():
             convert_state_dict(src)
 
 
-def test_reverse_warns_on_blissful_format_input(caplog):
-    import logging
-
+def test_reverse_rejects_blissful_format_input():
+    # Proceeding would overwrite the true use_dora_flag with False while keeping dora_layer.weight
+    # keys — the output would load as a plain LoRA with dead DoRA magnitudes. Hard error, no escape
+    # hatch: forward output never contains blissful markers, so legitimate round-trips never hit this.
     src = _make_checkpoint(use_dora=True)  # blissful format, fed to --reverse by mistake
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(ValueError, match="blissful-format keys"):
         convert_state_dict(src, reverse=True)
-    assert any("blissful-format keys" in r.message for r in caplog.records)
 
 
 def test_output_tensors_do_not_share_storage_with_input():
