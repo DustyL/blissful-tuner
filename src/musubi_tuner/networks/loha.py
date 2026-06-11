@@ -127,6 +127,13 @@ class LoHaModule(torch.nn.Module):
             x_for_delta = F.dropout(x_for_delta, p=self.dropout)
 
         diff_weight, scale = self._compute_diff_weight(apply_rank_dropout=True)
+        # Explicit dtype harmonization for the delta matmul (mirrors LoRAModule.forward, e85284b).
+        # Under autocast (the common case) this cast is a no-op. Without autocast (Ideogram 4
+        # disables it at do_inference / process_batch for training-inference parity), the base
+        # model's input dtype (bf16) and the adapter weight dtype (fp32 by default) don't match,
+        # and F.linear raises "expected mat1 and mat2 to have the same dtype".
+        if x_for_delta.dtype != diff_weight.dtype:
+            x_for_delta = x_for_delta.to(diff_weight.dtype)
         if self.is_conv2d:
             delta = F.conv2d(
                 x_for_delta,
@@ -140,7 +147,9 @@ class LoHaModule(torch.nn.Module):
         else:
             delta = F.linear(x_for_delta, diff_weight)
 
-        return org_forwarded + delta * self.multiplier * scale
+        # Scale in the delta's (higher-precision) dtype, then cast back to the base output dtype so
+        # the addition doesn't promote the module's output (fp32 delta + bf16 base -> fp32 otherwise).
+        return org_forwarded + (delta * self.multiplier * scale).to(org_forwarded.dtype)
 
     def forward(self, x):
         # Mirror LoRAModule.forward's enabled guard: set_enabled(False) on the parent network must

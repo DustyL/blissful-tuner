@@ -24,6 +24,13 @@ What DOES need conversion:
    ``(out,)`` magnitude broadcasts that division to ``(out, out)`` — a RuntimeError on rectangular
    layers (qkv: 3h x h) and silently wrong math on square ones (attention.o: h x h).
 
+LoHa and LoKr checkpoints (backlog P1-3) are also supported: their adapter keys (``hada_*`` /
+``lokr_*``) pass through unchanged — ComfyUI's weight_adapter/{loha,lokr}.py consume them under the
+same generic name resolution. The LoKr network-level ``lokr_factor`` buffer is stripped on forward
+(blissful's loader recovers the factor from the preserved ``ss_lokr_factor`` metadata), and the
+rsLoRA/DoRA semantics above apply only to the LoRA family (LoKr/LoHa modules ignore those kwargs
+at train time).
+
 Usage:
     python src/musubi_tuner/networks/convert_ideogram4_lora_to_comfy.py src.safetensors dst.safetensors
     python src/musubi_tuner/networks/convert_ideogram4_lora_to_comfy.py comfy.safetensors dst.safetensors --reverse
@@ -43,6 +50,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FLAG_KEYS = ("use_dora_flag", "use_rslora_flag")
+# Network-level bookkeeping tensors blissful saves that ComfyUI cannot match ("lora key not loaded"
+# noise). lokr_factor is LoKr's factorization persistence — safe to strip because blissful's own
+# loader falls back to the ss_lokr_factor metadata when the buffer is absent (lokr._resolve_factor),
+# and main() preserves metadata.
+BOOKKEEPING_KEYS = FLAG_KEYS + ("lokr_factor",)
 BLISSFUL_DORA_SUFFIX = ".dora_layer.weight"
 COMFY_DORA_SUFFIX = ".dora_scale"
 
@@ -59,23 +71,20 @@ def convert_state_dict(
     sd = dict(state_dict)
     stats = {"flags_stripped": 0, "alpha_rescaled": 0, "dora_converted": 0}
 
-    # LoHa/LoKr have entirely different ComfyUI key conventions and no alpha-baking equivalence;
-    # refuse rather than silently emit a wrong-format file. (Ideogram 4 LoHa/LoKr is backlog P1-3.)
-    foreign = sorted({k.split(".", 1)[0] for k in sd if ".hada_" in k or ".lokr_" in k})
-    if foreign:
-        raise NotImplementedError(
-            f"LoHa/LoKr Ideogram 4 checkpoints are not supported by this converter (found e.g. '{foreign[0]}'). "
-            "Only plain-LoRA checkpoints convert; LoHa/LoKr support arrives with backlog P1-3."
-        )
+    # Checkpoint family. LoHa/LoKr adapter keys pass through unchanged — ComfyUI's
+    # weight_adapter/{loha,lokr}.py consume hada_*/lokr_* keys under the same generic
+    # lora_unet_{path} name resolution that makes plain LoRA a passthrough. Only the LoRA family
+    # carries the rsLoRA/DoRA semantics handled below: LoKrModule absorbs-and-ignores
+    # use_rslora/use_dora at train time (lokr.py kwargs), LoHa never receives them.
+    has_lora = any(k.endswith(".lora_down.weight") for k in sd)
 
     if reverse:
         # Operator-error guard: blissful-format markers in a --reverse input mean the file is already
         # blissful format. Proceeding would OVERWRITE its true use_dora_flag with False while leaving
         # .dora_layer.weight keys in place — blissful's loader keys off the flag (lora.py), so the
-        # output would load as a plain LoRA with dead DoRA magnitudes. Refuse loudly (same class as
-        # the LoHa/LoKr guard above); legitimate round-trips never hit this because forward output
-        # contains no blissful markers.
-        blissful_markers = [k for k in sd if k in FLAG_KEYS or k.endswith(BLISSFUL_DORA_SUFFIX)]
+        # output would load as a plain LoRA with dead DoRA magnitudes. Refuse loudly; legitimate
+        # round-trips never hit this because forward output contains no blissful markers.
+        blissful_markers = [k for k in sd if k in BOOKKEEPING_KEYS or k.endswith(BLISSFUL_DORA_SUFFIX)]
         if blissful_markers:
             raise ValueError(
                 f"--reverse input already contains blissful-format keys (e.g. '{blissful_markers[0]}') — "
@@ -91,16 +100,27 @@ def convert_state_dict(
                 # no future in-place op on the output can corrupt the input dict.
                 sd[f"{name}{BLISSFUL_DORA_SUFFIX}"] = sd.pop(key).reshape(-1).clone()
                 stats["dora_converted"] += 1
-        sd["use_dora_flag"] = torch.tensor(had_dora, dtype=torch.bool)
-        sd["use_rslora_flag"] = torch.tensor(False, dtype=torch.bool)
+        if has_lora:
+            # Flags are LoRAModule semantics. LoHa networks never carry them; LoKr's loader tolerates
+            # their absence (and recovers lokr_factor from ss_lokr_factor metadata, which main()
+            # preserves) — so non-LoRA reverse is a pure rename-free passthrough.
+            sd["use_dora_flag"] = torch.tensor(had_dora, dtype=torch.bool)
+            sd["use_rslora_flag"] = torch.tensor(False, dtype=torch.bool)
         return sd, stats
 
     use_rslora = bool(sd["use_rslora_flag"].item()) if "use_rslora_flag" in sd else False
     use_dora = bool(sd["use_dora_flag"].item()) if "use_dora_flag" in sd else False
 
-    for flag in FLAG_KEYS:
-        if sd.pop(flag, None) is not None:
+    for key in BOOKKEEPING_KEYS:
+        if sd.pop(key, None) is not None:
             stats["flags_stripped"] += 1
+
+    if use_rslora and not has_lora:
+        # A LoKr checkpoint can carry use_rslora_flag=True if the user passed the kwarg, but
+        # LoKrModule absorbed and IGNORED it at train time — the saved alphas are plain alpha/dim
+        # semantics. Rescaling them would corrupt the checkpoint; match training behavior instead.
+        logger.info("use_rslora_flag present on a non-LoRA checkpoint — ignored (modules ignored it at train time too)")
+        use_rslora = False
 
     if use_rslora:
         # blissful applies alpha/sqrt(r); ComfyUI will apply alpha/r. alpha *= sqrt(r) makes them equal.
@@ -131,9 +151,9 @@ def convert_state_dict(
             sd[f"{name}{COMFY_DORA_SUFFIX}"] = sd.pop(key).reshape(-1, 1).clone()
             stats["dora_converted"] += 1
 
-    if use_dora and stats["dora_converted"] == 0:
+    if use_dora and has_lora and stats["dora_converted"] == 0:
         raise ValueError("use_dora_flag is set but no '.dora_layer.weight' magnitudes were found — corrupt checkpoint?")
-    if use_dora:
+    if use_dora and stats["dora_converted"] > 0:
         logger.warning(
             "DoRA checkpoint: ComfyUI's weight_decompose normalizes by the BASE weight norm on the output axis "
             "(not the merged W+delta norm the trainer uses), so ComfyUI output is a close approximation, not "

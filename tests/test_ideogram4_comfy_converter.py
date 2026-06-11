@@ -78,10 +78,11 @@ def test_rslora_alpha_rescaled_for_alpha_over_rank_semantics():
 
 
 def test_rslora_alpha_without_down_weight_raises():
-    src = {
-        "lora_unet_layers_0_attention_o.alpha": torch.tensor(4.0),
-        "use_rslora_flag": torch.tensor(True),
-    }
+    # Partially corrupt LoRA checkpoint: one module intact (establishes the LoRA family), another
+    # has an alpha with no matching lora_down — the rescale cannot read its rank and must refuse.
+    src = _make_module("lora_unet_layers_0_attention_qkv", out_dim=18, in_dim=6)
+    src["lora_unet_layers_0_attention_o.alpha"] = torch.tensor(4.0)
+    src["use_rslora_flag"] = torch.tensor(True)
     with pytest.raises(ValueError, match="lora_down.weight"):
         convert_state_dict(src)
 
@@ -142,14 +143,75 @@ def test_main_io_roundtrip(tmp_path):
     assert "sshs_model_hash" in metadata  # hashes recomputed for the converted tensors
 
 
-def test_loha_lokr_checkpoints_rejected():
-    for marker_key in (
-        "lora_unet_layers_0_attention_qkv.hada_w1_a",
-        "lora_unet_layers_0_attention_qkv.lokr_w1",
-    ):
-        src = {marker_key: torch.randn(4, 4)}
-        with pytest.raises(NotImplementedError, match="P1-3"):
-            convert_state_dict(src)
+def _make_loha_checkpoint():
+    # Mirrors a real blissful LoHa state dict (no network-level bookkeeping keys at all).
+    sd = {}
+    for name in ("lora_unet_layers_0_attention_qkv", "lora_unet_layers_0_feed_forward_w1"):
+        sd[f"{name}.hada_w1_a"] = torch.randn(18, 4)
+        sd[f"{name}.hada_w1_b"] = torch.randn(4, 6)
+        sd[f"{name}.hada_w2_a"] = torch.randn(18, 4)
+        sd[f"{name}.hada_w2_b"] = torch.randn(4, 6)
+        sd[f"{name}.alpha"] = torch.tensor(4.0)
+    return sd
+
+
+def _make_lokr_checkpoint(use_rslora=False):
+    # Mirrors a real blissful LoKr state dict: adapter keys + the three network-level bookkeeping
+    # buffers (LoKr rides on LoRANetwork, so it carries the flags even though LoKrModule ignores them).
+    sd = {}
+    for name in ("lora_unet_layers_0_attention_qkv", "lora_unet_layers_0_attention_o"):
+        sd[f"{name}.lokr_w1"] = torch.randn(3, 2)
+        sd[f"{name}.lokr_w2_a"] = torch.randn(6, 4)
+        sd[f"{name}.lokr_w2_b"] = torch.randn(4, 3)
+        sd[f"{name}.alpha"] = torch.tensor(4.0)
+    sd["use_dora_flag"] = torch.tensor(False)
+    sd["use_rslora_flag"] = torch.tensor(use_rslora)
+    sd["lokr_factor"] = torch.tensor(-1, dtype=torch.int64)
+    return sd
+
+
+def test_loha_checkpoint_passes_through_unchanged():
+    src = _make_loha_checkpoint()
+    out, stats = convert_state_dict(src)
+    assert stats == {"flags_stripped": 0, "alpha_rescaled": 0, "dora_converted": 0}
+    assert set(out) == set(src)
+    for key, tensor in src.items():
+        assert torch.equal(out[key], tensor), key
+
+
+def test_lokr_checkpoint_strips_bookkeeping_keeps_adapter_keys():
+    src = _make_lokr_checkpoint()
+    out, stats = convert_state_dict(src)
+    assert stats["flags_stripped"] == 3  # use_dora_flag + use_rslora_flag + lokr_factor
+    assert "lokr_factor" not in out and "use_dora_flag" not in out and "use_rslora_flag" not in out
+    adapter_keys = {k for k in src if "." in k}
+    assert {k for k in out} == adapter_keys
+    for key in adapter_keys:
+        assert torch.equal(out[key], src[key]), key
+
+
+def test_lokr_rslora_flag_does_not_rescale_alphas():
+    # LoKrModule absorbed-and-ignored use_rslora at train time, so the saved alphas are plain
+    # alpha/dim semantics — rescaling them (or raising for a missing lora_down) would be wrong.
+    src = _make_lokr_checkpoint(use_rslora=True)
+    out, stats = convert_state_dict(src)
+    assert stats["alpha_rescaled"] == 0
+    assert out["lora_unet_layers_0_attention_qkv.alpha"].item() == pytest.approx(4.0)
+
+
+def test_lokr_reverse_does_not_add_lora_flags():
+    # Reverse of a ComfyUI-format LoKr file: no flags re-added (LoKr loader tolerates their absence
+    # and recovers lokr_factor from ss_lokr_factor metadata, which main() preserves).
+    forward, _ = convert_state_dict(_make_lokr_checkpoint())
+    back, stats = convert_state_dict(forward, reverse=True)
+    assert set(back) == set(forward)
+    assert "use_dora_flag" not in back and "lokr_factor" not in back
+
+
+def test_reverse_rejects_blissful_lokr_input():
+    # lokr_factor is a blissful-format marker too: a blissful LoKr file fed to --reverse must refuse.
+    with pytest.raises(ValueError, match="blissful-format keys"):
+        convert_state_dict(_make_lokr_checkpoint(), reverse=True)
 
 
 def test_reverse_rejects_blissful_format_input():
