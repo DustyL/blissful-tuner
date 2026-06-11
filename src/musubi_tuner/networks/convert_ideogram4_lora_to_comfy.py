@@ -26,10 +26,11 @@ What DOES need conversion:
 
 LoHa and LoKr checkpoints (backlog P1-3) are also supported: their adapter keys (``hada_*`` /
 ``lokr_*``) pass through unchanged — ComfyUI's weight_adapter/{loha,lokr}.py consume them under the
-same generic name resolution. The LoKr network-level ``lokr_factor`` buffer is stripped on forward
-(blissful's loader recovers the factor from the preserved ``ss_lokr_factor`` metadata), and the
-rsLoRA/DoRA semantics above apply only to the LoRA family (LoKr/LoHa modules ignore those kwargs
-at train time).
+same generic name resolution. The LoKr network-level ``lokr_factor`` buffer is stripped on forward;
+``main()`` writes its value into ``ss_lokr_factor`` metadata FIRST (nothing else in production
+writes that key — the trainer save path doesn't emit it) and restores the native buffer from that
+metadata on reverse. The rsLoRA/DoRA semantics above apply only to the LoRA family (LoKr/LoHa
+modules ignore those kwargs at train time).
 
 Usage:
     python src/musubi_tuner/networks/convert_ideogram4_lora_to_comfy.py src.safetensors dst.safetensors
@@ -51,9 +52,11 @@ logger = logging.getLogger(__name__)
 
 FLAG_KEYS = ("use_dora_flag", "use_rslora_flag")
 # Network-level bookkeeping tensors blissful saves that ComfyUI cannot match ("lora key not loaded"
-# noise). lokr_factor is LoKr's factorization persistence — safe to strip because blissful's own
-# loader falls back to the ss_lokr_factor metadata when the buffer is absent (lokr._resolve_factor),
-# and main() preserves metadata.
+# noise). lokr_factor is LoKr's factorization persistence — stripping it is safe ONLY because main()
+# first writes its value into ss_lokr_factor metadata (which lokr._resolve_factor reads as the
+# fallback when the buffer is absent) and restores the buffer from that metadata on reverse. Nothing
+# else in production writes ss_lokr_factor, so callers using convert_state_dict() directly must
+# handle factor preservation themselves.
 BOOKKEEPING_KEYS = FLAG_KEYS + ("lokr_factor",)
 BLISSFUL_DORA_SUFFIX = ".dora_layer.weight"
 COMFY_DORA_SUFFIX = ".dora_scale"
@@ -102,8 +105,8 @@ def convert_state_dict(
                 stats["dora_converted"] += 1
         if has_lora:
             # Flags are LoRAModule semantics. LoHa networks never carry them; LoKr's loader tolerates
-            # their absence (and recovers lokr_factor from ss_lokr_factor metadata, which main()
-            # preserves) — so non-LoRA reverse is a pure rename-free passthrough.
+            # their absence — so non-LoRA reverse is a rename-free passthrough here (main() separately
+            # restores LoKr's lokr_factor buffer from the ss_lokr_factor metadata it wrote on forward).
             sd["use_dora_flag"] = torch.tensor(had_dora, dtype=torch.bool)
             sd["use_rslora_flag"] = torch.tensor(False, dtype=torch.bool)
         return sd, stats
@@ -171,8 +174,25 @@ def main(args):
         for key in f.keys():
             state_dict[key] = f.get_tensor(key)
 
+    # LoKr factor preservation. NOTHING in production writes ss_lokr_factor (the trainer save path
+    # never emits it — the _resolve_factor metadata fallback is only fed by callers that pass it),
+    # so stripping the lokr_factor buffer WITHOUT writing it here would silently lose any explicit
+    # factor (factor=-1 only survives by being the default). The buffer is the authoritative source
+    # per _resolve_factor precedence (buffer > metadata), so overwrite — never setdefault.
+    if not args.reverse and "lokr_factor" in state_dict:
+        metadata = {} if metadata is None else metadata
+        metadata["ss_lokr_factor"] = str(int(state_dict["lokr_factor"].item()))
+        logger.info(f"LoKr factor {metadata['ss_lokr_factor']} preserved into ss_lokr_factor metadata before buffer strip")
+
     logger.info("Converting...")
     state_dict, stats = convert_state_dict(state_dict, reverse=args.reverse)
+
+    # Reverse of a ComfyUI-format LoKr file: restore the native lokr_factor buffer from the metadata
+    # written on forward, so metadata-blind load paths (and --dim_from_weights reconstruction) see a
+    # fully native blissful checkpoint.
+    if args.reverse and metadata and "ss_lokr_factor" in metadata and any(".lokr_" in k for k in state_dict):
+        state_dict["lokr_factor"] = torch.tensor(int(metadata["ss_lokr_factor"]), dtype=torch.int64)
+        logger.info(f"LoKr factor {metadata['ss_lokr_factor']} restored from ss_lokr_factor metadata into the lokr_factor buffer")
 
     logger.info(f"Flag buffers stripped: {stats['flags_stripped']}")
     logger.info(f"rsLoRA alphas rescaled: {stats['alpha_rescaled']}")

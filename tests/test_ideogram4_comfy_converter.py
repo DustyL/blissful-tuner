@@ -200,12 +200,48 @@ def test_lokr_rslora_flag_does_not_rescale_alphas():
 
 
 def test_lokr_reverse_does_not_add_lora_flags():
-    # Reverse of a ComfyUI-format LoKr file: no flags re-added (LoKr loader tolerates their absence
-    # and recovers lokr_factor from ss_lokr_factor metadata, which main() preserves).
+    # Reverse of a ComfyUI-format LoKr file: no flags re-added (LoKr loader tolerates their absence;
+    # the lokr_factor buffer is restored by main() from ss_lokr_factor metadata, not by this function).
     forward, _ = convert_state_dict(_make_lokr_checkpoint())
     back, stats = convert_state_dict(forward, reverse=True)
     assert set(back) == set(forward)
     assert "use_dora_flag" not in back and "lokr_factor" not in back
+
+
+def test_main_lokr_factor_survives_full_roundtrip(tmp_path):
+    # Nothing in production writes ss_lokr_factor (the trainer save path doesn't emit it), so an
+    # explicit factor would be silently LOST by the buffer strip unless main() writes the metadata
+    # itself. factor=-1 survives by coincidence (it's also the loader default) — use factor=8 so
+    # this test actually discriminates.
+    src_path, comfy_path, back_path = (tmp_path / n for n in ("src.safetensors", "comfy.safetensors", "back.safetensors"))
+    sd = _make_lokr_checkpoint()
+    sd["lokr_factor"] = torch.tensor(8, dtype=torch.int64)
+    save_file(sd, str(src_path), metadata={"ss_network_module": "networks.lora_ideogram4"})
+
+    main(SimpleNamespace(src_path=str(src_path), dst_path=str(comfy_path), reverse=False))
+    with safe_open(str(comfy_path), framework="pt") as f:
+        assert "lokr_factor" not in set(f.keys())  # buffer stripped for ComfyUI
+        assert f.metadata()["ss_lokr_factor"] == "8"  # ...but the factor is preserved in metadata
+
+    main(SimpleNamespace(src_path=str(comfy_path), dst_path=str(back_path), reverse=True))
+    with safe_open(str(back_path), framework="pt") as f:
+        keys = set(f.keys())
+        assert "lokr_factor" in keys  # native buffer restored for metadata-blind load paths
+        restored = f.get_tensor("lokr_factor")
+    assert restored.item() == 8
+
+
+def test_main_lokr_factor_metadata_overwrites_stale_value(tmp_path):
+    # The buffer is the authoritative source (loader precedence: buffer > metadata): a stale
+    # ss_lokr_factor already in the source metadata must be OVERWRITTEN, not setdefault'ed.
+    src_path, dst_path = tmp_path / "src.safetensors", tmp_path / "dst.safetensors"
+    sd = _make_lokr_checkpoint()
+    sd["lokr_factor"] = torch.tensor(8, dtype=torch.int64)
+    save_file(sd, str(src_path), metadata={"ss_lokr_factor": "4"})  # stale, disagrees with buffer
+
+    main(SimpleNamespace(src_path=str(src_path), dst_path=str(dst_path), reverse=False))
+    with safe_open(str(dst_path), framework="pt") as f:
+        assert f.metadata()["ss_lokr_factor"] == "8"
 
 
 def test_reverse_rejects_blissful_lokr_input():
