@@ -134,13 +134,14 @@ def test_step_logs_emit_dora_group_lr_keys():
         assert f"lr/d*eff_lr/{desc}" in logs
     # Without shared_d (split_groups_mean off), the applied-step tags must NOT appear.
     assert "lr/shared_d" not in logs
-    assert not any(k.startswith("lr/applied_alpha/") for k in logs)
+    assert not any(k.startswith("lr/applied_d*") for k in logs)
 
 
 def test_step_logs_emit_applied_step_tags_under_split_groups_mean():
     # Klein v9 lesson (2026-06-11): the raw lr/d*lr tags are NOT the applied step under
-    # split_groups_mean — the ScheduleFree update is ~ d_raw x shared_d x lr (clip-bounded). Pin the
-    # new tags that make the applied scale visible, using the literal v9 telemetry values.
+    # split_groups_mean — the update is ~ d_raw x shared_d x lr, and the evaluated y-iterate
+    # additionally scales by ScheduleFree's xy_step (effective_lr = lr * xy_step). The new tags
+    # mirror the raw d*lr / d*eff_lr pair; literal v9 telemetry values as fixtures.
     from types import SimpleNamespace
 
     from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
@@ -150,7 +151,7 @@ def test_step_logs_emit_applied_step_tags_under_split_groups_mean():
     descs = ["unet", "unet plus", "unet dora"]
     shared = 6.43e-5
     groups = [
-        {"d": d, "d0": 1e-6, "lr": lr, "effective_lr": 0.5, "k": 500, "prodigy_steps": 500, "shared_d": shared}
+        {"d": d, "d0": 1e-6, "lr": lr, "effective_lr": lr * 0.5, "k": 500, "prodigy_steps": 500, "shared_d": shared}
         for d, lr in ((1.769, 1.0), (2.197e-5, 12.0), (8.798e-4, 1.0))
     ]
     optimizer = SimpleNamespace(param_groups=groups)
@@ -159,10 +160,14 @@ def test_step_logs_emit_applied_step_tags_under_split_groups_mean():
     logs = trainer.generate_step_logs(args, 0.1, 0.1, scheduler, descs, optimizer)
 
     assert logs["lr/shared_d"] == pytest.approx(shared)
-    assert logs["lr/applied_alpha/unet"] == pytest.approx(1.769 * shared)
-    assert logs["lr/applied_alpha/unet plus"] == pytest.approx(2.197e-5 * shared * 12.0)
-    assert logs["lr/applied_alpha/unet dora"] == pytest.approx(8.798e-4 * shared)
-    assert logs["lr/d_ratio/unet"] == pytest.approx(1.769 / shared)
+    # pre-ScheduleFree z-iterate scale: d_raw x shared_d x lr
+    assert logs["lr/applied_d*lr/unet"] == pytest.approx(1.769 * shared)
+    assert logs["lr/applied_d*lr/unet plus"] == pytest.approx(2.197e-5 * shared * 12.0)
+    assert logs["lr/applied_d*lr/unet dora"] == pytest.approx(8.798e-4 * shared)
+    # runtime y-iterate scale: d_raw x shared_d x effective_lr (xy_step = 0.5 in this fixture)
+    assert logs["lr/applied_d*eff_lr/unet"] == pytest.approx(1.769 * shared * 0.5)
+    assert logs["lr/applied_d*eff_lr/unet plus"] == pytest.approx(2.197e-5 * shared * 12.0 * 0.5)
+    assert logs["lr/d_raw_over_shared_d/unet"] == pytest.approx(1.769 / shared)
     # raw tags unchanged for cross-run continuity with historical dashboards
     assert logs["lr/d*lr/unet"] == pytest.approx(1.769)
 

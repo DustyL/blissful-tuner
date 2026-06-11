@@ -158,7 +158,9 @@ class NetworkTrainer:
             applied = ", ".join(f"{desc}: {d * float(shared_d) * lr:.3e}" for desc, d, _r, lr in ratios)
             logger.info(
                 f"Optimizer d at adaptation checkpoint (step {k}): {summary}; shared_d={float(shared_d):.3e} "
-                f"(harmonic mean, the dlr factor); per-group applied scale (d x shared_d x lr): {applied}"
+                f"(harmonic mean, the dlr factor); per-group applied scale, pre-ScheduleFree (d x shared_d x lr): "
+                f"{applied}. ScheduleFree's evaluated weights additionally scale by xy_step — see the "
+                "lr/applied_d*eff_lr tags for the runtime values."
             )
         else:
             logger.info(f"Optimizer d at adaptation checkpoint (step {k}): {summary}")
@@ -239,18 +241,22 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
                 # Under split_groups_mean, the raw d tags above are NOT the applied step: the
                 # ScheduleFree update scales the gradient by the raw per-group d (soft-clipped under
-                # use_stableadamw) and then steps by dlr = shared_d (harmonic mean) x lr. Log the
-                # missing factor and the per-group product so the dashboards show what is actually
-                # applied — three independent analyses misread the Klein v9 run from the raw tags
-                # alone (2026-06-11).
+                # use_stableadamw) and then steps by dlr = shared_d (harmonic mean) x lr — with the
+                # evaluated y-iterate additionally scaled by ScheduleFree's xy_step (effective_lr =
+                # lr * xy_step, prodigy_plus_schedulefree.py:260). Log both products, mirroring the
+                # raw d*lr / d*eff_lr tag pair: `applied_d*eff_lr` is what the evaluated weights
+                # actually move by; `applied_d*lr` is the pre-ScheduleFree z-iterate scale. Three
+                # independent analyses misread the Klein v9 run from the raw tags alone (2026-06-11).
                 shared_d = optimizer.param_groups[i].get("shared_d", None)
                 if shared_d is not None:
                     shared_d = float(shared_d)
                     d_raw = float(optimizer.param_groups[i]["d"])
                     logs["lr/shared_d"] = shared_d  # identical across groups; repeated assignment is harmless
-                    logs[f"lr/applied_alpha/{lr_desc}"] = d_raw * shared_d * float(optimizer.param_groups[i]["lr"])
+                    logs[f"lr/applied_d*lr/{lr_desc}"] = d_raw * shared_d * float(optimizer.param_groups[i]["lr"])
+                    if "effective_lr" in optimizer.param_groups[i]:
+                        logs[f"lr/applied_d*eff_lr/{lr_desc}"] = d_raw * shared_d * float(optimizer.param_groups[i]["effective_lr"])
                     if shared_d > 0:
-                        logs[f"lr/d_ratio/{lr_desc}"] = d_raw / shared_d
+                        logs[f"lr/d_raw_over_shared_d/{lr_desc}"] = d_raw / shared_d
 
         return logs
 
