@@ -1,6 +1,14 @@
 import torch
 
-FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# All four fp8 variants the repo recognizes elsewhere (flux_utils.is_fp8, model_utils.str_to_dtype):
+# the fn/fnuz pairs differ only in their value lattice (e.g. e4m3fnuz max 240 vs e4m3fn 448), which
+# matters at QUANTIZATION time — dequant is a dtype-agnostic scale multiply, so all four are safe
+# here. getattr guards keep this importable on torch builds that lack the ROCm-targeted fnuz pair.
+FP8_DTYPES = tuple(
+    dt
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if (dt := getattr(torch, name, None)) is not None
+)
 
 
 def dequantize_fp8_weight(
@@ -26,10 +34,21 @@ def dequantize_fp8_weight(
         )
     w = weight.to(compute_dtype)
     scale = scale_weight.to(device=weight.device, dtype=compute_dtype)
-    if scale.ndim < 3:
+    out_features = weight.shape[0]
+    # Strict shape contract, anchored to the weight: a raw [out] vector would broadcast over the LAST
+    # axis — silently scaling columns instead of rows on square matrices (and erroring on others).
+    # The repo's producers normalize to these shapes (fp8_optimization_utils, the Ideogram 4 shim);
+    # anything else is a caller bug we refuse rather than mis-scale.
+    if scale.numel() == 1 or scale.shape == (out_features, 1):
         return w * scale
-    out_features, num_blocks, _ = scale.shape
-    return (w.contiguous().view(out_features, num_blocks, -1) * scale).view(weight.shape)
+    if scale.ndim == 3 and scale.shape[0] == out_features and scale.shape[2] == 1 and weight.shape[1] % scale.shape[1] == 0:
+        num_blocks = scale.shape[1]
+        return (w.contiguous().view(out_features, num_blocks, -1) * scale).view(weight.shape)
+    raise ValueError(
+        f"unsupported scale_weight shape {tuple(scale.shape)} for weight shape {tuple(weight.shape)}: expected [1], "
+        "[out, 1], or [out, num_blocks, 1] with in_features divisible by num_blocks. A raw [out] vector would "
+        "silently scale the wrong axis on square matrices — reshape it to [out, 1]."
+    )
 
 
 def dora_weight_norm_materialized(

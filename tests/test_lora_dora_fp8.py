@@ -84,6 +84,42 @@ def test_dequantize_passthrough_for_non_fp8():
     assert dequantize_fp8_weight(w, None) is w
 
 
+@pytest.mark.parametrize("name", ["float8_e4m3fnuz", "float8_e5m2fnuz"])
+def test_fnuz_dtypes_detected_as_fp8(name):
+    # The repo recognizes all four fp8 variants elsewhere (flux_utils.is_fp8); the DoRA path must too,
+    # or an fnuz-prequantized base would skip dequant AND slip past the destructive-merge guards.
+    from musubi_tuner.networks.dora_utils import FP8_DTYPES
+
+    dt = getattr(torch, name, None)
+    if dt is None:
+        pytest.skip(f"{name} not available in this torch build")
+    assert dt in FP8_DTYPES
+    w = torch.randn(4, 4).to(dt)
+    with pytest.raises(ValueError, match="scale_weight"):
+        dequantize_fp8_weight(w, None)
+    deq = dequantize_fp8_weight(w, torch.tensor([2.0]))
+    assert deq.dtype == torch.float32
+    assert torch.allclose(deq, w.float() * 2.0)
+
+
+def test_dequantize_rejects_raw_per_row_scale_on_square_matrix():
+    # A raw [out] vector broadcasts over the LAST axis: on a square weight it silently scales
+    # COLUMNS instead of rows. Must refuse, not mis-scale.
+    lin, _ = _make_fp8_linear(out_dim=8, in_dim=8, layout="per_row")
+    bad_scale = lin.scale_weight.reshape(-1)  # (8, 1) -> raw (8,)
+    with pytest.raises(ValueError, match="wrong axis"):
+        dequantize_fp8_weight(lin.weight, bad_scale)
+    # The properly shaped (out, 1) scale on the same weight works.
+    assert dequantize_fp8_weight(lin.weight, lin.scale_weight).shape == (8, 8)
+
+
+def test_dequantize_rejects_blockwise_scale_with_indivisible_blocks():
+    lin, _ = _make_fp8_linear(out_dim=12, in_dim=8, layout="per_tensor")
+    bad_scale = torch.rand(12, 3, 1)  # in_features=8 not divisible by num_blocks=3
+    with pytest.raises(ValueError, match="unsupported scale_weight shape"):
+        dequantize_fp8_weight(lin.weight, bad_scale)
+
+
 def test_dequantize_fp8_without_scale_raises():
     lin, _ = _make_fp8_linear()
     with pytest.raises(ValueError, match="scale_weight"):
