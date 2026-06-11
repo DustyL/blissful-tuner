@@ -71,17 +71,23 @@ def test_cache_text_encoder_outputs_casts_bf16_and_validates_dim():
         def dtype(self):
             return self._dtype
 
-        def __call__(self, prompts: list[str]):
+        def __call__(self, prompts: list[str], return_seq_lens: bool = False):
             # Return float32 to ensure the caching path normalizes dtype to bf16.
-            return torch.zeros((len(prompts), 8, 4), dtype=torch.float32)
+            bsz = len(prompts)
+            ctx_vec = torch.zeros((bsz, 8, 4), dtype=torch.float32)
+            if return_seq_lens:
+                # Per-sample real (non-padded) token count, [B] int32 on CPU.
+                ctx_seq_len = torch.full((bsz,), 8, dtype=torch.int32)
+                return ctx_vec, ctx_seq_len
+            return ctx_vec
 
     # Use a tiny dummy model_info so the test tensor stays small.
     cache_te._model_version_info = SimpleNamespace(params=SimpleNamespace(context_in_dim=4), architecture_full="flux_2_dev")
 
     saved = []
 
-    def fake_save(item_info, ctx_vec, arch_full):
-        saved.append((ctx_vec.dtype, tuple(ctx_vec.shape), arch_full))
+    def fake_save(item_info, ctx_vec, arch_full, ctx_seq_len=None):
+        saved.append((ctx_vec.dtype, tuple(ctx_vec.shape), arch_full, ctx_seq_len))
 
     batch = [SimpleNamespace(caption="a"), SimpleNamespace(caption="b")]
 
@@ -95,8 +101,12 @@ def test_cache_text_encoder_outputs_casts_bf16_and_validates_dim():
         )
 
     assert saved, "Expected save_text_encoder_output_cache_flux_2 to be called"
-    assert all(dtype == torch.bfloat16 for (dtype, _shape, _arch) in saved)
-    assert all(shape == (8, 4) for (_dtype, shape, _arch) in saved)
+    assert all(dtype == torch.bfloat16 for (dtype, _shape, _arch, _seq_len) in saved)
+    assert all(shape == (8, 4) for (_dtype, shape, _arch, _seq_len) in saved)
+    # ctx_seq_len must flow through as a scalar int32 tensor (per-sample real token count).
+    assert all(seq_len is not None for (*_, seq_len) in saved)
+    assert all(seq_len.dtype == torch.int32 for (*_, seq_len) in saved)
+    assert all(int(seq_len.item()) == 8 for (*_, seq_len) in saved)
 
 
 def test_training_raises_on_ctx_dim_mismatch_early():
