@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import torch
 from PIL import Image
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 import musubi_tuner.networks.lora_ideogram4 as lora_ideogram4
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_IDEOGRAM4
@@ -35,6 +35,26 @@ def _empty_cache(device: torch.device):
         torch.cuda.empty_cache()
 
 
+def _resolve_multipliers(lora_weights: list[str], lora_multipliers: list[float] | None) -> list[float]:
+    """Multiplier contract for scripted A/B work (review hardening on PR #23).
+
+    None -> 1.0 for every weight; a SINGLE value broadcasts to all weights ("try all five
+    checkpoints at 0.8"); otherwise lengths must match exactly. The previous silent positional
+    defaulting (3 weights + 2 multipliers -> third quietly ran at 1.0) was easy to misread in
+    exactly the same-seed checkpoint-A/B use case this feature exists for.
+    """
+    if lora_multipliers is None:
+        return [1.0] * len(lora_weights)
+    if len(lora_multipliers) == 1:
+        return [float(lora_multipliers[0])] * len(lora_weights)
+    if len(lora_multipliers) != len(lora_weights):
+        raise ValueError(
+            f"--lora_multiplier count ({len(lora_multipliers)}) must match --lora_weight count "
+            f"({len(lora_weights)}), or be a single value to broadcast, or be omitted (all 1.0)."
+        )
+    return [float(m) for m in lora_multipliers]
+
+
 def apply_lora_weights_runtime(
     transformer: torch.nn.Module,
     lora_weights: list[str],
@@ -55,11 +75,18 @@ def apply_lora_weights_runtime(
 
     Returns the applied networks — keep the references alive until denoising is done.
     """
+    multipliers = _resolve_multipliers(lora_weights, lora_multipliers)
     networks: list[torch.nn.Module] = []
-    for i, path in enumerate(lora_weights):
-        multiplier = lora_multipliers[i] if lora_multipliers is not None and i < len(lora_multipliers) else 1.0
+    for path, multiplier in zip(lora_weights, multipliers):
         logger.info(f"Applying adapter {path} at multiplier {multiplier} (runtime, conditional DiT only)")
-        weights_sd = load_file(path)
+        # Single pass for tensors AND metadata: LoKr's factor can live only in ss_lokr_factor
+        # metadata (buffer-stripped files, e.g. from the ComfyUI converter's forward path) — without
+        # it, factor resolution falls back to -1 and load_state_dict fails on factorization shapes.
+        weights_sd: dict[str, torch.Tensor] = {}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            for key in f.keys():
+                weights_sd[key] = f.get_tensor(key)
 
         net_type = detect_network_type(weights_sd)
         if net_type == "lora":
@@ -71,9 +98,15 @@ def apply_lora_weights_runtime(
                 multiplier, weights_sd, unet=transformer, for_inference=True, architecture=ARCHITECTURE_IDEOGRAM4
             )
         elif net_type == "lokr":
-            # lokr_factor is resolved from the checkpoint buffer (or ss_lokr_factor metadata fallback).
+            # lokr_factor resolved with the documented precedence: checkpoint buffer first, then the
+            # ss_lokr_factor metadata this loader now actually supplies (lokr._resolve_factor).
             network = lokr.create_arch_network_from_weights(
-                multiplier, weights_sd, unet=transformer, for_inference=True, architecture=ARCHITECTURE_IDEOGRAM4
+                multiplier,
+                weights_sd,
+                unet=transformer,
+                for_inference=True,
+                architecture=ARCHITECTURE_IDEOGRAM4,
+                metadata_factor=metadata.get("ss_lokr_factor"),
             )
         else:
             raise ValueError(
@@ -127,7 +160,8 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         nargs="*",
         default=None,
-        help="multiplier(s) for --lora_weight, positionally matched (default 1.0 each)",
+        help="multiplier(s) for --lora_weight: omit for all-1.0, give ONE value to broadcast to every "
+        "weight, or match counts exactly (mismatched counts error out)",
     )
     return parser
 

@@ -162,6 +162,49 @@ def test_multiplier_zero_is_noop_for_all_families(tmp_path):
         assert torch.equal(pred, base_pred), f"{family}: multiplier 0 must be a bitwise no-op"
 
 
+def test_lokr_metadata_only_factor_reconstructs(tmp_path):
+    # Buffer-stripped LoKr file whose factor lives ONLY in ss_lokr_factor metadata (what the ComfyUI
+    # converter's forward path produces, and what convert_state_dict-direct callers can create).
+    # Without the loader passing metadata_factor through, factor resolution falls back to -1 and
+    # load_state_dict fails on factorization shapes (review finding on PR #23, reproduced).
+    donor, _ = _tiny_model()
+    net = lokr.create_arch_network(1.0, 4, 4.0, None, None, donor, architecture="i4", factor="8")
+    net.apply_to(None, donor, apply_text_encoder=False, apply_unet=True)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.normal_(0.0, 0.05)
+    sd = {k: v.detach().clone().contiguous() for k, v in net.state_dict().items()}
+    assert int(sd.pop("lokr_factor").item()) == 8  # strip the buffer; metadata is the only carrier
+    path = tmp_path / "lokr_meta_only.safetensors"
+    save_file(sd, str(path), metadata={"ss_lokr_factor": "8"})
+
+    base_model, cfg = _tiny_model()
+    base_pred = _forward(base_model, cfg)
+
+    model, _ = _tiny_model()
+    nets = apply_lora_weights_runtime(model, [str(path)], [1.0], DEVICE, DTYPE)
+    assert int(nets[0].lokr_factor.item()) == 8  # reconstructed from metadata, not the -1 default
+    pred = _forward(model, cfg)
+    assert torch.isfinite(pred).all()
+    assert not torch.allclose(pred, base_pred)
+
+
+def test_multiplier_contract(tmp_path):
+    paths = [_save_lora_checkpoint(tmp_path, name=f"l{i}.safetensors") for i in range(3)]
+
+    # Single value broadcasts: multiplier 0.0 across all three == base forward bitwise.
+    base_model, cfg = _tiny_model()
+    base_pred = _forward(base_model, cfg)
+    model, _ = _tiny_model()
+    apply_lora_weights_runtime(model, paths, [0.0], DEVICE, DTYPE)
+    assert torch.equal(_forward(model, cfg), base_pred)
+
+    # Mismatched counts (neither 1 nor exact) fail fast — no silent 1.0 defaulting.
+    model2, _ = _tiny_model()
+    with pytest.raises(ValueError, match="must match"):
+        apply_lora_weights_runtime(model2, paths, [1.0, 0.5], DEVICE, DTYPE)
+
+
 def test_unknown_checkpoint_rejected(tmp_path):
     path = tmp_path / "garbage.safetensors"
     save_file({"something.weird_key": torch.zeros(2, 2)}, str(path))
