@@ -20,6 +20,12 @@ def dequantize_fp8_weight(
     shape ``[1]`` (per-tensor) or ``[out, 1]`` (per-row) broadcasts directly; ``[out, num_blocks, 1]``
     (block-wise) reshapes the weight into blocks along the input dim first.
 
+    Per-tensor scales are matched by element count (``scale.numel() == 1``), not literal shape —
+    deliberately, not as an oversight: a 0-dim scalar and ``[1]`` broadcast identically and are
+    equally unambiguous (the reference forward path tolerates both). The strict-shape refusal
+    below exists only for shapes that could scale the WRONG AXIS, e.g. a raw ``[out]`` vector,
+    which broadcasts over columns instead of rows on square matrices.
+
     Raw fp8 values are NOT true weights — a plain ``.float()`` cast without the scale multiply
     yields quantization-lattice magnitudes (empirically ~200x off for the Ideogram 4 DiT), which
     for DoRA means silently wrong row norms and wrong magnitude scaling. Non-fp8 weights pass
