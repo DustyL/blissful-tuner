@@ -120,12 +120,18 @@ class NetworkTrainer:
         early, so that is ample signal). Duck-typed on param-group keys: a no-op for AdamW-family
         optimizers, and costs one boolean check per log step afterward.
 
-        Two by-design nuances (verified against the prodigyplus source, review 2026-06-11): under
-        ``split_groups=False`` every group carries the same shared d, so the cross-group spread check
-        is inherently a no-op there (a "spread" is meaningless in reference-Prodigy mode); and under
-        ``split_groups_mean=True`` the APPLIED step uses the harmonic-mean ``shared_d`` while this
-        check reads the raw per-group d — intentional, since a wide raw-d spread is the corruption
-        signal regardless of how the optimizer averages it away.
+        Step semantics this check reports on (verified against the prodigyplus SOURCE, 2026-06-11,
+        after the Klein v9 false-alarm cycle): in the ScheduleFree path the raw per-group ``d``
+        multiplies the gradient BEFORE the preconditioned update (``grad.mul_(group['d'])``, with the
+        second moment computed on the UNSCALED grad — so d does not cancel), the result is RMS
+        soft-clipped when ``use_stableadamw``, and the final step is scaled by ``dlr``, which under
+        ``split_groups_mean=True`` is the harmonic-mean ``shared_d`` (× lr) rather than the group's
+        own d. The per-group effective scale is therefore ``~ d_raw × shared_d × lr`` (clip-bounded
+        for large d_raw) — NEITHER the raw d alone NOR the harmonic mean alone. Three independent
+        analyses misread the Klein v9 telemetry by using one factor without the other; this check
+        reports both plus their product so nobody has to re-derive it from the source again. Under
+        ``split_groups=False`` every group carries the same d, so the spread check is inherently a
+        no-op there.
         """
         if self._optimizer_adaptation_checked or optimizer is None:
             return
@@ -140,16 +146,26 @@ class NetworkTrainer:
             return
         self._optimizer_adaptation_checked = True
 
+        shared_d = groups[0].get("shared_d", None)
         ratios = []
         for i, g in enumerate(groups):
             desc = lr_descriptions[i] if lr_descriptions is not None and i < len(lr_descriptions) else f"group{i}"
             d = float(g["d"])
             d0 = float(g["d0"]) or 1e-12
-            ratios.append((desc, d, d / d0))
-        summary = ", ".join(f"{desc}: d={d:.3e} ({r:.1f}x d0)" for desc, d, r in ratios)
-        logger.info(f"Optimizer d at adaptation checkpoint (step {k}): {summary}")
+            ratios.append((desc, d, d / d0, float(g.get("lr", 1.0))))
+        summary = ", ".join(f"{desc}: d={d:.3e} ({r:.1f}x d0)" for desc, d, r, _lr in ratios)
+        if shared_d is not None:
+            applied = ", ".join(f"{desc}: {d * float(shared_d) * lr:.3e}" for desc, d, _r, lr in ratios)
+            logger.info(
+                f"Optimizer d at adaptation checkpoint (step {k}): {summary}; shared_d={float(shared_d):.3e} "
+                f"(harmonic mean, the dlr factor); per-group applied scale, pre-ScheduleFree (d x shared_d x lr): "
+                f"{applied}. ScheduleFree's evaluated weights additionally scale by xy_step — see the "
+                "lr/applied_d*eff_lr tags for the runtime values."
+            )
+        else:
+            logger.info(f"Optimizer d at adaptation checkpoint (step {k}): {summary}")
 
-        for desc, d, r in ratios:
+        for desc, d, r, _lr in ratios:
             if r < 1.5:
                 logger.warning(
                     f"Optimizer group '{desc}' barely adapted: d/d0 = {r:.2f} after {k} steps — its step size is "
@@ -157,13 +173,22 @@ class NetworkTrainer:
                     "parameter populations corrupt the shared per-group d estimate — the DoRA-magnitudes case from "
                     "the DLAY v8 post-mortem). Training will proceed but may converge far slower than intended."
                 )
-        ds = [d for _, d, _ in ratios]
+        ds = [d for _, d, _, _ in ratios]
         if len(ds) > 1 and min(ds) > 0 and max(ds) / min(ds) > 1000:
-            logger.warning(
-                f"Optimizer per-group d values span {max(ds) / min(ds):.0f}x across groups ({summary}). A spread this "
-                "wide usually means one group's estimate is corrupted rather than genuinely needing a different step "
-                "size — verify group composition before trusting the run."
-            )
+            spread_msg = f"Optimizer per-group d values span {max(ds) / min(ds):.0f}x across groups ({summary})."
+            if shared_d is not None:
+                spread_msg += (
+                    " With split_groups_mean, the update uses BOTH the raw per-group d (gradient scaling, RMS "
+                    "soft-clipped when use_stableadamw) AND the harmonic shared_d as the dlr factor — judge the "
+                    "per-group applied scales reported above against prior healthy runs before concluding pathology; "
+                    "a wide raw spread mostly means the groups' applied scales differ, not that training is broken."
+                )
+            else:
+                spread_msg += (
+                    " A spread this wide usually means one group's estimate is corrupted rather than genuinely "
+                    "needing a different step size — verify group composition before trusting the run."
+                )
+            logger.warning(spread_msg)
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -214,6 +239,24 @@ class NetworkTrainer:
                 logs[f"lr/d*lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
                 if "effective_lr" in optimizer.param_groups[i]:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
+                # Under split_groups_mean, the raw d tags above are NOT the applied step: the
+                # ScheduleFree update scales the gradient by the raw per-group d (soft-clipped under
+                # use_stableadamw) and then steps by dlr = shared_d (harmonic mean) x lr — with the
+                # evaluated y-iterate additionally scaled by ScheduleFree's xy_step (effective_lr =
+                # lr * xy_step, prodigy_plus_schedulefree.py:260). Log both products, mirroring the
+                # raw d*lr / d*eff_lr tag pair: `applied_d*eff_lr` is what the evaluated weights
+                # actually move by; `applied_d*lr` is the pre-ScheduleFree z-iterate scale. Three
+                # independent analyses misread the Klein v9 run from the raw tags alone (2026-06-11).
+                shared_d = optimizer.param_groups[i].get("shared_d", None)
+                if shared_d is not None:
+                    shared_d = float(shared_d)
+                    d_raw = float(optimizer.param_groups[i]["d"])
+                    logs["lr/shared_d"] = shared_d  # identical across groups; repeated assignment is harmless
+                    logs[f"lr/applied_d*lr/{lr_desc}"] = d_raw * shared_d * float(optimizer.param_groups[i]["lr"])
+                    if "effective_lr" in optimizer.param_groups[i]:
+                        logs[f"lr/applied_d*eff_lr/{lr_desc}"] = d_raw * shared_d * float(optimizer.param_groups[i]["effective_lr"])
+                    if shared_d > 0:
+                        logs[f"lr/d_raw_over_shared_d/{lr_desc}"] = d_raw / shared_d
 
         return logs
 
