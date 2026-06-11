@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 
 from musubi_tuner.ideogram4.ideogram4_utils import grid_to_dit_tokens
+from musubi_tuner.ideogram4.scheduler import get_schedule_for_resolution
 from musubi_tuner.ideogram4.sequence import build_ideogram4_conditioning, build_image_input, extract_image_tokens
 
 
@@ -31,6 +32,36 @@ def ideogram4_cleanness_to_noise_timestep(t: torch.Tensor) -> torch.Tensor:
     Tested in tests/test_ideogram4_prior_preservation.py — t=[0.0, 0.3, 1.0] -> [1000, 700, 0].
     """
     return (1.0 - t.to(torch.float32)) * 1000.0
+
+
+def estimate_prior_gate_skip_rate(
+    height: int,
+    width: int,
+    *,
+    timestep_mu: float,
+    timestep_std: float,
+    threshold: float,
+    n: int = 10_000,
+    seed: int = 0,
+) -> float:
+    """Simulate the training timestep distribution; return the expected fraction of steps the
+    prior-teacher forward is SKIPPED by ``--prior_preservation_timestep_threshold`` (backlog P0-8b).
+
+    Uses the exact production path — ``get_schedule_for_resolution`` (resolution-shifted
+    logit-normal) followed by the cleanness->noise remap — so the estimate cannot drift from what
+    training actually samples. Round-number thresholds are misleading without this: the v8 run set
+    threshold=250 expecting ~25-40% teacher savings and measured **3.3%**, because at 1024x1024 the
+    resolution shift moves the schedule mean by 0.5*ln(4) and the skip mass is
+    P(traditional_t <= 250) = Phi((ln(1/3) - 0.693) / std) ~= 3.7% — confirmed by both the analytic
+    value and the run telemetry (DLAY v8 post-mortem, 2026-06-11).
+
+    Fixed seed: the estimate is a deterministic property of the configuration, not a sample.
+    """
+    schedule = get_schedule_for_resolution((height, width), known_mean=timestep_mu, std=timestep_std)
+    g = torch.Generator().manual_seed(seed)
+    t = schedule(torch.rand(n, generator=g))
+    traditional = ideogram4_cleanness_to_noise_timestep(t)
+    return float((traditional <= float(threshold)).float().mean().item())
 
 
 def ideogram4_flow_matching_target(

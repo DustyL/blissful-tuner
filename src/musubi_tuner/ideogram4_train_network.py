@@ -26,7 +26,11 @@ from musubi_tuner.ideogram4.text_encoder import (
     load_ideogram4_tokenizer,
 )
 from blissful_tuner.mask_loss_process_batch import prior_model_context
-from musubi_tuner.ideogram4.training import ideogram4_cleanness_to_noise_timestep, ideogram4_flow_matching_target
+from musubi_tuner.ideogram4.training import (
+    estimate_prior_gate_skip_rate,
+    ideogram4_cleanness_to_noise_timestep,
+    ideogram4_flow_matching_target,
+)
 from musubi_tuner.modules.loss_utils import compute_unreduced_target_loss
 from musubi_tuner.modules.mask_loss import apply_masked_loss_with_prior, require_mask_weights_if_enabled
 from musubi_tuner.modules.prior_scheduling import compute_prior_weight_per_sample
@@ -61,6 +65,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self._sample_unconditional_dit = None  # loaded only during sampling (on_before/after_sample_images)
+        self._prior_gate_rate_logged = False  # one-shot guard for the P0-8b skip-rate estimate
 
     def _validate_args_and_init(self, args) -> bool:
         # Neutralize the no-op fp8 flags BEFORE the base fp8 assert (which lives inside the base
@@ -210,6 +215,26 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # reducer also gates application of the prior term per-sample so a teacher forward triggered
         # for ANY sample in the batch is the natural granularity here.
         prior_timestep_threshold = getattr(args, "prior_preservation_timestep_threshold", None)
+
+        # P0-8b: one-shot expected-skip-rate estimate for the timestep gate. Round-number thresholds
+        # mislead without it (v8 set 250 expecting ~25-40% teacher savings; reality was 3.3% — the
+        # resolution-shifted schedule concentrates mass above traditional-t 250). Logged on the first
+        # gated batch so it uses the exact args + a real bucket resolution.
+        if need_prior_base and prior_timestep_threshold is not None and not self._prior_gate_rate_logged:
+            self._prior_gate_rate_logged = True
+            skip_rate = estimate_prior_gate_skip_rate(
+                height,
+                width,
+                timestep_mu=float(getattr(args, "ideogram4_timestep_mu", 0.0) or 0.0),
+                timestep_std=float(getattr(args, "ideogram4_timestep_std", 1.0) or 1.0),
+                threshold=float(prior_timestep_threshold),
+            )
+            logger.info(
+                f"prior timestep gate: threshold={float(prior_timestep_threshold):.0f} is expected to skip "
+                f"~{skip_rate * 100:.1f}% of prior-teacher forwards at {height}x{width} (10k-draw simulation of the "
+                "training timestep distribution; multi-bucket runs vary slightly by resolution). If you expected "
+                "bigger wall-clock savings, raise the threshold — but each skipped step also skips prior preservation."
+            )
         prior_sample_mask = None
         need_prior = need_prior_base
         if need_prior and (prior_timestep_threshold is not None or prior_weight_per_sample is not None):
