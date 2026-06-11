@@ -104,8 +104,66 @@ class NetworkTrainer:
         self.blocks_to_swap = None
         self.timestep_range_pool = []
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
+        self._optimizer_adaptation_checked = False  # one-shot guard for _check_optimizer_adaptation_once
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+
+    def _check_optimizer_adaptation_once(self, optimizer, lr_descriptions) -> None:
+        """One-shot adaptation health check for d-adapting optimizers (Prodigy family) — backlog P0-8.
+
+        The DLAY v8 post-mortems (2026-06-11) showed per-group d pathologies that were visible in
+        telemetry within ~50 steps but went unnoticed for entire runs: a group's shared d pinned at
+        d0 (Ideogram 4 fp8: 3.9x under the no-DoRA baseline -> identity converged ~4x slower) or
+        inflated absurdly relative to sibling groups (FLUX.2 Klein bf16: 1660x, masked only by
+        use_stableadamw's update clamp). Both signatures are checked here once, at the
+        ``prodigy_steps`` freeze (or step 200 for never-freezing configs — d growth is exponential
+        early, so that is ample signal). Duck-typed on param-group keys: a no-op for AdamW-family
+        optimizers, and costs one boolean check per log step afterward.
+
+        Two by-design nuances (verified against the prodigyplus source, review 2026-06-11): under
+        ``split_groups=False`` every group carries the same shared d, so the cross-group spread check
+        is inherently a no-op there (a "spread" is meaningless in reference-Prodigy mode); and under
+        ``split_groups_mean=True`` the APPLIED step uses the harmonic-mean ``shared_d`` while this
+        check reads the raw per-group d — intentional, since a wide raw-d spread is the corruption
+        signal regardless of how the optimizer averages it away.
+        """
+        if self._optimizer_adaptation_checked or optimizer is None:
+            return
+        groups = getattr(optimizer, "param_groups", None)
+        if not groups or "d" not in groups[0] or "d0" not in groups[0]:
+            self._optimizer_adaptation_checked = True  # not a d-adapting optimizer; never re-check
+            return
+        k = int(groups[0].get("k", 0) or 0)
+        freeze = max(int(g.get("prodigy_steps") or 0) for g in groups)
+        check_at = freeze if freeze > 0 else 200
+        if k < check_at:
+            return
+        self._optimizer_adaptation_checked = True
+
+        ratios = []
+        for i, g in enumerate(groups):
+            desc = lr_descriptions[i] if lr_descriptions is not None and i < len(lr_descriptions) else f"group{i}"
+            d = float(g["d"])
+            d0 = float(g["d0"]) or 1e-12
+            ratios.append((desc, d, d / d0))
+        summary = ", ".join(f"{desc}: d={d:.3e} ({r:.1f}x d0)" for desc, d, r in ratios)
+        logger.info(f"Optimizer d at adaptation checkpoint (step {k}): {summary}")
+
+        for desc, d, r in ratios:
+            if r < 1.5:
+                logger.warning(
+                    f"Optimizer group '{desc}' barely adapted: d/d0 = {r:.2f} after {k} steps — its step size is "
+                    "effectively pinned at d0. Check the group's parameter composition and gradient scale (mixed "
+                    "parameter populations corrupt the shared per-group d estimate — the DoRA-magnitudes case from "
+                    "the DLAY v8 post-mortem). Training will proceed but may converge far slower than intended."
+                )
+        ds = [d for _, d, _ in ratios]
+        if len(ds) > 1 and min(ds) > 0 and max(ds) / min(ds) > 1000:
+            logger.warning(
+                f"Optimizer per-group d values span {max(ds) / min(ds):.0f}x across groups ({summary}). A spread this "
+                "wide usually means one group's estimate is corrupted rather than genuinely needing a different step "
+                "size — verify group composition before trusting the run."
+            )
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -120,6 +178,7 @@ class NetworkTrainer:
         mean_norm=None,
         maximum_norm=None,
     ):
+        self._check_optimizer_adaptation_once(optimizer, lr_descriptions)
         network_train_unet_only = True
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 

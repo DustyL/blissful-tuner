@@ -1543,10 +1543,19 @@ class LoRANetwork(torch.nn.Module):
         lr_descriptions = []
 
         def assemble_params(loras, lr, loraplus_ratio):
-            param_groups = {"lora": {}, "plus": {}}
+            param_groups = {"lora": {}, "plus": {}, "dora": {}}
             for lora in loras:
                 for name, param in lora.named_parameters():
-                    if loraplus_ratio is not None and "lora_up" in name:
+                    if "dora_layer" in name:
+                        # DoRA magnitudes are a DISTINCT parameter population: initialized at
+                        # weight-row-norm scale (~1-10) vs the near-zero LoRA matrices. Sharing a
+                        # group with lora_down corrupts adaptive optimizers' per-group step-size
+                        # estimation — Prodigy's shared d collapsed to ~d0 (3.9x under baseline) on
+                        # Ideogram 4 fp8 and inflated 1660x over its own up-group on FLUX.2 Klein
+                        # bf16 (DLAY v8 post-mortems, 2026-06-11). A separate group gives the
+                        # magnitudes their own estimate; fixed-LR optimizers behave identically.
+                        param_groups["dora"][f"{lora.lora_name}.{name}"] = param
+                    elif loraplus_ratio is not None and "lora_up" in name:
                         param_groups["plus"][f"{lora.lora_name}.{name}"] = param
                     else:
                         param_groups["lora"][f"{lora.lora_name}.{name}"] = param
@@ -1566,6 +1575,8 @@ class LoRANetwork(torch.nn.Module):
                     if key == "plus":
                         param_data["lr"] = lr * loraplus_ratio
                     else:
+                        # "dora" deliberately uses the base lr: magnitudes are not up-projections,
+                        # and the group exists for optimizer-estimation isolation, not an LR ratio.
                         param_data["lr"] = lr
 
                 if param_data.get("lr", None) == 0 or param_data.get("lr", None) is None:
@@ -1573,7 +1584,7 @@ class LoRANetwork(torch.nn.Module):
                     continue
 
                 params.append(param_data)
-                descriptions.append("plus" if key == "plus" else "")
+                descriptions.append(key if key != "lora" else "")
 
             return params, descriptions
 
