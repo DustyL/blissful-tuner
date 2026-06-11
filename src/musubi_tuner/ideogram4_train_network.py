@@ -241,6 +241,10 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         ):
             self.prior_lora_ema = LoRAEmaTeacher(decay=prior_teacher_ema_decay)
             self.prior_lora_ema.init_from(accelerator.unwrap_model(network))
+            logger.info(
+                f"EMA teacher initialized at global_step={global_step} (decay={prior_teacher_ema_decay}); "
+                "the prior teacher switches from base to EMA from this step on (prior/teacher_mode_ema_used flips to 1)"
+            )
 
         # Per-sample structural gating via the (remapped) timestep threshold. The shared masked-loss
         # reducer also gates application of the prior term per-sample so a teacher forward triggered

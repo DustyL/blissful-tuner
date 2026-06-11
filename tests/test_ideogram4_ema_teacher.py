@@ -149,6 +149,46 @@ def test_base_mode_never_creates_ema(monkeypatch):
     assert net.enabled_calls == [False, True]
 
 
+def test_teacher_sees_ema_weights_student_sees_live(monkeypatch):
+    # Integration proof (second-review suggestion): the EMA swap must be numerically observable
+    # through the SAME object graph the transformer's monkey-patched forwards use. The flow stub
+    # records the live adapter value at each call: after init at weight=1.0 and a live mutation to
+    # 3.0, the teacher forward (under apply_to) must observe 1.0 and the student forward 3.0 —
+    # with the live value restored afterward.
+    trainer = itn.Ideogram4NetworkTrainer()
+    net = _ParamNetwork()
+    args = _args()
+
+    observed: list[float] = []
+
+    def recording_flow(transformer, latents, text_features, noise, timesteps, *, network_dtype, device):
+        observed.append(float(net.weight.detach().mean().item()))
+        gh, gw = int(latents.shape[2]), int(latents.shape[3])
+        return torch.zeros(1, gh * gw, 128, dtype=network_dtype), torch.full((1, gh * gw, 128), 0.5, dtype=network_dtype)
+
+    monkeypatch.setattr(itn, "ideogram4_flow_matching_target", recording_flow)
+    monkeypatch.setattr(itn, "get_schedule_for_resolution", lambda reso, *, known_mean, std: lambda u: u)
+
+    # Run 1 at the init step: EMA snapshots weight=1.0 (init happens before the teacher forward).
+    latents, batch = _batch()
+    trainer.process_batch(
+        args, _make_accel(), "T", net, batch, latents, torch.ones_like(latents), None, torch.float32, torch.float32, None, 100
+    )
+    assert trainer.prior_lora_ema is not None
+
+    # Mutate the LIVE adapter, then run again: teacher = EMA(1.0), student = live(3.0).
+    with torch.no_grad():
+        net.weight.fill_(3.0)
+    observed.clear()
+    latents, batch = _batch()
+    trainer.process_batch(
+        args, _make_accel(), "T", net, batch, latents, torch.ones_like(latents), None, torch.float32, torch.float32, None, 101
+    )
+
+    assert observed == [1.0, 3.0]  # [teacher under apply_to, student on live weights]
+    assert torch.allclose(net.weight, torch.full((4,), 3.0))  # live weights restored after the swap
+
+
 def test_on_post_optimizer_step_updates_only_on_sync_gradients():
     trainer = itn.Ideogram4NetworkTrainer()
     net = _ParamNetwork()
