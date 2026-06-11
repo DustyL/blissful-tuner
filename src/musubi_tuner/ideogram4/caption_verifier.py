@@ -351,19 +351,51 @@ class CaptionVerifier:
 _caption_logger = BlissfulLogger(__name__, "yellow")
 _default_verifier = CaptionVerifier()
 
+# Plain-text flood suppression (backlog P0-3). Plain .txt captions are the NORMAL blissful LoRA
+# workflow, but every one fails the JSON parse — one WARNING per caption per cache run plus several
+# more at trainer start. Auto-detect: a caption whose only issue is the failed JSON parse and that
+# doesn't even look like attempted JSON (no leading '{') is plain text — notify ONCE at INFO, then
+# stay quiet for the rest of the process. Captions that look like attempted JSON keep the full
+# per-caption WARNING (a malformed structured caption is actionable; silence would hide it).
+_plain_text_notice_emitted = False
+
+
+def _is_plain_text_caption(prompt: str, issues: list[str]) -> bool:
+    if len(issues) != 1 or not issues[0].startswith("invalid JSON"):
+        return False
+    return not prompt.lstrip().startswith("{")
+
+
+def reset_plain_text_notice() -> None:
+    """Re-arm the one-shot plain-text caption notice (test hook)."""
+    global _plain_text_notice_emitted
+    _plain_text_notice_emitted = False
+
 
 def verify_caption(prompt: str, *, strict: bool = False) -> list[str]:
     """Check an Ideogram-4 caption. Returns the list of issue strings (empty = OK).
 
-    strict=False (DEFAULT): issues are logged as a warning, never fatal. Plain-text captions parse as
-    invalid JSON and will warn — expected (the model was trained on structured captions; plain text is a
-    domain shift, not an error). strict=True: raise ValueError on any issue (opt-in validation mode).
+    strict=False (DEFAULT): issues are logged, never fatal. Plain-text captions parse as invalid JSON —
+    expected (the model was trained on structured captions; plain text is a domain shift, not an error) —
+    so they produce a single INFO notice per process instead of a per-caption WARNING flood. Captions
+    that look like attempted JSON (leading '{') still warn per caption. strict=True: raise ValueError on
+    any issue (opt-in validation mode).
     """
+    global _plain_text_notice_emitted
     issues = _default_verifier.verify_raw(prompt)
     if not issues:
         return issues
     detail = "\n  ".join(issues)
     if strict:
         raise ValueError(f"Ideogram 4 caption issues (strict):\n  {detail}")
+    if _is_plain_text_caption(prompt, issues):
+        if not _plain_text_notice_emitted:
+            _plain_text_notice_emitted = True
+            _caption_logger.info(
+                "Ideogram 4 captions appear to be plain text (not structured JSON). This is fine for LoRA "
+                "training; suppressing further plain-text caption notices for this run. Pass "
+                "--strict_caption_verifier to enforce the structured-JSON schema instead."
+            )
+        return issues
     _caption_logger.warning(f"Ideogram 4 caption issues (warn-only; set strict to enforce):\n  {detail}")
     return issues
