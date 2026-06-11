@@ -61,7 +61,7 @@ def test_parser_default_is_none_and_flag_parses():
     assert parser.parse_args(["--ideogram4_sample_guidance", "3.0"]).ideogram4_sample_guidance == 3.0
 
 
-@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
 def test_handle_model_specific_args_rejects_nonpositive_guidance(bad):
     trainer = Ideogram4NetworkTrainer()
     args = SimpleNamespace(ideogram4_sample_guidance=bad, mixed_precision="bf16")

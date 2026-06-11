@@ -1,6 +1,7 @@
 import argparse
 import gc
 import logging
+import math
 import os
 from typing import Optional
 
@@ -421,15 +422,17 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                     "--vae for decode. Samples degenerate below ~1024 — set width/height=1024 in the prompt file."
                 )
 
-        # Training-sample guidance override (backlog P0-4): fail fast on a non-positive / NaN value here
-        # rather than producing silently-degenerate samples at the first sample interval. The flag is
+        # Training-sample guidance override (backlog P0-4): fail fast on a non-positive / NaN / inf value
+        # here rather than producing silently-degenerate samples at the first sample interval. The flag is
         # legal without --sample_prompts (it then simply never fires).
         sample_guidance = getattr(args, "ideogram4_sample_guidance", None)
-        if sample_guidance is not None and not (float(sample_guidance) > 0.0):
-            raise ValueError(
-                f"--ideogram4_sample_guidance must be > 0, got {sample_guidance}. It replaces every step of the "
-                "training-sample preset's guidance schedule (recommended: 3.0 for early-training probes)."
-            )
+        if sample_guidance is not None:
+            value = float(sample_guidance)
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(
+                    f"--ideogram4_sample_guidance must be a finite value > 0, got {sample_guidance}. It replaces every "
+                    "step of the training-sample preset's guidance schedule (recommended: 3.0 for early-training probes)."
+                )
 
         # args.mixed_precision is filled from the accelerate config LATER (trainer_base.py:1516); when this
         # hook runs it is still None if the CLI omitted it. Default the omitted case to bf16 — fp32 would OOM
