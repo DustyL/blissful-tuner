@@ -376,14 +376,6 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                 "block-swap hooks (base training would call transformer.enable_block_swap()). Remove the flag "
                 "and train at a lower resolution, or add block swap to modeling_ideogram4."
             )
-        if getattr(args, "compile", False):
-            raise ValueError(
-                "Ideogram 4 does not support --compile yet: it has no compile_transformer hook, so the base "
-                "default raises NotImplementedError (trainer_base.py:1127) only AFTER accelerator.prepare — a "
-                "confusing late crash. Remove --compile; a compile_transformer over [transformer.layers] can be "
-                "added later (see docs/plans/2026-06-07-ideogram4-native-1024-gc-blockswap.md)."
-            )
-
         # Prior preservation (Slice 2): base-mode teacher with t-remapped scheduling/gating is supported.
         # EMA teacher mode is deferred to a follow-up PR (needs on_post_optimizer_step override + lazy
         # init semantics). Reject `prior_teacher_mode="ema"` LOUDLY rather than silently falling through
@@ -456,6 +448,15 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         self._control_training = False
         self.default_guidance_scale = 7.0  # Ideogram uses asymmetric CFG at inference; unused at train time
         self.default_discrete_flow_shift = 1.0
+
+    def compile_transformer(self, args, transformer):
+        # Compile each of the 34 transformer blocks individually rather than the root module — Inductor
+        # prefers 34 identical small graphs over one huge one (mirrors flux_2_train_network.py). The root
+        # forward stays eager, which keeps two load-bearing seams intact: the fp8 monkey-patched Linear
+        # forwards (traced inside each block's graph) and disable_accelerate_forward_autocast's root-level
+        # _original_forward swap during sampling. disable_linear is a block-swap accommodation; Ideogram 4
+        # rejects --blocks_to_swap, so it is unconditionally False here.
+        return model_utils.compile_transformer(args, transformer, [transformer.layers], disable_linear=False)
 
     def extra_metadata(self, args) -> dict:
         # The Ideogram DiT is loaded as PRE-QUANTIZED fp8 via the shim, not the musubi fp8 path — so the base
