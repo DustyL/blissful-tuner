@@ -469,13 +469,11 @@ def test_loss_routes_prior_loss_into_reducer(monkeypatch):
 # ---------------------------------------------------------------------------------------------------
 
 
-def test_ema_teacher_mode_rejected_loudly():
-    """The global parser accepts --prior_teacher_mode=ema (registered in modules/mask_loss.py), but
-    Ideogram 4 Phase 1 only supports base mode. handle_model_specific_args must reject EMA mode with
-    an actionable error rather than silently fall through to base — the latter would be the exact
-    "looks configured, does the wrong thing" failure class the v1-v3 investigation killed.
-
-    The follow-up PR that adds EMA must also remove this rejection."""
+def test_ema_teacher_mode_accepted():
+    """P0-6 landed: EMA teacher mode is now supported (lazy init + apply_to teacher context +
+    on_post_optimizer_step updates), so the Phase-1 deferred-mode rejection is gone — exactly as
+    that rejection's own docstring instructed. The full EMA lifecycle is pinned in
+    tests/test_ideogram4_ema_teacher.py; this guards only that validation no longer rejects it."""
     from musubi_tuner.ideogram4_train_network import Ideogram4NetworkTrainer
 
     trainer = Ideogram4NetworkTrainer()
@@ -487,10 +485,9 @@ def test_ema_teacher_mode_rejected_loudly():
         prior_preservation_weight=0.5,
         prior_teacher_mode="ema",
         sample_prompts=None,
+        mixed_precision="bf16",
     )
-
-    with pytest.raises(ValueError, match=r"EMA teacher mode is deferred"):
-        trainer.handle_model_specific_args(args)
+    trainer.handle_model_specific_args(args)  # no raise
 
 
 def test_base_teacher_mode_accepted_with_prior_weight():

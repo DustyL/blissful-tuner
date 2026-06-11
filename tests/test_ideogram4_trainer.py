@@ -136,24 +136,21 @@ def test_handle_model_specific_args_accepts_use_mask_loss():
     assert trainer.dit_dtype == torch.bfloat16
 
 
-def test_handle_model_specific_args_rejects_ema_teacher_for_prior_preservation():
-    # Slice-2 update: base-mode prior preservation is supported, but EMA teacher mode is deferred to
-    # a follow-up PR. Reject EMA loudly rather than silently fall through to base — the global parser
-    # accepts --prior_teacher_mode=ema (it's registered for the shared masked-loss infrastructure),
-    # so an Ideogram-side silent fallback would be the exact "looks configured, does the wrong thing"
-    # failure class commit 55e4d79 killed. (Previous Slice-1 test rejected ALL prior_weight>0 combos;
-    # that fail-fast was removed when teacher forward + t-remap landed.)
+def test_handle_model_specific_args_accepts_both_teacher_modes():
+    # P0-6: EMA teacher mode landed (lazy init + on_post_optimizer_step update + apply_to teacher
+    # context) — the deferred-mode fail-fast is gone. Both modes validate cleanly now; the EMA
+    # lifecycle behavior is pinned in tests/test_ideogram4_ema_teacher.py.
     trainer = Ideogram4NetworkTrainer()
-    args = SimpleNamespace(
-        use_mask_loss=True,
-        prior_preservation_weight=1.0,
-        prior_teacher_mode="ema",
-        mixed_precision="bf16",
-    )
-    with pytest.raises(ValueError, match=r"EMA teacher mode is deferred"):
-        trainer.handle_model_specific_args(args)
+    trainer.handle_model_specific_args(
+        SimpleNamespace(
+            use_mask_loss=True,
+            prior_preservation_weight=1.0,
+            prior_teacher_mode="ema",
+            mixed_precision="bf16",
+        )
+    )  # no raise
 
-    # base teacher mode (default) is now ACCEPTED with prior_weight>0 + use_mask_loss=True.
+    # base teacher mode (default) likewise ACCEPTED with prior_weight>0 + use_mask_loss=True.
     trainer2 = Ideogram4NetworkTrainer()
     trainer2.handle_model_specific_args(
         SimpleNamespace(
