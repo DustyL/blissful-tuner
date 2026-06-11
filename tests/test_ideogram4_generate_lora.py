@@ -128,6 +128,40 @@ def test_lokr_checkpoint_applies(tmp_path):
     assert not torch.allclose(pred, base_pred)
 
 
+def _save_loha_checkpoint(tmp_path, name="loha.safetensors"):
+    from musubi_tuner.networks import loha
+
+    donor, _ = _tiny_model()
+    net = loha.create_arch_network(1.0, 4, 4.0, None, None, donor, architecture="i4")
+    net.apply_to(None, donor, apply_text_encoder=False, apply_unet=True)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.normal_(0.0, 0.05)
+    sd = {k: v.detach().clone().contiguous() for k, v in net.state_dict().items()}
+    path = tmp_path / name
+    save_file(sd, str(path))
+    return str(path)
+
+
+def test_multiplier_zero_is_noop_for_all_families(tmp_path):
+    # Locks the IEEE-754-exact zero-delta invariant per family (review note on PR #23): LoRA
+    # short-circuits, LoHa scales the delta term by multiplier, LoKr folds multiplier into
+    # get_weight — all three must reproduce the base forward bitwise at multiplier 0.
+    base_model, cfg = _tiny_model()
+    base_pred = _forward(base_model, cfg)
+
+    checkpoints = {
+        "lora": _save_lora_checkpoint(tmp_path),
+        "loha": _save_loha_checkpoint(tmp_path),
+        "lokr": _save_lokr_checkpoint(tmp_path),
+    }
+    for family, path in checkpoints.items():
+        model, _ = _tiny_model()
+        apply_lora_weights_runtime(model, [path], [0.0], DEVICE, DTYPE)
+        pred = _forward(model, cfg)
+        assert torch.equal(pred, base_pred), f"{family}: multiplier 0 must be a bitwise no-op"
+
+
 def test_unknown_checkpoint_rejected(tmp_path):
     path = tmp_path / "garbage.safetensors"
     save_file({"something.weird_key": torch.zeros(2, 2)}, str(path))
