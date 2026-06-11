@@ -130,7 +130,9 @@ def main():
     rels = [abs(e - c) / max(abs(e), 1e-9) for e, c in zip(eager_losses, compiled_losses)]
     finite = all(map(lambda x: x == x and abs(x) != float("inf"), compiled_losses))
     speedup = (eager_s - compiled_s) / eager_s * 100
-    print(f"\nloss parity over {args.parity_steps} AdamW steps: mean rel {statistics.mean(rels) * 100:.3f}%  max rel {max(rels) * 100:.3f}%")
+    print(
+        f"\nloss parity over {args.parity_steps} AdamW steps: mean rel {statistics.mean(rels) * 100:.3f}%  max rel {max(rels) * 100:.3f}%"
+    )
     print(f"mean loss: eager {statistics.mean(eager_losses):.6f} vs compiled {statistics.mean(compiled_losses):.6f}")
     print(f"speedup: {speedup:+.1f}%  ({eager_s:.3f} -> {compiled_s:.3f} s/step)")
     ok = finite and statistics.mean(rels) < 0.01 and max(rels) < 0.05
