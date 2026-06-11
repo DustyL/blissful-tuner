@@ -170,12 +170,18 @@ class LoKrModule(nn.Module):
             if torch.rand(1).item() < self.module_dropout:
                 return result
 
+        # Explicit dtype harmonization for the delta matmul (mirrors LoRAModule.forward, e85284b).
+        # Under autocast this cast is a no-op; without it (Ideogram 4 defeats autocast for
+        # training-inference parity) bf16 input x fp32 LoKr weights raises
+        # "expected mat1 and mat2 to have the same dtype".
+        x_for_delta = x.to(diff_weight.dtype) if x.dtype != diff_weight.dtype else x
         if diff_weight.dim() == 2:
-            delta = torch.nn.functional.linear(x, diff_weight)
+            delta = torch.nn.functional.linear(x_for_delta, diff_weight)
         else:
-            delta = torch.nn.functional.linear(x, diff_weight.view(diff_weight.shape[0], -1))
+            delta = torch.nn.functional.linear(x_for_delta, diff_weight.view(diff_weight.shape[0], -1))
 
-        return result + delta
+        # Cast back to the base output dtype so the addition doesn't promote the module's output.
+        return result + delta.to(result.dtype)
 
 
 class LoKrInfModule(LoKrModule):

@@ -20,9 +20,12 @@ LoHa and LoKr share the same architecture registry. All architectures supported 
 - FramePack
 - FLUX.1 Kontext
 - FLUX.2 (Dev, Klein 4B, Klein 9B)
+- Ideogram 4 (pass `--network_args "architecture=i4"`)
 - Qwen-Image (all variants)
 - Z-Image-Turbo
 - Kandinsky 5
+
+Note: `create_arch_network` reads the target architecture from `--network_args "architecture=<key>"` and defaults to HunyuanVideo when omitted. For Ideogram 4 the key is `i4`. Ideogram 4 LoHa/LoKr checkpoints also convert to ComfyUI format via `convert_ideogram4_lora_to_comfy.py` (adapter keys pass through; bookkeeping buffers are stripped).
 
 ## Training with LoHa
 

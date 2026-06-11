@@ -7,6 +7,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
+    ARCHITECTURE_IDEOGRAM4,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
@@ -19,6 +20,7 @@ from musubi_tuner.networks.lora_flux import FLUX_KONTEXT_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_flux_2 import FLUX_2_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_framepack import FRAMEPACK_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_hv_1_5 import HV_1_5_IMAGE_TARGET_REPLACE_MODULES
+from musubi_tuner.networks.lora_ideogram4 import IDEOGRAM4_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_kandinsky import KANDINSKY5_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_qwen_image import QWEN_IMAGE_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_wan import WAN_TARGET_REPLACE_MODULES
@@ -36,6 +38,7 @@ class TestArchRegistryDefaults(unittest.TestCase):
             (ARCHITECTURE_FLUX_2_DEV, FLUX_2_TARGET_REPLACE_MODULES),
             (ARCHITECTURE_HUNYUAN_VIDEO, HUNYUAN_TARGET_REPLACE_MODULES),
             (ARCHITECTURE_HUNYUAN_VIDEO_1_5, HV_1_5_IMAGE_TARGET_REPLACE_MODULES),
+            (ARCHITECTURE_IDEOGRAM4, IDEOGRAM4_TARGET_REPLACE_MODULES),
             (ARCHITECTURE_QWEN_IMAGE, QWEN_IMAGE_TARGET_REPLACE_MODULES),
             (ARCHITECTURE_Z_IMAGE, ZIMAGE_TARGET_REPLACE_MODULES),
             (ARCHITECTURE_KANDINSKY5, KANDINSKY5_TARGET_REPLACE_MODULES),

@@ -10,6 +10,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
+    ARCHITECTURE_IDEOGRAM4,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
@@ -22,6 +23,7 @@ from musubi_tuner.networks.lora_flux import FLUX_KONTEXT_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_flux_2 import FLUX_2_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_framepack import FRAMEPACK_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_hv_1_5 import HV_1_5_IMAGE_TARGET_REPLACE_MODULES
+from musubi_tuner.networks.lora_ideogram4 import IDEOGRAM4_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_kandinsky import KANDINSKY5_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_qwen_image import QWEN_IMAGE_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_wan import WAN_TARGET_REPLACE_MODULES
@@ -71,6 +73,12 @@ ARCH_CONFIGS = {
     ARCHITECTURE_FLUX_2_KLEIN_9B: {
         "target_modules": FLUX_2_TARGET_REPLACE_MODULES,
         "exclude_patterns": [r".*(norm).*"],
+    },
+    ARCHITECTURE_IDEOGRAM4: {
+        "target_modules": IDEOGRAM4_TARGET_REPLACE_MODULES,
+        # Matches lora_ideogram4.create_arch_network's always-appended exclusion: adaln_modulation
+        # is the per-block modulation Linear — training it destabilizes like norm/mod layers elsewhere.
+        "exclude_patterns": [r".*adaln_modulation.*"],
     },
     ARCHITECTURE_QWEN_IMAGE: {
         "target_modules": QWEN_IMAGE_TARGET_REPLACE_MODULES,
