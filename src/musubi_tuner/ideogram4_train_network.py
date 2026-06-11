@@ -1,6 +1,7 @@
 import argparse
 import gc
 import logging
+import math
 import os
 from typing import Optional
 
@@ -15,7 +16,7 @@ from musubi_tuner.hv_train_network import (
 from musubi_tuner.ideogram4 import ideogram4_utils
 from musubi_tuner.ideogram4.caption_verifier import verify_caption
 from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
-from musubi_tuner.ideogram4.sampler_configs import PRESETS
+from musubi_tuner.ideogram4.sampler_configs import PRESETS, resolve_training_sample_preset
 from musubi_tuner.ideogram4.scheduler import get_schedule_for_resolution
 from musubi_tuner.ideogram4.sequence import IDEOGRAM4_IMAGE_PATCH
 from musubi_tuner.ideogram4.text_encoder import (
@@ -421,6 +422,18 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
                     "--vae for decode. Samples degenerate below ~1024 — set width/height=1024 in the prompt file."
                 )
 
+        # Training-sample guidance override (backlog P0-4): fail fast on a non-positive / NaN / inf value
+        # here rather than producing silently-degenerate samples at the first sample interval. The flag is
+        # legal without --sample_prompts (it then simply never fires).
+        sample_guidance = getattr(args, "ideogram4_sample_guidance", None)
+        if sample_guidance is not None:
+            value = float(sample_guidance)
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(
+                    f"--ideogram4_sample_guidance must be a finite value > 0, got {sample_guidance}. It replaces every "
+                    "step of the training-sample preset's guidance schedule (recommended: 3.0 for early-training probes)."
+                )
+
         # args.mixed_precision is filled from the accelerate config LATER (trainer_base.py:1516); when this
         # hook runs it is still None if the CLI omitted it. Default the omitted case to bf16 — fp32 would OOM
         # the 8B DiT AND split the loaded-model dtype (self.dit_dtype) from the training-loop dtype (the local
@@ -550,7 +563,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             )
         device = accelerator.device
         vae.to(device)  # base loads the VAE on CPU and returns it there afterward (trainer_base.py:1051)
-        preset = PRESETS[args.sampler_preset]
+        preset = resolve_training_sample_preset(args)  # honors --ideogram4_sample_guidance (training samples only)
         text_features = sample_parameter["i4_llm_features"].to(device=device, dtype=dit_dtype)
         # Lazy-load the unconditional DiT HERE (not on_before) so the risky 9.4 GB load is inside the base's
         # sampling try/finally — an OOM here still reaches on_after cleanup. Freed per-prompt before decode, so a
@@ -633,6 +646,15 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         default="V4_TURBO_12",
         choices=list(PRESETS),
         help="named sampler preset for training samples (default V4_TURBO_12, a fast health check)",
+    )
+    parser.add_argument(
+        "--ideogram4_sample_guidance",
+        type=float,
+        default=None,
+        help="uniform CFG override for TRAINING-TIME samples only: replaces every step of the active preset's "
+        "guidance schedule (recommended: 3.0). Ideogram 4's asymmetric CFG amplifies an early-training LoRA at the "
+        "presets' production gw=7.0, making healthy runs look broken in early samples. Production generation "
+        "(ideogram4_generate_image.py) is unaffected.",
     )
     parser.add_argument("--strict_caption_verifier", action="store_true", help="error (not warn) on caption-format issues")
     return parser
