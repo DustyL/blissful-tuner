@@ -119,6 +119,13 @@ class NetworkTrainer:
         ``prodigy_steps`` freeze (or step 200 for never-freezing configs — d growth is exponential
         early, so that is ample signal). Duck-typed on param-group keys: a no-op for AdamW-family
         optimizers, and costs one boolean check per log step afterward.
+
+        Two by-design nuances (verified against the prodigyplus source, review 2026-06-11): under
+        ``split_groups=False`` every group carries the same shared d, so the cross-group spread check
+        is inherently a no-op there (a "spread" is meaningless in reference-Prodigy mode); and under
+        ``split_groups_mean=True`` the APPLIED step uses the harmonic-mean ``shared_d`` while this
+        check reads the raw per-group d — intentional, since a wide raw-d spread is the corruption
+        signal regardless of how the optimizer averages it away.
         """
         if self._optimizer_adaptation_checked or optimizer is None:
             return
