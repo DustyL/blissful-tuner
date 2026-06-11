@@ -738,6 +738,16 @@ class LoRAInfModule(LoRAModule):
         # extract weight from org_module
         org_sd = self.org_module.state_dict()
         weight = org_sd["weight"]
+        # fp8-prequantized base: destructive merge is structurally unsupported — the float cast below
+        # reads raw fp8 lattice values (silently ~1000x off without scale_weight), and writing merged
+        # true-space values back as fp8 without inverse re-scaling (plus saturation handling) would
+        # corrupt the checkpoint. Runtime LoRA application (LoRAInfModule.forward) IS fp8-aware; use it.
+        if weight.dtype in FP8_DTYPES:
+            raise ValueError(
+                f"merge_to: cannot merge LoRA into fp8-prequantized base weights ({self.lora_name}, {weight.dtype}). "
+                "Apply the LoRA at runtime instead (the non-destructive forward path is fp8-aware), or merge into "
+                "a bf16 copy of the base model."
+            )
         org_dtype = weight.dtype
         org_device = weight.device
         weight = weight.to(device, dtype=torch.float, non_blocking=non_blocking)  # for calculation
@@ -1660,6 +1670,15 @@ class LoRANetwork(torch.nn.Module):
             sd = org_module.state_dict()
 
             org_weight = sd["weight"]
+            # fp8-prequantized base: get_weight() returns a TRUE-weight-space delta (it dequantizes via
+            # scale_weight), but this consumer would anchor it to the raw fp8 lattice values and re-store
+            # as fp8 without re-scaling — numerically inconsistent. Refuse loudly; the runtime forward
+            # path handles fp8 correctly without pre-calculation.
+            if org_weight.dtype in FP8_DTYPES:
+                raise ValueError(
+                    f"pre_calculation: cannot bake LoRA into fp8-prequantized base weights ({lora.lora_name}, "
+                    f"{org_weight.dtype}). Skip pre_calculation for fp8 models — the runtime forward path is fp8-aware."
+                )
             lora_weight = lora.get_weight().to(org_weight.device, dtype=org_weight.dtype)
             sd["weight"] = org_weight + lora_weight
             assert sd["weight"].shape == org_weight.shape

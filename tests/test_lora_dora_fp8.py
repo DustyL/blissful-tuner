@@ -12,13 +12,15 @@
 # The e85284b LoRA dtype harmonization fixed only LoRAModule.forward's delta path, NOT these
 # raw-weight reads — that question (backlog P0-2 step 1) is settled by these tests existing.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from musubi_tuner.networks.dora_utils import dequantize_fp8_weight, dora_weight_norm_materialized
-from musubi_tuner.networks.lora import DoRALayer, LoRAModule
+from musubi_tuner.networks.lora import DoRALayer, LoRAInfModule, LoRAModule, LoRANetwork
 
 E4M3_MAX = 448.0
 
@@ -167,3 +169,29 @@ def test_dora_forward_backward_on_fp8_linear():
     ref = LoRAModule("lora_unet_test_ref", ref_lin, 1.0, lora_dim=4, alpha=4, use_dora=True)
     ref.apply_to()
     assert torch.allclose(out, ref_lin.forward(x), rtol=0.15, atol=0.05)
+
+
+# --- destructive merge paths refuse fp8 bases ------------------------------------------------------
+# Merging/baking into an fp8 checkpoint would write float-merged values back as fp8 without inverse
+# re-scaling — silent corruption. Both destructive paths must refuse loudly; runtime forward is the
+# supported fp8 route.
+
+
+def test_merge_to_refuses_fp8_base():
+    lin, _ = _make_fp8_linear()
+    m = LoRAInfModule("lora_unet_test_fp8", lin, 1.0, lora_dim=4, alpha=4)
+    weights = {
+        "lora_down.weight": torch.randn(4, 8),
+        "lora_up.weight": torch.randn(12, 4),
+    }
+    with pytest.raises(ValueError, match="fp8-prequantized"):
+        m.merge_to(weights, None, None)
+
+
+def test_pre_calculation_refuses_fp8_base():
+    lin, _ = _make_fp8_linear()
+    inf = LoRAInfModule("lora_unet_test_fp8", lin, 1.0, lora_dim=4, alpha=4)
+    inf.org_module_ref = [lin]
+    fake_network = SimpleNamespace(text_encoder_loras=[], unet_loras=[inf])
+    with pytest.raises(ValueError, match="fp8-prequantized"):
+        LoRANetwork.pre_calculation(fake_network)
