@@ -222,11 +222,17 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # gated batch so it uses the exact args + a real bucket resolution.
         if need_prior_base and prior_timestep_threshold is not None and not self._prior_gate_rate_logged:
             self._prior_gate_rate_logged = True
+            # None-tolerant but 0.0-faithful: `or`-style guards would coerce std=0.0 to 1.0 and make
+            # the estimate disagree with production's degenerate constant schedule (the production
+            # sampling path passes these args UNGUARDED). mu's falsy value IS its default, so the
+            # distinction only matters for std.
+            mu_val = getattr(args, "ideogram4_timestep_mu", 0.0)
+            std_val = getattr(args, "ideogram4_timestep_std", 1.0)
             skip_rate = estimate_prior_gate_skip_rate(
                 height,
                 width,
-                timestep_mu=float(getattr(args, "ideogram4_timestep_mu", 0.0) or 0.0),
-                timestep_std=float(getattr(args, "ideogram4_timestep_std", 1.0) or 1.0),
+                timestep_mu=float(0.0 if mu_val is None else mu_val),
+                timestep_std=float(1.0 if std_val is None else std_val),
                 threshold=float(prior_timestep_threshold),
             )
             logger.info(

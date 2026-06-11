@@ -46,6 +46,15 @@ def test_resolution_shifts_the_rate():
     assert at_512 > at_1024
 
 
+def test_std_zero_matches_degenerate_production_schedule():
+    # std=0 is parser-legal and collapses production sampling to a constant t = 1 - expit(mean):
+    # at 1024^2 that's traditional_t ~= 667, so threshold=250 skips NOTHING and threshold=700 skips
+    # EVERYTHING. An `or`-style falsy guard would coerce std=0 -> 1.0 and report ~3.9% here — the one
+    # config where the estimate would lie about production (review finding, 2026-06-11).
+    assert estimate_prior_gate_skip_rate(1024, 1024, timestep_mu=0.0, timestep_std=0.0, threshold=250.0) == 0.0
+    assert estimate_prior_gate_skip_rate(1024, 1024, timestep_mu=0.0, timestep_std=0.0, threshold=700.0) >= 0.999
+
+
 def test_deterministic():
     a = estimate_prior_gate_skip_rate(1024, 1024, timestep_mu=0.0, timestep_std=1.0, threshold=250.0)
     b = estimate_prior_gate_skip_rate(1024, 1024, timestep_mu=0.0, timestep_std=1.0, threshold=250.0)
@@ -102,8 +111,18 @@ def _run_process_batch(trainer, args, monkeypatch):
     monkeypatch.setattr(itn, "get_schedule_for_resolution", lambda reso, *, known_mean, std: lambda u: u)
     latents, batch = _batch()
     trainer.process_batch(
-        args, _make_accel(), "TRANSFORMER", _StubNetwork(), batch, latents, torch.ones_like(latents),
-        None, torch.float32, torch.float32, None, 0,
+        args,
+        _make_accel(),
+        "TRANSFORMER",
+        _StubNetwork(),
+        batch,
+        latents,
+        torch.ones_like(latents),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
 
@@ -139,11 +158,12 @@ def test_no_estimate_without_prior_preservation(monkeypatch, caplog):
     assert not [r for r in caplog.records if "expected to skip" in r.message]
 
 
-def test_mu_none_tolerated(monkeypatch, caplog):
-    # _base_args-style configs (and the parser pre-defaulting) can leave mu as None; the trainer
-    # call defends with `or 0.0` rather than crashing the first training step.
+def test_mu_and_std_none_tolerated(monkeypatch, caplog):
+    # _base_args-style configs (and pre-parser defaulting) can leave mu/std as None; the trainer
+    # call substitutes the parser defaults rather than crashing the first training step. The guard
+    # is None-only — falsy 0.0 values pass through faithfully (see the std=0 estimator test).
     trainer = itn.Ideogram4NetworkTrainer()
-    args = _args(ideogram4_timestep_mu=None)
+    args = _args(ideogram4_timestep_mu=None, ideogram4_timestep_std=None)
     with caplog.at_level(logging.INFO, logger=TRAINER_LOGGER):
         _run_process_batch(trainer, args, monkeypatch)
     assert [r for r in caplog.records if "expected to skip" in r.message]
