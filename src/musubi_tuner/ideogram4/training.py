@@ -109,15 +109,20 @@ def compute_flow_loss_diagnostics(model_pred: torch.Tensor, target: torch.Tensor
 
     Computed on detached float32 copies of the token-space (pred, target) BEFORE Huber, mask
     weighting, or area-scale beta touch the loss — so the values are comparable across runs
-    regardless of loss configuration. The two baselines anchor the training loss to something
-    interpretable: ``loss/zero_pred`` is the MSE a predict-zero model would score (= target power),
-    ``loss/flipped_pred`` the MSE of a sign-flipped prediction (sanity check for inverted targets —
-    healthy training has flipped_pred >> zero_pred > actual loss). ``loss/pred_target_cosine`` is
-    the global cosine between the flattened tensors: 1.0 = perfectly aligned direction, ~0 =
-    uncorrelated, < 0 = the model is fighting the target. ``timestep/traditional_t_*`` report the
-    sampled timesteps in the shared noise-level [0, 1000] convention (Ideogram's t = cleanness is
-    remapped via ``ideogram4_cleanness_to_noise_timestep``), matching the ``prior/traditional_t_*``
-    semantics so the two tag families read on the same axis.
+    regardless of loss configuration. ``loss/raw_mse`` is the headline scalar: the direct
+    unweighted flow error from this pre-reduction point (what ``loss/average`` would read in a
+    plain-MSE unmasked run). ``loss/raw_mse_over_zero_pred`` normalizes it by the predict-zero
+    baseline — a denominator-invariant progress number (1.0 = no better than predicting zero;
+    same cross-run-comparison role as Klein's ``huber_lin_frac``). The other baselines anchor
+    interpretation: ``loss/zero_pred`` is the MSE a predict-zero model would score (= target
+    power), ``loss/flipped_pred`` the MSE of a sign-flipped prediction (sanity check for inverted
+    targets — healthy training has flipped_pred >> zero_pred > raw_mse).
+    ``loss/pred_target_cosine`` is the global cosine between the flattened tensors: 1.0 =
+    perfectly aligned direction, ~0 = uncorrelated, < 0 = the model is fighting the target.
+    ``timestep/traditional_t_*`` report the sampled timesteps in the shared noise-level [0, 1000]
+    convention (Ideogram's t = cleanness is remapped via
+    ``ideogram4_cleanness_to_noise_timestep``), matching the ``prior/traditional_t_*`` semantics
+    so the two tag families read on the same axis.
 
     timesteps: (B,) cleanness coefficients in [0, 1] (the trainer's native sampling output).
     """
@@ -127,9 +132,13 @@ def compute_flow_loss_diagnostics(model_pred: torch.Tensor, target: torch.Tensor
         pred_rms = pred_f.square().mean().sqrt()
         target_rms = target_f.square().mean().sqrt()
         denom = (pred_rms * target_rms).clamp_min(1e-8)
+        zero_pred = target_f.square().mean()
+        raw_mse = torch.nn.functional.mse_loss(pred_f, target_f, reduction="mean")
         traditional_t = ideogram4_cleanness_to_noise_timestep(timesteps.detach().float())
         return {
-            "loss/zero_pred": target_f.square().mean().item(),
+            "loss/raw_mse": raw_mse.item(),
+            "loss/raw_mse_over_zero_pred": (raw_mse / zero_pred.clamp_min(1e-8)).item(),
+            "loss/zero_pred": zero_pred.item(),
             "loss/flipped_pred": torch.nn.functional.mse_loss(-pred_f, target_f, reduction="mean").item(),
             "loss/pred_rms": pred_rms.item(),
             "loss/target_rms": target_rms.item(),
