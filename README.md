@@ -39,6 +39,7 @@ Blissful Features:
 - Load mixed precision transformers (`--mixed_precision_transformer` for inference or training, see [here](https://github.com/kohya-ss/musubi-tuner/discussions/232#discussioncomment-13284677) for how to create such a transformer and why you might wanna) (WV) (T)
 - Several more LLM options (`--hidden_state_skip_layer N --apply_final_norm`, please see the `--help` for explanations!) (HY)
 - FP8 scaled support using the same algo as Wan (`--fp8_scaled`, HIGHLY recommend both for inference and training. It's just better fp8 that's all you need to know!) (HY) (T)
+- Choose the save precision for LoRA weights (`--save_precision float/fp32/fp16/bf16`, defaults to fp32 since LoRA weights are actually trained in fp32 - this keeps full precision for post-hoc EMA, merging, extraction and weight analysis. When training with `--mixed_precision bf16`/`fp16` the saved file may be ~2x larger than before; pass `--save_precision bf16` to restore the old behavior and size. Subsumed from upstream Musubi [PR #967](https://github.com/kohya-ss/musubi-tuner/pull/967), thanks rockerBOO!) (HY) (WV) (FP) (FX) (QI) (T)
 - Separate prompt for CLIP (`--prompt_2 "second prompt goes here"`, provides a different prompt to CLIP since it's used to simpler text) (HY)
 - Rescale text encoders based on https://github.com/zer0int/ComfyUI-HunyuanVideo-Nyan (`--te_multiplier llm clip` such as `--te_multiplier 0.9 1.2` to downweight the LLM slightly and upweight the CLIP slightly) (HY)
 

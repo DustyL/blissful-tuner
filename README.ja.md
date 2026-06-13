@@ -41,6 +41,7 @@ Musubi Tunerの開発に尽力いただいたkohya-ssさん、重要なコード
 - 混合精度トランスフォーマーをロードします (推論または学習には `--mixed_precision_transformer` を使用します。このようなトランスフォーマーの作成方法と、その理由については https://github.com/kohya-ss/musubi-tuner/discussions/232#discussioncomment-13284677 を参照してください) (WV) (T)
 - LLMオプションの追加 (`--hidden_​​state_skip_layer N --apply_final_norm`、説明は`--help`を参照してください!) (HY)
 - Wanと同じアルゴリズムを使用したFP8スケールのサポート (`--fp8_scaled`、推論と学習の両方に強く推奨。FP8が優れているだけなので、これだけ知っておく必要があります!) (HY) (T)
+- LoRA重みの保存精度を選択可能 (`--save_precision float/fp32/fp16/bf16`、LoRA重みは実際にはfp32で学習されるため省略時はfp32で保存します。post-hoc EMA、マージ、抽出、重み解析などの後処理のために完全な精度を保持します。`--mixed_precision bf16`/`fp16`で学習している場合、保存されるファイルが従来のおよそ2倍のサイズになることがあります。従来の挙動とサイズに戻すには`--save_precision bf16`を指定してください。upstream Musubiの[PR #967](https://github.com/kohya-ss/musubi-tuner/pull/967)から取り込みました。rockerBOO氏に感謝します!) (HY) (WV) (FP) (FX) (QI) (T)
 - CLIP用のプロンプトの分離 (`--prompt_2 "second prompt goes here"`、CLIPはよりシンプルなテキストに使用されるため、CLIPとは異なるプロンプトを提供します) (HY)
 - https://github.com/zer0int/ComfyUI-HunyuanVideo-Nyan に基づいてテキストエンコーダーを再スケール (`--te_multiplier llm clip`、例えば`--te_multiplier 0.9 1.2`のように、LLMの重みをわずかに下げ、CLIPの重みを上げる)（HY）
 
