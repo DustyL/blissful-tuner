@@ -28,6 +28,7 @@ from musubi_tuner.ideogram4.text_encoder import (
 from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, prior_model_context
 from musubi_tuner.modules.lora_ema_teacher import LoRAEmaTeacher
 from musubi_tuner.ideogram4.training import (
+    compute_flow_loss_diagnostics,
     estimate_prior_gate_skip_rate,
     ideogram4_cleanness_to_noise_timestep,
     ideogram4_flow_matching_target,
@@ -364,9 +365,18 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             device=device,
         )
 
+        # --- Optional raw flow diagnostics (--log_loss_stats) -------------------------------------
+        # Computed on token-space pred/target BEFORE Huber/mask/beta so the values stay comparable
+        # across runs regardless of loss config (the masked loss below is beta- and mask-scaled and
+        # NOT cross-run comparable — that gap cost a debug cycle in the DLAY v8-v12 likeness work).
+        # Gated on trackers to avoid .item() syncs nothing consumes.
+        flow_diagnostics: dict[str, float] = {}
+        if bool(getattr(args, "log_loss_stats", False)) and len(accelerator.trackers) > 0:
+            flow_diagnostics = compute_flow_loss_diagnostics(model_pred, target, timesteps)
+
         if not use_mask_loss:
             loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target.to(network_dtype), reduction="mean")
-            return loss, {}
+            return loss, flow_diagnostics
 
         # Mask-weighted loss: put per-token pred/target/prior back on the spatial grid (B, 128, gh, gw)
         # — the exact inverse of grid_to_dit_tokens — so the cached (B, 1, 1, gh, gw) mask aligns. The
@@ -407,7 +417,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             layout="video",
         )
 
-        loss_metrics: dict[str, float] = {}
+        loss_metrics: dict[str, float] = dict(flow_diagnostics)
         if stats_enabled and mask_loss_stats:
             for k, v in mask_loss_stats.items():
                 if isinstance(v, torch.Tensor):
@@ -726,6 +736,13 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         "(ideogram4_generate_image.py) is unaffected.",
     )
     parser.add_argument("--strict_caption_verifier", action="store_true", help="error (not warn) on caption-format issues")
+    parser.add_argument(
+        "--log_loss_stats",
+        action="store_true",
+        help="log raw flow-matching diagnostics each step (loss/zero_pred + flipped_pred baselines, pred/target RMS, "
+        "pred_target_cosine, timestep/traditional_t_*), computed BEFORE Huber/mask/area-scale-beta so the values are "
+        "comparable across runs regardless of loss config. Negligible overhead; ported from sdbds qinglong 99ad6c5.",
+    )
     return parser
 
 
