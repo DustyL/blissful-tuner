@@ -11,10 +11,12 @@ from musubi_tuner.optimizers.muon_util import (
     print_muon_summary,
     split_param_groups_for_muon,
 )
+from musubi_tuner.optimizers.prodigy_plus_inner_momentum import ProdigyPlusInnerMomentumScheduleFree
 
 __all__ = [
     "MUON_AVAILABLE",
     "create_muon_optimizer",
+    "ProdigyPlusInnerMomentumScheduleFree",
     "MODEL_LAYER_PATTERNS",
     "LayerFilter",
     "MuonParamStats",
