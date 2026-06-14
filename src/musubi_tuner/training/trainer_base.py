@@ -198,6 +198,13 @@ class NetworkTrainer:
                 "needing a different step size — verify group composition before trusting the run."
             )
 
+    @staticmethod
+    def _is_d_adapting_schedulefree_optimizer(args: argparse.Namespace, optimizer=None) -> bool:
+        if optimizer is None or not args.optimizer_type.lower().endswith("schedulefree"):
+            return False
+        groups = getattr(optimizer, "param_groups", None)
+        return bool(groups) and all("d" in group and "lr" in group for group in groups)
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -242,7 +249,7 @@ class NetworkTrainer:
                     lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
                 )
 
-            if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
+            if self._is_d_adapting_schedulefree_optimizer(args, optimizer):
                 # tracking d*lr value of unet.
                 logs[f"lr/d*lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
                 if "effective_lr" in optimizer.param_groups[i]:
