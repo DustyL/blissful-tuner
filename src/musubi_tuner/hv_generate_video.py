@@ -25,6 +25,7 @@ from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscret
 from musubi_tuner.networks import lora
 from rich_argparse import RichHelpFormatter
 from musubi_tuner.utils import model_utils
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.device_utils import clean_memory_on_device, synchronize_device
 from musubi_tuner.utils.lora_utils import (
@@ -771,9 +772,8 @@ def main():
 
         if blocks_to_swap > 0:
             logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {device}")
-            transformer.enable_block_swap(
-                blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
-            )
+            swap_config = BlockSwapConfig(device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap)
+            transformer.enable_block_swap(blocks_to_swap, swap_config)
             transformer.move_to_device_except_swap_blocks(device)
             transformer.prepare_block_swap_before_forward()
         else:

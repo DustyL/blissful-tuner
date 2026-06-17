@@ -23,6 +23,7 @@ from musubi_tuner.frame_pack.utils import crop_or_pad_yield_mask, soft_append_bc
 from musubi_tuner.frame_pack.clip_vision import hf_clip_vision_encode
 from musubi_tuner.frame_pack.k_diffusion_hunyuan import sample_hunyuan
 from musubi_tuner.dataset import image_video_dataset
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.lora_utils import (
     convert_diffusers_if_needed,
@@ -562,9 +563,8 @@ def load_dit_model(args: argparse.Namespace, device: torch.device) -> HunyuanVid
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(
-            args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
-        )
+        swap_config = BlockSwapConfig(device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap)
+        model.enable_block_swap(args.blocks_to_swap, swap_config)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:

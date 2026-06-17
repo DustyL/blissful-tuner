@@ -15,6 +15,7 @@ import torch
 
 from musubi_tuner.flux_2 import flux2_utils
 from musubi_tuner.hv_train_network import NetworkTrainer
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.lora_ema_teacher import LoRAEmaTeacher
 from musubi_tuner.networks import lora_flux_2
 from musubi_tuner.utils import model_utils
@@ -77,7 +78,7 @@ def test_flux2_block_swap_prior_teacher_restore_smoke(pytestconfig):
         disable_numpy_memmap=False,
     )
     model.requires_grad_(False)
-    model.enable_block_swap(blocks_to_swap, device, supports_backward=True, use_pinned_memory=False)
+    model.enable_block_swap(blocks_to_swap, BlockSwapConfig(device, supports_backward=True, use_pinned_memory=False))
     model.move_to_device_except_swap_blocks(device)
 
     network = lora_flux_2.create_arch_network(1.0, 4, 4, None, [], model, use_dora=True)

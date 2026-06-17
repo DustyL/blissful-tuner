@@ -29,7 +29,7 @@ from torch.utils.checkpoint import checkpoint
 from accelerate import init_empty_weights
 
 from musubi_tuner.modules.attention import AttentionParams, attention
-from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
@@ -490,18 +490,17 @@ class ZImageTransformer2DModel(nn.Module):
 
         logger.info("Z-Image: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
+    def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig):
         self.blocks_to_swap = num_blocks
 
         assert self.blocks_to_swap <= self.num_blocks - 2, (
             f"Cannot swap more than {self.num_blocks - 2} double blocks. Requested {self.blocks_to_swap} double blocks."
         )
 
-        self.offloader = ModelOffloader(
-            "double", self.layers, len(self.layers), self.blocks_to_swap, supports_backward, device, use_pinned_memory
-        )
+        self.offloader = create_offloader("double", self.layers, len(self.layers), self.blocks_to_swap, config)
         logger.info(
-            f"Z-Image: Block swap enabled. Swapping {num_blocks} of {self.num_blocks} blocks to device {device}. Supports backward: {supports_backward}"
+            f"Z-Image: Block swap enabled. Swapping {num_blocks} of {self.num_blocks} blocks to device {config.device}. "
+            f"Supports backward: {config.supports_backward}. H2D-only: {config.h2d_only}"
         )
 
     def switch_block_swap_for_inference(self):

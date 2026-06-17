@@ -20,6 +20,7 @@ from musubi_tuner.networks import lora_flux
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, synchronize_device, setup_parser_compile
 from musubi_tuner.utils import model_utils
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.wan_generate_video import merge_lora_weights
 from blissful_tuner.latent_preview import LatentPreviewer
 from blissful_tuner.guidance import parse_scheduled_cfg, apply_zerostar_scaling
@@ -316,9 +317,8 @@ def optimize_model(model: flux_models.Flux, args: argparse.Namespace, device: to
 
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(
-            args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
-        )
+        swap_config = BlockSwapConfig(device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap)
+        model.enable_block_swap(args.blocks_to_swap, swap_config)
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:

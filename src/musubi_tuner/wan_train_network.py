@@ -9,6 +9,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
 from musubi_tuner.hv_train_network import (
     DiTOutput,
@@ -646,10 +647,21 @@ class WanNetworkTrainer(NetworkTrainer):
             )
             # if args.force_v2_1_time_embedding:
             #    model_high_noise.set_time_embedding_v2_1(True)
+
+            # Freeze the high-noise expert before block-swap setup: it is a frozen base for LoRA
+            # training (only the adapters train). The base trainer freezes the main/low-noise
+            # transformer after load_transformer() returns, but this expert is set up here, so it
+            # must be frozen explicitly first. Required for H2D-only block swap, whose offloader
+            # asserts frozen base weights (without this, --block_swap_h2d_only dual-expert WAN runs
+            # trip the guard at setup).
+            model_high_noise.eval()
+            model_high_noise.requires_grad_(False)
             if self.blocks_to_swap > 0:
                 # This moves the weights to the appropriate device
                 logger.info(f"Prepare block swap for high noise model, blocks_to_swap={self.blocks_to_swap}")
-                model_high_noise.enable_block_swap(self.blocks_to_swap, accelerator.device, supports_backward=True)
+                model_high_noise.enable_block_swap(
+                    self.blocks_to_swap, BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+                )
                 model_high_noise.move_to_device_except_swap_blocks(accelerator.device)
                 model_high_noise.prepare_block_swap_before_forward()
 

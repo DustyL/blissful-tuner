@@ -505,6 +505,15 @@ canonical direct-kwargs pattern with pre-allocation guard assertions.
 
 ```bash
 --blocks_to_swap N            # Swap N blocks to CPU (max 39 for 14B)
+--block_swap_h2d_only         # H2D-only block swap (LoRA/frozen-base ONLY): keeps pinned CPU masters,
+                              #   copies Host→Device only (no D2H), ~25-33% faster at heavy swap. REQUIRES
+                              #   --gradient_checkpointing (from_args raises otherwise); full-FT rejected
+                              #   (asserts frozen base). Wired all archs (training) + factory. ⚠ RUNTIME-GATE
+                              #   before prod Klein: torch.compile (Parameter-object swap vs classic .data),
+                              #   --fp8_scaled (_scaled_mm layout on ring views), prior-teacher re-prepare
+                              #   cost/correctness. See docs/block_swap.md "runtime-gating".
+--block_swap_ring_size N      # (with --block_swap_h2d_only) GPU ring buffers: 2=double-buffer (default),
+                              #   1=min VRAM, no overlap (good with --fp8_base)
 --fp8_base                    # FP8 for DiT. NOTE: alone = blunt full-model fp8 cast (norms/modulation
                               #   included) → WAN 2.2's TP-03 guard rejects it. For WAN, PAIR with --fp8_scaled.
 --fp8_scaled                  # Per-layer scaled fp8 (requires --fp8_base): quantizes only .weight, excludes
@@ -569,11 +578,32 @@ in `modules/lora_ema_teacher.py`) iterate `network.named_parameters()` where
 never touch transformer parameters and therefore cannot disturb block-swap
 state. This is true by construction, not by luck.
 
+**H2D-only offloader (`--block_swap_h2d_only`, ported from upstream `9bfc5a4`).**
+`create_offloader()` (`modules/custom_offloading_utils.py`) selects `LoRAStreamOffloader`
+(frozen-base, Host→Device-only streaming into a GPU ring) over the classic `ModelOffloader`
+when `BlockSwapConfig.h2d_only` is set. The invariant helpers above are compatible **by
+construction**: `LoRAStreamOffloader` exposes the same `prepare_block_devices_before_forward`
+/ `set_forward_only` / `wait_for_block` surface, so `restore_block_swap_after_no_grad_forward`
+→ `prepare_block_swap_before_forward()` re-prepares the ring correctly (rebinds streamed
+blocks to their CPU masters, then preloads `ring_size` ranks). Two H2D-specific facts: (1) it
+**requires `--gradient_checkpointing`** for training — the ring's in-place `copy_` bumps the
+saved weight's autograd version, and only recompute-at-backward keeps it consistent
+(`from_args` raises early otherwise; `tests/test_h2d_block_swap.py` proves both the guard and
+the without-checkpointing failure); (2) the prior-teacher no_grad forward fires a **re-prepare
+every step**, which defeats the "ring survives the turnaround" optimization (a per-step
+cold-start H2D of `ring_size` blocks). NOT yet validated against this fork's compile /
+`--fp8_scaled` production path — see `docs/block_swap.md` "runtime-gating" before enabling in a
+real Klein run.
+
 Guarded by:
 - `tests/test_block_swap_prior_restore.py` — 7 tests covering the helper's
   safety guard, prior teacher no-grad restore, sample-mode switch round-trip,
   EMA non-interference, exception-path cleanup in `sample_images()`, and
   combined EMA + LoRA(DoRA) + block swap + restore + student backward.
+- `tests/test_h2d_block_swap.py` — H2D-only: `BlockSwapConfig.from_args` guards
+  (gradient_checkpointing requirement, ring_size, inference exemption), factory
+  routing, frozen-base assertion, and a CUDA forward/backward **parity** smoke
+  (no-swap reference == H2D output + gradients) including the re-prepare round-trip.
 - `tests/manual/test_flux2_block_swap_smoke.py` — real-checkpoint smoke
   (gated behind `--run-manual`) that loads FLUX.2 Klein-9B, enables block
   swap, applies DoRA LoRA, optionally compiles each block, runs an EMA
