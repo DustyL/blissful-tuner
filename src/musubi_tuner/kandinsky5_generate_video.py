@@ -19,6 +19,7 @@ from musubi_tuner.kandinsky5.generation_utils import (
 from musubi_tuner.kandinsky5.models.text_embedders import get_text_embedder
 from musubi_tuner.kandinsky5_train_network import Kandinsky5NetworkTrainer
 from musubi_tuner.hv_train_network import clean_memory_on_device
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.networks import lora_kandinsky
 from musubi_tuner.utils.lora_utils import (
     convert_diffusers_if_needed,
@@ -336,7 +337,9 @@ def main():
                 dit.dtype = dit_weight_dtype
 
             if args.blocks_to_swap and args.blocks_to_swap > 0:
-                dit.enable_block_swap(args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=False)
+                dit.enable_block_swap(
+                    args.blocks_to_swap, BlockSwapConfig(device, supports_backward=False, use_pinned_memory=False)
+                )
                 dit.move_to_device_except_swap_blocks(device)
 
             if hasattr(dit, "switch_block_swap_for_inference"):

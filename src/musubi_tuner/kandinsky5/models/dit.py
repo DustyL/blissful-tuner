@@ -24,7 +24,7 @@ from .nn import (
 )
 from .utils import fractal_flatten, fractal_unflatten
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
-from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 
 from blissful_tuner.blissful_logger import BlissfulLogger
 
@@ -137,8 +137,8 @@ class DiffusionTransformer3D(nn.Module):
 
         # block swap state
         self.blocks_to_swap = None
-        self.offloader_visual: ModelOffloader | None = None
-        self.offloader_text: ModelOffloader | None = None
+        self.offloader_visual = None
+        self.offloader_text = None
         self.num_text_blocks = len(self.text_transformer_blocks)
         self.num_visual_blocks = len(self.visual_transformer_blocks)
         self.gradient_checkpointing = False
@@ -273,7 +273,7 @@ class DiffusionTransformer3D(nn.Module):
         return state_dict
 
     # Offloading
-    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
+    def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig):
         self.blocks_to_swap = num_blocks
         if num_blocks <= 0:
             return
@@ -283,23 +283,9 @@ class DiffusionTransformer3D(nn.Module):
         visual_to_swap = min(visual_to_swap, self.num_visual_blocks - 1)
 
         if text_to_swap > 0:
-            self.offloader_text = ModelOffloader(
-                "text",
-                self.text_transformer_blocks,
-                self.num_text_blocks,
-                text_to_swap,
-                supports_backward,
-                device,
-                use_pinned_memory,
-            )
-        self.offloader_visual = ModelOffloader(
-            "visual",
-            self.visual_transformer_blocks,
-            self.num_visual_blocks,
-            visual_to_swap,
-            supports_backward,
-            device,
-            use_pinned_memory,
+            self.offloader_text = create_offloader("text", self.text_transformer_blocks, self.num_text_blocks, text_to_swap, config)
+        self.offloader_visual = create_offloader(
+            "visual", self.visual_transformer_blocks, self.num_visual_blocks, visual_to_swap, config
         )
         logger.info(f"Kandinsky5: block swap enabled. text={text_to_swap}, visual={visual_to_swap}")
 

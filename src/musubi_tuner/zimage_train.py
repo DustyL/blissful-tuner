@@ -39,6 +39,7 @@ from musubi_tuner.hv_train_network import (
 import logging
 
 from musubi_tuner.zimage_train_network import ZImageNetworkTrainer
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.lora_utils import inject_ss_base_sha256_metadata
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
@@ -209,10 +210,17 @@ class ZImageTrainer(ZImageNetworkTrainer):
         transformer = self.load_transformer(accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_dtype)
 
         if blocks_to_swap > 0:
+            if getattr(args, "block_swap_h2d_only", False):
+                raise ValueError(
+                    "--block_swap_h2d_only is only valid for frozen-base (LoRA/LoHa/LoKr) training; "
+                    "full fine-tuning updates the base weights, so H2D-only block swap cannot be used. "
+                    "Remove --block_swap_h2d_only (classic block swap via --blocks_to_swap still works)."
+                )
             logger.info(f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}")
-            transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
+            swap_config = BlockSwapConfig(
+                accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
             )
+            transformer.enable_block_swap(blocks_to_swap, swap_config)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
 
         if args.gradient_checkpointing:
