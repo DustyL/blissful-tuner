@@ -1457,6 +1457,19 @@ class NetworkTrainer:
         inject_ss_base_sha256_metadata(args, md)
         return md
 
+    def extra_minimum_metadata_keys(self) -> list[str]:
+        """Architecture-specific ``ss_*`` keys to retain under ``--no_metadata`` (in addition to
+        SS_METADATA_MINIMUM_KEYS). For keys that are part of the checkpoint's numerical execution
+        contract -- i.e. generation produces wrong output without them -- not optional provenance.
+        Default: none. Subclasses override to return their essential keys."""
+        return []
+
+    def _build_minimum_metadata(self, metadata: dict) -> dict:
+        """Filter ``metadata`` down to the keys retained under ``--no_metadata``: the base network
+        reconstruction keys plus any architecture-specific essential keys (extra_minimum_metadata_keys)."""
+        keys = SS_METADATA_MINIMUM_KEYS + list(self.extra_minimum_metadata_keys())
+        return {key: metadata[key] for key in keys if key in metadata}
+
     def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
         """Returns additional log entries to merge into the per-step log payload.
 
@@ -2065,11 +2078,8 @@ class NetworkTrainer:
 
         metadata = {k: str(v) for k, v in metadata.items()}
 
-        # make minimum metadata for filtering
-        minimum_metadata = {}
-        for key in SS_METADATA_MINIMUM_KEYS:
-            if key in metadata:
-                minimum_metadata[key] = metadata[key]
+        # make minimum metadata for filtering (base network keys + any architecture-essential keys)
+        minimum_metadata = self._build_minimum_metadata(metadata)
 
         if accelerator.is_main_process:
             init_kwargs = {}

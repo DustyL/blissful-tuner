@@ -22,3 +22,8 @@ IDEOGRAM4_LATENT_LAYOUT_KEY = "ideogram4_latent_layout"
 IDEOGRAM4_LATENT_LAYOUT_GRID_CHW = "grid_chw"
 IDEOGRAM4_LATENT_SPACE_KEY = "ideogram4_latent_space"
 IDEOGRAM4_LATENT_SPACE_DIT_TOKENS = "ideogram4_dit_tokens"
+
+# Timestep conditioning regime, recorded in LoRA metadata so generation reproduces the trained regime
+# (fp32 corrected vs legacy bf16). Single source of truth shared by the trainer (stamp + minimum-metadata
+# retention) and the generator (auto-resolution). True/False is stored str()'d ("True"/"False").
+IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY = "ss_ideogram4_fp32_timestep"

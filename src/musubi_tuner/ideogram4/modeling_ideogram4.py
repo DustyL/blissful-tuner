@@ -373,6 +373,10 @@ class Ideogram4Transformer(nn.Module):
 
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
+        # Timestep conditioning precision. Default False = legacy: cast t to the (bf16) compute dtype in
+        # forward(); True = keep t in fp32 (the corrected regime). See forward() for why this matters.
+        # Set from --ideogram4_fp32_timestep by the trainer/generator after load (before any wrap/compile).
+        self.fp32_timestep = False
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False) -> None:
         # Base trainer calls this with args.gradient_checkpointing_cpu_offload (trainer_base.py:1661). The
@@ -435,7 +439,14 @@ class Ideogram4Transformer(nn.Module):
 
         param_dtype = getattr(self.input_proj, "compute_dtype", None) or self.input_proj.weight.dtype
         x = x.to(param_dtype)
-        t = t.to(param_dtype)
+        # t feeds Ideogram4EmbedScalar, which re-upcasts to fp32 (line ~294) and applies a 1e4 sinusoidal
+        # scale that amplifies any rounding -- so casting t to the (bf16) param dtype here is a lossy
+        # round-trip with no compute benefit (timestep-embedding cosine ~0.79 vs fp32). EmbedScalar casts
+        # its OUTPUT back to compute dtype regardless, so this flag changes ONLY the sinusoidal precision;
+        # no downstream tensor changes dtype. Default (legacy) keeps the bf16 cast -- the regime every
+        # pre-2026-06 Ideogram adapter was trained AND sampled under; --ideogram4_fp32_timestep opts into
+        # the corrected fp32 conditioning. See docs/ideogram4.md.
+        t = t.to(torch.float32) if self.fp32_timestep else t.to(param_dtype)
         llm_features = llm_features.to(param_dtype)
 
         indicator = indicator.to(torch.long)

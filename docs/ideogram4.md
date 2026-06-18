@@ -93,9 +93,36 @@ architecture registry). See `docs/loha_lokr.md`.
 | `--ideogram4_timestep_std` | `1.0` | std of the logit-normal training-timestep schedule. Larger values push more mass into the low-noise / detail-refinement tail (e.g. `1.5` ≈ 11.6% of steps below traditional noise timestep 250 on the [0, 1000] convention, vs ≈ 3.6% at `1.0`, same median). A worthwhile A/B knob; `1.0` is the blissful default. |
 | `--ideogram4_timestep_mu` | resolution-derived | known mean for the logit-normal schedule (resolution-aware by default). |
 | `--ideogram4_sample_guidance` | unset | overrides the CFG scale for **training-time sample images only** (must be finite and > 0). Does not affect the trained weights. |
+| `--ideogram4_fp32_timestep` | off (legacy bf16) | keep the timestep in fp32 through the DiT time-embedding (corrected conditioning). See **Timestep precision** below. |
 
 > Note: `--fp8_base` / `--fp8_scaled` are accepted for CLI compatibility but ignored for Ideogram 4
 > (fp8 loading is automatic via the pre-quantized shim). They emit a warning if set.
+
+### Timestep precision
+
+The DiT forward historically cast the flow-matching timestep `t` to the bf16 compute dtype before the
+time embedding. Because `Ideogram4EmbedScalar` re-upcasts to fp32 and multiplies by a 1e4 sinusoidal
+scale, that cast is a lossy round-trip whose error is amplified into the embedding (a standalone probe
+measured ~0.79 cosine vs the fp32 embedding). `--ideogram4_fp32_timestep` keeps `t` in fp32, matching the
+precision the frozen base was trained for. It changes **only** the sinusoidal computation — every
+downstream tensor keeps the same dtype either way.
+
+- **Default is legacy bf16** (behavior-preserving): every pre-2026-06 Ideogram adapter was trained *and*
+  sampled under the bf16 cast, so they remain bit-consistent. A/B the fp32 regime before adopting it
+  widely. The trainer flag is `--ideogram4_fp32_timestep` / `--no-ideogram4_fp32_timestep`.
+- **The regime is recorded** in the LoRA metadata (`ss_ideogram4_fp32_timestep`), and is retained even
+  under `--no_metadata` (it governs how the checkpoint must be run, not optional provenance).
+- **Generation auto-inherits it.** `ideogram4_generate_image.py` reads that metadata and matches each
+  adapter's trained regime by default, avoiding a silent train/inference mismatch. When the regime is
+  genuinely ambiguous it refuses to guess and fails fast with a one-line fix:
+    - a stack whose adapters disagree (one fp32, one legacy), or an fp32 adapter mixed with an
+      **unstamped** adapter (which may be an old bf16 adapter *or* an upstream-native fp32 one), → error;
+    - all-unstamped or all-legacy → legacy bf16 (with a warning for unstamped);
+    - a malformed stamp → error.
+  Pass `--ideogram4_fp32_timestep` / `--no-ideogram4_fp32_timestep` to force the regime explicitly (this
+  short-circuits metadata resolution — the escape hatch for mixed/unstamped stacks and A/Bs). Note the
+  intentional asymmetry: the trainer flag *defines* the regime (default legacy), the generator flag
+  *inherits* it (default auto-from-metadata).
 
 ## Mask-weighted loss & prior preservation
 

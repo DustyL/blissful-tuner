@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sys
 
 import numpy as np
 import torch
@@ -9,6 +10,7 @@ from safetensors import safe_open
 import musubi_tuner.networks.lora_ideogram4 as lora_ideogram4
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_IDEOGRAM4
 from musubi_tuner.ideogram4.caption_verifier import verify_caption
+from musubi_tuner.ideogram4.constants import IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY
 from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
 from musubi_tuner.ideogram4.ideogram4_utils import (
     decode_dit_tokens_to_pixels,
@@ -53,6 +55,81 @@ def _resolve_multipliers(lora_weights: list[str], lora_multipliers: list[float] 
             f"({len(lora_weights)}), or be a single value to broadcast, or be omitted (all 1.0)."
         )
     return [float(m) for m in lora_multipliers]
+
+
+_FORCE_HINT = "Pass --ideogram4_fp32_timestep / --no-ideogram4_fp32_timestep to choose the regime explicitly."
+
+
+def _read_lora_timestep_regime(path: str) -> bool | None:
+    """Read one LoRA's stamped timestep regime: True/False, or None if the adapter carries no stamp
+    (unknown -- e.g. a pre-2026-06 blissful adapter or an upstream-native adapter that does not write
+    this key) or its metadata could not be read. Raises ValueError on a present-but-malformed stamp."""
+    try:
+        with safe_open(path, framework="pt") as f:
+            md = f.metadata() or {}
+    except Exception as e:  # metadata-only reopen; tensors already loaded successfully upstream
+        logger.warning(f"could not read metadata from {path} ({e}); treating its timestep regime as unknown")
+        return None
+    raw = md.get(IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY)
+    if raw is None:
+        return None
+    normalized = str(raw).strip().lower()
+    if normalized in ("true", "1"):
+        return True
+    if normalized in ("false", "0"):
+        return False
+    raise ValueError(f"{path}: invalid {IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY}={raw!r} (expected true/false).")
+
+
+def _resolve_generation_timestep_regime(flag: bool | None, lora_weights: list[str] | None) -> bool:
+    """Resolve the DiT timestep conditioning regime for generation so it matches the trained regime.
+
+    An explicit flag (True / False) always wins. Otherwise inherit it from the loaded LoRAs'
+    ``ss_ideogram4_fp32_timestep`` metadata. Unstamped adapters count as UNKNOWN (not silently legacy),
+    because "missing" can mean a pre-2026-06 bf16 adapter OR an upstream-native fp32 adapter. When the
+    regime is genuinely ambiguous (a true/false conflict, or an fp32 stamp mixed with unknowns) this
+    refuses to guess and raises -- the caller turns that into a clean fail-fast. Falls back to legacy
+    bf16 (with a warning) only when nothing positively requests fp32.
+    """
+    if flag is not None:
+        logger.info(f"Ideogram 4 timestep conditioning: {'fp32' if flag else 'bf16 (legacy)'} (explicit flag)")
+        return flag
+
+    if not lora_weights:
+        logger.info("Ideogram 4 timestep conditioning: bf16 (legacy) -- base generation, no adapters.")
+        return False
+
+    regimes = {path: _read_lora_timestep_regime(path) for path in lora_weights}
+    known = {p: r for p, r in regimes.items() if r is not None}
+    unknown = [p for p, r in regimes.items() if r is None]
+    known_values = set(known.values())
+
+    if len(known_values) > 1:
+        raise ValueError(f"Stacked LoRAs disagree on the timestep regime ({known}). {_FORCE_HINT}")
+    if known_values == {True}:
+        if unknown:
+            raise ValueError(
+                f"fp32-trained LoRA(s) {list(known)} are stacked with unstamped/unknown-regime LoRA(s) {unknown}; "
+                f"the correct regime is ambiguous. If they are all fp32, pass --ideogram4_fp32_timestep. {_FORCE_HINT}"
+            )
+        logger.info("Ideogram 4 timestep conditioning: fp32 (all adapters stamped fp32).")
+        return True
+
+    # known_values is empty or {False}: nothing positively requests fp32 -> legacy bf16.
+    if unknown:
+        logger.warning(
+            f"{len(unknown)} adapter(s) carry no timestep regime stamp ({unknown}); assuming legacy bf16. "
+            "If one was trained with --ideogram4_fp32_timestep, pass it explicitly at generation."
+        )
+    else:
+        logger.info("Ideogram 4 timestep conditioning: bf16 (legacy) -- all adapters stamped legacy.")
+    return False
+
+
+def _apply_timestep_regime(conditional, unconditional, fp32_timestep: bool) -> None:
+    """Apply the resolved timestep regime to BOTH DiTs (the two-DiT invariant for asymmetric CFG)."""
+    conditional.fp32_timestep = fp32_timestep
+    unconditional.fp32_timestep = fp32_timestep
 
 
 def apply_lora_weights_runtime(
@@ -163,6 +240,14 @@ def setup_parser() -> argparse.ArgumentParser:
         help="multiplier(s) for --lora_weight: omit for all-1.0, give ONE value to broadcast to every "
         "weight, or match counts exactly (mismatched counts error out)",
     )
+    parser.add_argument(
+        "--ideogram4_fp32_timestep",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="timestep conditioning regime for the DiT. Omit (default) to AUTO-inherit the regime each "
+        "--lora_weight was trained under (ss_ideogram4_fp32_timestep metadata), avoiding a silent "
+        "train/inference mismatch; pass --ideogram4_fp32_timestep / --no-ideogram4_fp32_timestep to force it.",
+    )
     return parser
 
 
@@ -172,6 +257,14 @@ def main():
     dtype = str_to_dtype(args.dtype)
     height, width = args.image_size
     preset = PRESETS[args.sampler_preset]
+
+    # Resolve the timestep regime FIRST (metadata-only LoRA reads), before loading the text encoder and
+    # the ~19 GB of DiTs, so an ambiguous/invalid-metadata stack fails fast rather than after a long load.
+    try:
+        fp32_timestep = _resolve_generation_timestep_regime(args.ideogram4_fp32_timestep, args.lora_weight)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(2)
 
     # 1. Encode the prompt, then free the text encoder before loading the (large) DiTs.
     verify_caption(args.prompt, strict=args.strict_caption_verifier)  # H4: warn-only by default
@@ -200,6 +293,9 @@ def main():
     lora_networks = []
     if args.lora_weight:
         lora_networks = apply_lora_weights_runtime(conditional, args.lora_weight, args.lora_multiplier, device, dtype)
+
+    # Apply the regime (resolved early, above) to BOTH DiTs before denoise.
+    _apply_timestep_regime(conditional, unconditional, fp32_timestep)
 
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     logger.info(f"Denoising: {preset.num_steps} steps, preset {args.sampler_preset}")

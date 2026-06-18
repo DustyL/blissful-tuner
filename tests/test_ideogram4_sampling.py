@@ -126,7 +126,7 @@ def test_do_inference_reloads_unconditional_when_freed(monkeypatch):
 
     def fake_load(*a, **k):
         loads["n"] += 1
-        return "RELOADED"
+        return SimpleNamespace()  # attribute-settable (the trainer sets .fp32_timestep on the loaded DiT)
 
     monkeypatch.setattr(m.ideogram4_utils, "load_ideogram4_transformer", fake_load)
     monkeypatch.setattr(m, "denoise_ideogram4_to_tokens", lambda cond, uncond, tf, **k: (torch.zeros(1, 16, 128), 4, 4))
@@ -143,6 +143,32 @@ def test_do_inference_reloads_unconditional_when_freed(monkeypatch):
     trainer.do_inference(_cpu_accel(), args, sp, vae, torch.bfloat16, "COND", None, None, 64, 64, 1, None, False, None, None)
     assert loads["n"] == 1, "reloaded the unconditional DiT when a prior prompt had freed it"
     assert trainer._sample_unconditional_dit is None, "freed again before its own decode"
+
+
+def test_do_inference_sets_uncond_timestep_regime(monkeypatch):
+    # Seam regression-proofing: the lazily-loaded unconditional DiT must receive the configured
+    # timestep regime so training samples match the trained path (a future refactor dropping the
+    # assignment would otherwise go unnoticed).
+    seen = {}
+    monkeypatch.setattr(m.ideogram4_utils, "load_ideogram4_transformer", lambda *a, **k: SimpleNamespace())
+
+    def fake_denoise(cond, uncond, tf, **k):
+        seen["uncond_fp32"] = uncond.fp32_timestep
+        return (torch.zeros(1, 16, 128), 4, 4)
+
+    monkeypatch.setattr(m, "denoise_ideogram4_to_tokens", fake_denoise)
+    monkeypatch.setattr(m.ideogram4_utils, "decode_dit_tokens_to_pixels", lambda ae, z, **k: torch.rand(1, 3, 64, 64))
+    monkeypatch.setattr(m, "clean_memory_on_device", lambda d: None)
+
+    trainer = Ideogram4NetworkTrainer()
+    trainer.dit_dtype = torch.bfloat16
+    trainer._sample_unconditional_dit = None
+    vae = SimpleNamespace(to=lambda d: None)
+    args = SimpleNamespace(sampler_preset="V4_TURBO_12", unconditional_dit="u.safetensors", ideogram4_fp32_timestep=True)
+    sp = {"i4_llm_features": torch.randn(3, 53248)}
+
+    trainer.do_inference(_cpu_accel(), args, sp, vae, torch.bfloat16, "COND", None, None, 64, 64, 1, None, False, None, None)
+    assert seen["uncond_fp32"] is True, "unconditional sample DiT inherits the configured timestep regime"
 
 
 def test_block_swap_switches_are_noops_so_sampler_does_not_crash():
