@@ -158,5 +158,32 @@ class LoRAResidualNoOps(unittest.TestCase):
         self.assertTrue(torch.equal(base(x), lora.org_forward(x)))
 
 
+class LoRAResidualAutocastNoOp(unittest.TestCase):
+    """Under autocast, org_forward(x) and the adapter output share the autocast dtype, so 'round the
+    delta then add' and 'add then round' collapse to the SAME expression -- the change is a bitwise
+    no-op for every autocast architecture (WAN / HV / FLUX.2). This is the standing guard for that
+    dtype-confluence invariant; the divergence tests above only cover the no-autocast Ideogram-class
+    regime where the two output dtypes differ. Runs on CPU autocast -- no GPU needed."""
+
+    def _check(self, split_dims):
+        in_f, out_f, lora_dim = 64, (96 if split_dims else 64), 8
+        # fp32 master weights + adapter under bf16 autocast == the canonical mixed-precision setup.
+        base, lora = _make_lora(in_f, out_f, lora_dim, torch.float32, split_dims=split_dims)
+        x = _fixed((4, in_f), torch.float32)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            actual = base(x)  # NEW code: the real wrapped forward (also exercises the x.to(lora_dtype) cast)
+            org = lora.org_forward(x)
+            lx = _recompute_lx(lora, x)
+            old = org + lx.to(org.dtype) * lora.multiplier * lora.scale  # round-delta-first (OLD)
+        self.assertEqual(actual.dtype, torch.bfloat16, "autocast output is the autocast dtype")
+        self.assertTrue(torch.equal(actual, old), "under autocast the change is a bitwise no-op (dtype confluence)")
+
+    def test_normal_path_autocast_is_noop(self):
+        self._check(split_dims=None)
+
+    def test_split_dims_path_autocast_is_noop(self):
+        self._check(split_dims=[32, 32, 32])
+
+
 if __name__ == "__main__":
     unittest.main()
