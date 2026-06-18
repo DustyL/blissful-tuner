@@ -655,9 +655,14 @@ class LoRAModule(torch.nn.Module):
                 dora_delta = self._dora_delta(org_forwarded, lx.to(org_forwarded.dtype), scale)
                 return org_forwarded + dora_delta
             else:
-                # Cast back to base's dtype before adding so addition doesn't promote the
-                # output dtype (e.g., fp32 LoRA output + bf16 base would otherwise become fp32).
-                return org_forwarded + lx.to(org_forwarded.dtype) * self.multiplier * scale
+                # Scale and add the delta in its (possibly higher-precision) adapter dtype -- fp32 in the
+                # current pipeline -- then round the SUM to the base dtype exactly once, rather than
+                # prematurely quantizing+scaling the delta in the base dtype and rounding the sum again.
+                # Numerically better (most at higher multiplier/scale): the bf16 training output becomes
+                # the correctly-rounded base-dtype approximation of the higher-precision residual sum.
+                # Still returns the base dtype so the add doesn't promote the output. multiplier==0 (and
+                # scale==0) stay bitwise no-ops (org + 0 -> base dtype); DoRA keeps its own delta path above.
+                return (org_forwarded + lx * self.multiplier * scale).to(org_forwarded.dtype)
         else:
             # All sub-loras share the same dtype (created together with the same nn.Linear default).
             lora_dtype = self.lora_down[0].weight.dtype
@@ -690,8 +695,10 @@ class LoRAModule(torch.nn.Module):
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
-            # Cast concatenated LoRA result back to base's dtype to preserve output dtype.
-            return org_forwarded + torch.cat(lxs, dim=-1).to(org_forwarded.dtype) * self.multiplier * scale
+            # Same one-rounding residual add as the non-split path: scale + add the concatenated delta in
+            # its (possibly higher-precision) adapter dtype, then round the sum to the base dtype once
+            # (preserves the output dtype).
+            return (org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale).to(org_forwarded.dtype)
 
 
 class LoRAInfModule(LoRAModule):
