@@ -61,23 +61,55 @@ def test_mrope_adjacent_image_positions_do_not_collapse_under_autocast():
     assert not torch.allclose(cos_ac[0, 0], cos_ac[0, 1])
 
 
+def test_mrope_autocast_is_a_noop_at_production_geometry():
+    # Real Ideogram/Klein MRoPE geometry (head_dim=256, base=5e6, sections 24/20/20). Guards against a
+    # future change to the interleaving / section lengths that leaves the tiny synthetic case green
+    # while breaking the production configuration.
+    mrope = Ideogram4MRoPE(head_dim=256, base=5_000_000, mrope_section=(24, 20, 20)).eval()
+    position_ids = _image_position_ids(8)
+    cos_ref, sin_ref = mrope(position_ids)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        cos_ac, sin_ac = mrope(position_ids)
+    assert torch.equal(cos_ref, cos_ac)
+    assert torch.equal(sin_ref, sin_ac)
+
+
 # ----------------------------------------------------------------------------------------------------
 # Item 3: non-float8 dtype rejection in the pre-quantized fp8 loader
 # ----------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8])
-def test_prequant_loader_rejects_one_byte_integer_weights(dtype):
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.bool])
+def test_prequant_loader_rejects_one_byte_non_float8_weights(dtype):
+    # int8/uint8/bool .weight tensors are one byte wide but NOT float8 -> reject precisely instead of
+    # letting the patcher reinterpret their bytes as fp8.
     weight = torch.zeros(4, 4, dtype=dtype)
-    with pytest.raises(ValueError, match="not float8"):
+    with pytest.raises(ValueError, match="one-byte non-float8"):
         convert_prequantized_fp8_tensor("blocks.0.attn.qkv.weight", weight, torch.bfloat16)
 
 
-def test_prequant_loader_keeps_fp8_weight_as_is():
-    weight = torch.zeros(4, 4, dtype=torch.float8_e4m3fn)
+def test_prequant_loader_rejects_non_floating_scale():
+    # An integer .weight_scale would silently cast to bf16 and corrupt dequantization -> reject it.
+    scale = torch.zeros(4, dtype=torch.int8)
+    with pytest.raises(ValueError, match="floating"):
+        convert_prequantized_fp8_tensor("blocks.0.attn.qkv.weight_scale", scale, torch.bfloat16)
+
+
+def test_prequant_loader_passes_non_weight_integer_buffer():
+    # A legitimate non-weight integer buffer (not a .weight key) must NOT be rejected; the guard is
+    # scoped to weight keys so it loads into its own model buffer untouched.
+    buf = torch.arange(8, dtype=torch.uint8)
+    key, value = convert_prequantized_fp8_tensor("blocks.0.some_int_buffer", buf, torch.bfloat16)
+    assert key == "blocks.0.some_int_buffer"
+    assert value.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_prequant_loader_keeps_fp8_weight_as_is(fp8_dtype):
+    weight = torch.zeros(4, 4, dtype=fp8_dtype)
     key, value = convert_prequantized_fp8_tensor("blocks.0.attn.qkv.weight", weight, torch.bfloat16)
     assert key == "blocks.0.attn.qkv.weight"
-    assert value.dtype == torch.float8_e4m3fn  # fp8 native weight is preserved, not rejected
+    assert value.dtype == fp8_dtype  # both fp8 native dtypes are preserved, not rejected
 
 
 def test_prequant_loader_casts_plain_float_weight_to_compute_dtype():
@@ -134,3 +166,12 @@ def test_sai_model_spec_ideogram4_defaults_to_1024():
 
     metadata = sai_model_spec.build_metadata(None, ARCHITECTURE_IDEOGRAM4, 0.0)
     assert metadata["modelspec.resolution"] == "1024x1024"
+
+
+def test_sai_model_spec_ideogram4_does_not_override_explicit_resolution():
+    from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_IDEOGRAM4
+    from musubi_tuner.utils import sai_model_spec
+
+    # The new default branch only fires when reso is unset; an explicit reso must still win.
+    metadata = sai_model_spec.build_metadata(None, ARCHITECTURE_IDEOGRAM4, 0.0, reso=(768, 1024))
+    assert metadata["modelspec.resolution"] == "768x1024"
