@@ -62,6 +62,18 @@ def convert_prequantized_fp8_tensor(
         new_key = key.removesuffix(".weight_scale") + ".scale_weight"
         return new_key, _reshape_scale_weight(value).to(dtype=compute_dtype)
 
+    # A one-byte integer weight (uint8/int8) is NOT an fp8 weight, even though it shares the byte
+    # width. Reject it explicitly here rather than letting apply_fp8_monkey_patch reinterpret its
+    # bytes as float8 (silent garbage / late failure deep in the patched forward). Such a checkpoint
+    # is some other quantization (e.g. int8) and is not Ideogram-4 fp8-native. Guard ported from
+    # upstream musubi-tuner #975.
+    if value.dtype in (torch.uint8, torch.int8):
+        raise ValueError(
+            f"Ideogram 4 pre-quantized fp8 loader: tensor {key!r} has dtype {value.dtype}, a one-byte "
+            f"integer, not float8 (e4m3fn/e5m2). This checkpoint is not fp8-native (e.g. an int8/uint8 "
+            f"quantization); provide an fp8 or bf16/fp16 checkpoint."
+        )
+
     if value.is_floating_point() and not _is_fp8_dtype(value.dtype) and value.dtype != compute_dtype:
         if stats is not None:
             stats.cast_float_tensors += 1
