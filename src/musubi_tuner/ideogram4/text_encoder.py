@@ -16,6 +16,7 @@ ALL activation layers including the last. Verified equivalent to the native forw
 
 from __future__ import annotations
 
+import inspect
 import json
 import struct
 from typing import Union
@@ -138,6 +139,30 @@ def load_ideogram4_text_encoder(
     return model
 
 
+def _create_qwen_causal_mask(language_model, inputs_embeds, attention_mask, text_position_ids, cache_position):
+    """Build the Qwen3-VL causal mask, adapting to the installed transformers ``create_causal_mask``
+    signature: the ``input_embeds`` -> ``inputs_embeds`` parameter rename and the optional
+    ``cache_position`` argument. Keeps this manual decoder-drive robust across transformers versions
+    instead of hardcoding kwargs, which matters because blissful tracks transformers main (preferred
+    over a version pin). Native-parity is guarded by tests/test_ideogram4_text_encoder.py. Ported from
+    upstream musubi-tuner #975.
+    """
+    signature = inspect.signature(create_causal_mask)
+    kwargs = {
+        "config": language_model.config,
+        "attention_mask": attention_mask,
+        "past_key_values": None,
+        "position_ids": text_position_ids,
+    }
+    if "input_embeds" in signature.parameters:
+        kwargs["input_embeds"] = inputs_embeds
+    else:
+        kwargs["inputs_embeds"] = inputs_embeds
+    if "cache_position" in signature.parameters:
+        kwargs["cache_position"] = cache_position
+    return create_causal_mask(**kwargs)
+
+
 def _tap_qwen3_vl_text_layers(language_model, token_ids: torch.Tensor) -> list[torch.Tensor]:
     """Manual decoder-layer tap (text-only): return the pre-norm hidden states at QWEN3_VL_ACTIVATION_LAYERS.
 
@@ -153,12 +178,13 @@ def _tap_qwen3_vl_text_layers(language_model, token_ids: torch.Tensor) -> list[t
     mrope_position_ids = position_ids[1:]
 
     inputs_embeds = language_model.embed_tokens(token_ids)
-    attention_mask = create_causal_mask(
-        config=language_model.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=torch.ones(token_ids.shape, dtype=torch.long, device=device),
-        past_key_values=None,
-        position_ids=text_position_ids,
+    cache_position = torch.arange(seq_len, dtype=torch.long, device=device)
+    attention_mask = _create_qwen_causal_mask(
+        language_model,
+        inputs_embeds,
+        torch.ones(token_ids.shape, dtype=torch.long, device=device),
+        text_position_ids,
+        cache_position,
     )
     position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
 

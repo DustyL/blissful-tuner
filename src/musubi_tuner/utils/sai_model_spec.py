@@ -282,6 +282,8 @@ def build_metadata(
             reso = (1024, 1024)
         elif architecture == ARCHITECTURE_Z_IMAGE:
             reso = (1024, 1024)
+        elif architecture == ARCHITECTURE_IDEOGRAM4:
+            reso = (1024, 1024)
         else:
             reso = (1280, 720)
     if isinstance(reso, int):

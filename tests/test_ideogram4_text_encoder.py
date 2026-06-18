@@ -1,4 +1,3 @@
-import copy
 import os
 
 import pytest
@@ -7,36 +6,39 @@ import torch
 from musubi_tuner.ideogram4.constants import IDEOGRAM4_TE_FEATURE_DIM, QWEN3_VL_ACTIVATION_LAYERS
 from musubi_tuner.ideogram4.text_encoder import (
     _assert_hf_full_format,
+    _create_qwen_causal_mask,
     _tap_qwen3_vl_text_layers,
     inspect_te_checkpoint,
     load_ideogram4_text_encoder,
 )
 
-# Building a tiny native Qwen3-VL needs the local config (shrunk). Format-gate tests below don't.
+# The loader-path test (H6) needs a local Qwen3-VL config dir; the tiny-model tests below build their
+# own self-contained config so the crucial native checks run in CI rather than skipping.
 _TE_CONFIG_DIR = "/home/dustin/Ideogram-4/Huggingface-Model-Weights/text_encoder"
 _HAS_TE_CONFIG = os.path.isdir(_TE_CONFIG_DIR)
 _needs_config = pytest.mark.skipif(not _HAS_TE_CONFIG, reason="local Qwen3-VL config required")
 
 
 def _tiny_language_model():
+    """A tiny native Qwen3-VL language model from an inline config -- no local files required, so the
+    native-tap / native-parity checks run in CI instead of skipping. 36 narrow layers keep
+    QWEN3_VL_ACTIVATION_LAYERS (taps up to 35) valid (the real model has 36)."""
     from transformers import Qwen3VLConfig, Qwen3VLModel
 
-    cfg = copy.deepcopy(Qwen3VLConfig.from_pretrained(_TE_CONFIG_DIR, local_files_only=True))
-    # 36 tiny layers so QWEN3_VL_ACTIVATION_LAYERS (taps up to 35) are all valid (real model has 36).
-    for k, v in (
-        ("num_hidden_layers", 36),
-        ("hidden_size", 64),
-        ("intermediate_size", 128),
-        ("num_attention_heads", 4),
-        ("num_key_value_heads", 2),
-        ("head_dim", 16),
-    ):
-        setattr(cfg.text_config, k, v)
-    for k, v in (("depth", 2), ("hidden_size", 64), ("num_heads", 4), ("intermediate_size", 128), ("out_hidden_size", 64)):
-        if hasattr(cfg.vision_config, k):
-            setattr(cfg.vision_config, k, v)
+    text_config = dict(
+        vocab_size=200,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=36,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        rope_scaling={"rope_type": "default", "mrope_section": [4, 4, 4]},
+    )
+    vision_config = dict(depth=2, hidden_size=64, num_heads=4, intermediate_size=128, out_hidden_size=64)
     torch.manual_seed(0)
-    return Qwen3VLModel(cfg).eval().language_model
+    return Qwen3VLModel(Qwen3VLConfig(text_config=text_config, vision_config=vision_config)).eval().language_model
 
 
 def _write_st(path, tensors, metadata=None):
@@ -151,7 +153,6 @@ def test_loader_config_path_is_native_and_offline(monkeypatch):
 # --------------------------------------------------------------------------- native tap (tiny real Qwen3-VL)
 
 
-@_needs_config
 def test_tap_returns_13_layers_and_feature_shape():
     lm = _tiny_language_model()
     token_ids = torch.randint(1, 100, (1, 7))
@@ -163,13 +164,28 @@ def test_tap_returns_13_layers_and_feature_shape():
     assert torch.isfinite(stacked).all()
 
 
-@_needs_config
+def test_manual_tap_matches_native_hidden_states():
+    """The manual decoder-drive must reproduce transformers' native decoder-layer outputs bit-for-bit
+    at the 12 intermediate taps (proves the manual path -- and the adaptive causal-mask helper it uses
+    -- stays faithful to the installed transformers' decoder-forward contract; the manual-vs-manual
+    packed test below cannot catch a native-contract drift). The 13th/last tap (QWEN3_VL_ACTIVATION_
+    LAYERS[-1] = 35) is intentionally the RAW pre-final-norm output of the final decoder layer, which
+    transformers does not expose -- native hidden_states[-1] is POST final-norm -- so it has no native
+    counterpart and is excluded here."""
+    lm = _tiny_language_model()
+    token_ids = torch.randint(1, 100, (1, 7))
+
+    manual = _tap_qwen3_vl_text_layers(lm, token_ids)
+    native = lm(input_ids=token_ids, output_hidden_states=True, return_dict=True).hidden_states
+    # native.hidden_states[0] is the embedding; decoder layer i's output is native[i + 1].
+    for layer_idx, manual_state in zip(QWEN3_VL_ACTIVATION_LAYERS[:-1], manual[:-1]):
+        torch.testing.assert_close(manual_state, native[layer_idx + 1], rtol=0, atol=0)
+
+
 def test_text_only_equals_packed_text_slice():
     """GATE 8 (foundational): text-only features == the text slice of the canonical packed [text][image]
     sequence, justifying per-prompt (image-independent) caching. Image positions are masked + causal, text
     precedes image, text positions are local arange -> the text features cannot depend on the image."""
-    from transformers.masking_utils import create_causal_mask
-
     lm = _tiny_language_model()
     num_text = 5
     token_ids = torch.randint(1, 100, (1, num_text))
@@ -188,7 +204,8 @@ def test_text_only_equals_packed_text_slice():
     text_pos, mrope = pos_4d[0], pos_4d[1:]
 
     emb = lm.embed_tokens(packed)
-    cm = create_causal_mask(config=lm.config, inputs_embeds=emb, attention_mask=attn, past_key_values=None, position_ids=text_pos)
+    cache_position = torch.arange(total, dtype=torch.long)
+    cm = _create_qwen_causal_mask(lm, emb, attn, text_pos, cache_position)
     pe = lm.rotary_emb(emb, mrope)
     h = emb
     captured = {}

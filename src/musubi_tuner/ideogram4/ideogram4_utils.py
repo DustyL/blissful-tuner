@@ -57,10 +57,30 @@ def convert_prequantized_fp8_tensor(
         return None, None
 
     if key.endswith(".weight_scale"):
+        # An fp8 scale must be a real (floating) per-row/per-tensor scale. A non-floating scale
+        # (e.g. int8/uint8) would otherwise be cast to compute_dtype below and silently corrupt
+        # every dequantization downstream, so reject it explicitly here.
+        if not value.is_floating_point():
+            raise ValueError(
+                f"Ideogram 4 pre-quantized fp8 loader: scale {key!r} has non-floating dtype {value.dtype}; "
+                f"fp8 weight scales must be floating-point (e.g. fp32)."
+            )
         if stats is not None:
             stats.renamed_scales += 1
         new_key = key.removesuffix(".weight_scale") + ".scale_weight"
         return new_key, _reshape_scale_weight(value).to(dtype=compute_dtype)
+
+    # A target weight that is one byte wide but not a float8 dtype (uint8/int8/bool) is NOT an fp8
+    # weight, even though it shares the byte width. Reject it precisely rather than letting
+    # apply_fp8_monkey_patch reinterpret its bytes as float8 (silent garbage / late failure deep in
+    # the patched forward). Scoped to weight keys so legitimate non-weight integer buffers (which
+    # load into their own model buffers) pass through untouched. Guard ported from upstream #975.
+    if key.endswith(".weight") and value.element_size() == 1 and not _is_fp8_dtype(value.dtype):
+        raise ValueError(
+            f"Ideogram 4 pre-quantized fp8 loader: weight {key!r} has dtype {value.dtype}, a one-byte "
+            f"non-float8 type. This checkpoint is not fp8-native (e.g. an int8/uint8/bool quantization); "
+            f"provide an fp8 (e4m3fn/e5m2) or bf16/fp16 checkpoint."
+        )
 
     if value.is_floating_point() and not _is_fp8_dtype(value.dtype) and value.dtype != compute_dtype:
         if stats is not None:

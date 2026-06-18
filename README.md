@@ -227,7 +227,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [Z-Image](./docs/zimage.md)
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
-- [FLUX.2](./docs/flux_2.md)
+- [Ideogram 4](./docs/ideogram4.md)
 
 **Common Configuration & Usage:**
 - [Dataset Configuration](./docs/dataset_config.md)
