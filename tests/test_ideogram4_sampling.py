@@ -126,7 +126,7 @@ def test_do_inference_reloads_unconditional_when_freed(monkeypatch):
 
     def fake_load(*a, **k):
         loads["n"] += 1
-        return "RELOADED"
+        return SimpleNamespace()  # attribute-settable (the trainer sets .fp32_timestep on the loaded DiT)
 
     monkeypatch.setattr(m.ideogram4_utils, "load_ideogram4_transformer", fake_load)
     monkeypatch.setattr(m, "denoise_ideogram4_to_tokens", lambda cond, uncond, tf, **k: (torch.zeros(1, 16, 128), 4, 4))

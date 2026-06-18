@@ -546,6 +546,9 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         layout = getattr(self, "_ideogram4_fp8_layout", None)
         if layout:
             metadata["ss_ideogram4_fp8_scale_layout"] = layout  # per_row (HF) / per_tensor (Comfy) / ...
+        # Record the timestep conditioning regime so generation can reproduce it (avoids a silent
+        # train/inference skew). True = fp32 (corrected); False = legacy bf16.
+        metadata["ss_ideogram4_fp32_timestep"] = bool(getattr(args, "ideogram4_fp32_timestep", False))
         return metadata
 
     def scale_shift_latents(self, latents):
@@ -578,6 +581,9 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         # records ss_fp8_base=False because we neutralize the musubi fp8 flags, so the LoRA would otherwise
         # look like it was trained from a full-precision base.
         self._ideogram4_fp8_layout = ideogram4_utils.detect_fp8_scale_layout(transformer)
+        # Set the timestep regime on the raw module BEFORE accelerate.prepare/compile wraps it; the inner
+        # forward reads self.fp32_timestep, so it survives wrapping. Default False = legacy bf16.
+        transformer.fp32_timestep = getattr(args, "ideogram4_fp32_timestep", False)
         return transformer
 
     def call_dit(self, *args, **kwargs):
@@ -651,6 +657,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
             self._sample_unconditional_dit = ideogram4_utils.load_ideogram4_transformer(
                 args.unconditional_dit, dtype=self.dit_dtype, loading_device=device
             )
+            # Match the training transformer's timestep regime so training samples reflect the trained path.
+            self._sample_unconditional_dit.fp32_timestep = getattr(args, "ideogram4_fp32_timestep", False)
         # Denoise with both DiTs, then FREE the unconditional DiT BEFORE the VAE decode. Keeping both 9.4 GB DiTs
         # resident through a 1024 decode peaks ~30 GB and OOMs a 32 GB card; freeing first caps the peak ~21 GB
         # (cond = unwrapped training transformer, LoRA ACTIVE — so samples reflect the current adapter).
@@ -704,6 +712,13 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     )
     parser.add_argument(
         "--ideogram4_timestep_std", type=float, default=1.0, help="logit-normal schedule std for training timesteps"
+    )
+    parser.add_argument(
+        "--ideogram4_fp32_timestep",
+        action="store_true",
+        help="keep the timestep in fp32 through the DiT time-embedding (corrected conditioning). Default (omitted) "
+        "is the legacy bf16 cast that every pre-2026-06 adapter was trained under. The chosen regime is recorded in "
+        "the LoRA metadata (ss_ideogram4_fp32_timestep) so generation can reproduce it. A/B before adopting widely.",
     )
     # Ideogram 4 weights are always fp8 (loaded via the pre-quantized shim), so this is defined only so the base
     # loop can read args.fp8_scaled; it is neutralized (with a warning) in neutralize_unused_fp8_args(). --fp8_base

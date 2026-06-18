@@ -55,6 +55,49 @@ def _resolve_multipliers(lora_weights: list[str], lora_multipliers: list[float] 
     return [float(m) for m in lora_multipliers]
 
 
+def _resolve_generation_timestep_regime(flag: bool | None, lora_weights: list[str] | None) -> bool:
+    """Resolve the DiT timestep conditioning regime for generation.
+
+    An explicit --ideogram4_fp32_timestep / --no-ideogram4_fp32_timestep wins. Otherwise inherit the
+    regime each loaded LoRA was trained under (``ss_ideogram4_fp32_timestep`` metadata) so an fp32-trained
+    adapter is sampled under fp32 and a legacy bf16 adapter under bf16 -- a silent train/inference mismatch
+    otherwise degrades likeness. Falls back to legacy bf16 when nothing specifies it.
+    """
+    if flag is not None:
+        logger.info(f"Ideogram 4 timestep conditioning: {'fp32' if flag else 'bf16 (legacy)'} (explicit flag)")
+        return flag
+
+    stamped: dict[str, bool] = {}
+    for path in lora_weights or []:
+        try:
+            with safe_open(path, framework="pt") as f:
+                md = f.metadata() or {}
+        except Exception:
+            continue
+        raw = md.get("ss_ideogram4_fp32_timestep")
+        if raw is not None:
+            stamped[path] = str(raw).strip().lower() in ("true", "1")
+
+    distinct = set(stamped.values())
+    if len(distinct) > 1:
+        logger.warning(
+            "Stacked LoRAs disagree on the timestep regime (ss_ideogram4_fp32_timestep): "
+            f"{stamped}. Falling back to bf16 (legacy); pass --ideogram4_fp32_timestep / "
+            "--no-ideogram4_fp32_timestep to force a regime."
+        )
+        return False
+    if distinct:
+        regime = distinct.pop()
+        logger.info(f"Ideogram 4 timestep conditioning: {'fp32' if regime else 'bf16 (legacy)'} (inherited from LoRA metadata)")
+        return regime
+
+    logger.info(
+        "Ideogram 4 timestep conditioning: bf16 (legacy) -- no flag and no LoRA metadata; "
+        "pass --ideogram4_fp32_timestep for the corrected regime."
+    )
+    return False
+
+
 def apply_lora_weights_runtime(
     transformer: torch.nn.Module,
     lora_weights: list[str],
@@ -163,6 +206,14 @@ def setup_parser() -> argparse.ArgumentParser:
         help="multiplier(s) for --lora_weight: omit for all-1.0, give ONE value to broadcast to every "
         "weight, or match counts exactly (mismatched counts error out)",
     )
+    parser.add_argument(
+        "--ideogram4_fp32_timestep",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="timestep conditioning regime for the DiT. Omit (default) to AUTO-inherit the regime each "
+        "--lora_weight was trained under (ss_ideogram4_fp32_timestep metadata), avoiding a silent "
+        "train/inference mismatch; pass --ideogram4_fp32_timestep / --no-ideogram4_fp32_timestep to force it.",
+    )
     return parser
 
 
@@ -200,6 +251,12 @@ def main():
     lora_networks = []
     if args.lora_weight:
         lora_networks = apply_lora_weights_runtime(conditional, args.lora_weight, args.lora_multiplier, device, dtype)
+
+    # Timestep conditioning regime: explicit flag, else inherit each LoRA's trained regime from metadata
+    # (avoids a silent train/inference mismatch), else legacy bf16. Set on BOTH DiTs before denoise.
+    fp32_timestep = _resolve_generation_timestep_regime(args.ideogram4_fp32_timestep, args.lora_weight)
+    conditional.fp32_timestep = fp32_timestep
+    unconditional.fp32_timestep = fp32_timestep
 
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     logger.info(f"Denoising: {preset.num_steps} steps, preset {args.sampler_preset}")
