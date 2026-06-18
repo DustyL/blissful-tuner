@@ -109,11 +109,18 @@ downstream tensor keeps the same dtype either way.
 
 - **Default is legacy bf16** (behavior-preserving): every pre-2026-06 Ideogram adapter was trained *and*
   sampled under the bf16 cast, so they remain bit-consistent. A/B the fp32 regime before adopting it
-  widely.
-- **The regime is recorded** in the LoRA metadata (`ss_ideogram4_fp32_timestep`).
-- **Generation auto-inherits it.** `ideogram4_generate_image.py` reads that metadata and matches the
-  trained regime by default, avoiding a silent train/inference mismatch. Pass
-  `--ideogram4_fp32_timestep` / `--no-ideogram4_fp32_timestep` to force it (e.g. for an A/B). Note the
+  widely. The trainer flag is `--ideogram4_fp32_timestep` / `--no-ideogram4_fp32_timestep`.
+- **The regime is recorded** in the LoRA metadata (`ss_ideogram4_fp32_timestep`), and is retained even
+  under `--no_metadata` (it governs how the checkpoint must be run, not optional provenance).
+- **Generation auto-inherits it.** `ideogram4_generate_image.py` reads that metadata and matches each
+  adapter's trained regime by default, avoiding a silent train/inference mismatch. When the regime is
+  genuinely ambiguous it refuses to guess and fails fast with a one-line fix:
+    - a stack whose adapters disagree (one fp32, one legacy), or an fp32 adapter mixed with an
+      **unstamped** adapter (which may be an old bf16 adapter *or* an upstream-native fp32 one), → error;
+    - all-unstamped or all-legacy → legacy bf16 (with a warning for unstamped);
+    - a malformed stamp → error.
+  Pass `--ideogram4_fp32_timestep` / `--no-ideogram4_fp32_timestep` to force the regime explicitly (this
+  short-circuits metadata resolution — the escape hatch for mixed/unstamped stacks and A/Bs). Note the
   intentional asymmetry: the trainer flag *defines* the regime (default legacy), the generator flag
   *inherits* it (default auto-from-metadata).
 

@@ -14,6 +14,7 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
 )
 from musubi_tuner.ideogram4 import ideogram4_utils
+from musubi_tuner.ideogram4.constants import IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY
 from musubi_tuner.ideogram4.caption_verifier import verify_caption
 from musubi_tuner.ideogram4.generation import denoise_ideogram4_to_tokens
 from musubi_tuner.ideogram4.sampler_configs import PRESETS, resolve_training_sample_preset
@@ -547,9 +548,15 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         if layout:
             metadata["ss_ideogram4_fp8_scale_layout"] = layout  # per_row (HF) / per_tensor (Comfy) / ...
         # Record the timestep conditioning regime so generation can reproduce it (avoids a silent
-        # train/inference skew). True = fp32 (corrected); False = legacy bf16.
-        metadata["ss_ideogram4_fp32_timestep"] = bool(getattr(args, "ideogram4_fp32_timestep", False))
+        # train/inference skew). True = fp32 (corrected); False = legacy bf16. Retained under
+        # --no_metadata via extra_minimum_metadata_keys() (it is execution-contract, not provenance).
+        metadata[IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY] = bool(getattr(args, "ideogram4_fp32_timestep", False))
         return metadata
+
+    def extra_minimum_metadata_keys(self) -> list[str]:
+        # The timestep regime governs how the checkpoint must be RUN -- generation produces a silent
+        # train/inference mismatch without it -- so keep it even under --no_metadata.
+        return [IDEOGRAM4_FP32_TIMESTEP_METADATA_KEY]
 
     def scale_shift_latents(self, latents):
         # Cached Ideogram latents are already latent_norm'd (grid_to_dit_tokens flattens, never re-normalizes).
@@ -715,10 +722,11 @@ def ideogram4_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     )
     parser.add_argument(
         "--ideogram4_fp32_timestep",
-        action="store_true",
-        help="keep the timestep in fp32 through the DiT time-embedding (corrected conditioning). Default (omitted) "
-        "is the legacy bf16 cast that every pre-2026-06 adapter was trained under. The chosen regime is recorded in "
-        "the LoRA metadata (ss_ideogram4_fp32_timestep) so generation can reproduce it. A/B before adopting widely.",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="keep the timestep in fp32 through the DiT time-embedding (corrected conditioning). Default (or "
+        "--no-ideogram4_fp32_timestep) is the legacy bf16 cast that every pre-2026-06 adapter was trained under. "
+        "The chosen regime is recorded in the LoRA metadata so generation reproduces it. A/B before adopting widely.",
     )
     # Ideogram 4 weights are always fp8 (loaded via the pre-quantized shim), so this is defined only so the base
     # loop can read args.fp8_scaled; it is neutralized (with a warning) in neutralize_unused_fp8_args(). --fp8_base
