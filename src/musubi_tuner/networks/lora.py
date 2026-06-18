@@ -655,9 +655,13 @@ class LoRAModule(torch.nn.Module):
                 dora_delta = self._dora_delta(org_forwarded, lx.to(org_forwarded.dtype), scale)
                 return org_forwarded + dora_delta
             else:
-                # Cast back to base's dtype before adding so addition doesn't promote the
-                # output dtype (e.g., fp32 LoRA output + bf16 base would otherwise become fp32).
-                return org_forwarded + lx.to(org_forwarded.dtype) * self.multiplier * scale
+                # Keep the LoRA delta in fp32 through the scale/multiply AND the residual add, then round
+                # the SUM to the base dtype exactly once -- rather than rounding the delta to bf16 first
+                # and the sum again (two roundings). Numerically better (most at higher multiplier/scale)
+                # and moves the bf16 training output closer to the fp32 inference sum (train/infer parity).
+                # Still returns the base dtype so the add doesn't promote the output. multiplier==0 (and
+                # scale==0) stay bitwise no-ops (org + 0 -> base dtype); DoRA keeps its own delta path above.
+                return (org_forwarded + lx * self.multiplier * scale).to(org_forwarded.dtype)
         else:
             # All sub-loras share the same dtype (created together with the same nn.Linear default).
             lora_dtype = self.lora_down[0].weight.dtype
@@ -690,8 +694,9 @@ class LoRAModule(torch.nn.Module):
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
-            # Cast concatenated LoRA result back to base's dtype to preserve output dtype.
-            return org_forwarded + torch.cat(lxs, dim=-1).to(org_forwarded.dtype) * self.multiplier * scale
+            # Same one-rounding residual add as the non-split path: keep the concatenated delta in fp32
+            # through the scale/add, then round the sum to the base dtype once (preserves output dtype).
+            return (org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale).to(org_forwarded.dtype)
 
 
 class LoRAInfModule(LoRAModule):
