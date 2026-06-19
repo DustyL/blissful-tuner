@@ -427,7 +427,11 @@ class Ideogram4Transformer(nn.Module):
             x: (B, L, in_channels) noise tokens.
             t: (B,) or (B, L) flow-matching time in [0, 1].
             position_ids: (B, L, 3) (t, h, w) positions for MRoPE.
-            segment_ids: (B, L) sample id within a packed batch.
+            segment_ids: (B, L) per-position validity partition from build_ideogram4_conditioning
+                (1 = real text/image token, SEQUENCE_PADDING_INDICATOR = left-pad). CONTRACT: one sample
+                per batch row, so a batch_size==1 row is always unpadded/uniform -- which the attention
+                mask-elision below relies on. Single-row packing or fixed-length padding would violate
+                this and must revisit the batch_size==1 branch.
             indicator: (B, L) per-token role: LLM_TOKEN_INDICATOR or OUTPUT_IMAGE_INDICATOR.
 
         Returns:
@@ -477,11 +481,15 @@ class Ideogram4Transformer(nn.Module):
         cos = cos.to(h.dtype)
         sin = sin.to(h.dtype)
 
-        # Build the block-diagonal attention mask ONCE here (not 34x, once per block). For a single
-        # sample there is no padding -- segment_ids is uniform -- so the mask is all-True; passing None
-        # lets SDPA select the flash backend (it rejects a non-null mask), numerically a no-op for
-        # batch=1 and a real speedup. The batch_size==1 guard is SHAPE-static (torch.compile-safe; a
-        # data-dependent segment_ids.unique() guard would break fullgraph). batch>1 keeps the exact mask.
+        # Build the block-diagonal attention mask ONCE here (not 34x, once per block). Under the
+        # one-sample-per-row contract (see segment_ids docstring) a batch_size==1 row has no padding, so
+        # the mask is all-True; passing None lets SDPA select the flash backend (it rejects a non-null
+        # mask) -- numerically a no-op for that case and a real speedup. The guard is the shape-static
+        # batch_size==1, NOT segment_ids.unique(): this runs in the EAGER root (no fullgraph boundary
+        # here), so the reason to avoid unique() is that .numel() on its data-dependent result forces a
+        # per-forward GPU->CPU sync, while batch_size is a free Python int. batch>1 keeps the exact mask.
+        # If single-row packing or fixed-length padding is ever added, this batch_size==1 branch must be
+        # revisited -- a padded/multi-segment batch-1 row would silently lose its mask here.
         attn_mask = None if batch_size == 1 else (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
 
         for layer in self.layers:
