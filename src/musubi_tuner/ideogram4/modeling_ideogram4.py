@@ -171,7 +171,7 @@ class Ideogram4Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        segment_ids: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
@@ -191,9 +191,9 @@ class Ideogram4Attention(nn.Module):
 
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Block-diagonal mask from segment ids: (B, 1, L, L), True = attend.
-        attn_mask = (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
-
+        # attn_mask is the block-diagonal (B,1,L,L) mask built ONCE in the root forward, or None for a
+        # single-sample sequence where it is all-True. Passing None lets SDPA select the flash backend
+        # (flash rejects a non-null mask) -- numerically a no-op for batch=1 (no padding), a real speedup.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
         return self.o(out)
@@ -244,7 +244,7 @@ class Ideogram4TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        segment_ids: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         adaln_input: torch.Tensor,
@@ -257,13 +257,13 @@ class Ideogram4TransformerBlock(nn.Module):
             fn = self._forward
             if self.activation_cpu_offloading:
                 fn = create_cpu_offloading_wrapper(fn, self.feed_forward.w1.weight.device)
-            return checkpoint(fn, x, segment_ids, cos, sin, adaln_input, use_reentrant=False)
-        return self._forward(x, segment_ids, cos, sin, adaln_input)
+            return checkpoint(fn, x, attn_mask, cos, sin, adaln_input, use_reentrant=False)
+        return self._forward(x, attn_mask, cos, sin, adaln_input)
 
     def _forward(
         self,
         x: torch.Tensor,
-        segment_ids: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         adaln_input: torch.Tensor,
@@ -277,7 +277,7 @@ class Ideogram4TransformerBlock(nn.Module):
 
         attn_out = self.attention(
             self.attention_norm1(x) * scale_msa,
-            segment_ids=segment_ids,
+            attn_mask=attn_mask,
             cos=cos,
             sin=sin,
         )
@@ -477,8 +477,15 @@ class Ideogram4Transformer(nn.Module):
         cos = cos.to(h.dtype)
         sin = sin.to(h.dtype)
 
+        # Build the block-diagonal attention mask ONCE here (not 34x, once per block). For a single
+        # sample there is no padding -- segment_ids is uniform -- so the mask is all-True; passing None
+        # lets SDPA select the flash backend (it rejects a non-null mask), numerically a no-op for
+        # batch=1 and a real speedup. The batch_size==1 guard is SHAPE-static (torch.compile-safe; a
+        # data-dependent segment_ids.unique() guard would break fullgraph). batch>1 keeps the exact mask.
+        attn_mask = None if batch_size == 1 else (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
+
         for layer in self.layers:
-            h = layer(h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
+            h = layer(h, attn_mask=attn_mask, cos=cos, sin=sin, adaln_input=adaln_input)
 
         out = self.final_layer(h, c=adaln_input)
         return out.to(torch.float32)
