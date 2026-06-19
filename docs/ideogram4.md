@@ -27,6 +27,12 @@ diagnostics, and a ComfyUI LoRA converter).
   taps by `tests/test_ideogram4_text_encoder.py::test_manual_tap_matches_native_hidden_states`.
 - **VAE.** Ideogram 4 uses the FLUX.2 VAE (`flux2-vae.safetensors`).
 - **Native resolution** is 1024×1024 (samples degenerate well below it).
+- **Attention (batch-1 fast path).** For a single sample the block-diagonal attention mask is all-True,
+  so it is elided and SDPA selects the flash backend (~26% faster training step on the settled recipe,
+  measured A/B). This is a backend transition (mem-efficient → flash), so batch-1 attention numerics
+  changed at that commit — runs trained before vs after it are not bitwise-comparable (no metadata flag:
+  the SDPA backend already depends on torch/CUDA/hardware; the checkout boundary is the thing to track).
+  batch>1 keeps the exact mask.
 
 ## Pipeline
 
