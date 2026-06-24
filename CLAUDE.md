@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Blissful Tuner is an extended fork of Musubi Tuner (by kohya-ss) developed by Blyss Sarania. It provides training and inference tools for LoRA models with multiple video/image generation architectures: HunyuanVideo, HunyuanVideo 1.5, Wan 2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2, Z-Image-Turbo, Qwen-Image, and Kandinsky 5.
+Blissful Tuner is an extended fork of Musubi Tuner (by kohya-ss) developed by Blyss Sarania. It provides training and inference tools for LoRA models with multiple video/image generation architectures: HunyuanVideo, HunyuanVideo 1.5, Wan 2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2, Z-Image-Turbo, Qwen-Image, Kandinsky 5, Ideogram 4, and Krea 2.
 
 **Key Extensions over Musubi Tuner:**
 - Rich logging with beautiful console output
@@ -18,6 +18,13 @@ Blissful Tuner is an extended fork of Musubi Tuner (by kohya-ss) developed by Bl
 - Muon optimizer integration
 - Gradio-based training GUI
 - Post-processing tools (VFI, upscaling, face restoration)
+
+> **Comparing against OneTrainer.** When deciding whether a training technique (a LoRA/OFT/DoRA
+> adapter variant, an optimizer, a loss/timestep/noise scheme, or a VRAM lever) is worth borrowing
+> from the competing **OneTrainer** trainer, read `~/OneTrainer/CLAUDE.blissful-comparison.md` — a
+> feature-by-feature comparison plus a prioritized "worth porting" shortlist, written from this
+> repo's perspective and cross-checked against this file. (OneTrainer's own contributor rules live
+> in `~/OneTrainer/AGENTS.md`; its `~/OneTrainer/CLAUDE.md` is just an upstream pointer to that.)
 
 ## Code Style
 
@@ -139,7 +146,7 @@ python wan_generate_video.py \
     --lora_weight /path/to/lora.safetensors
 ```
 
-### All Root-Level Scripts (45 thin wrappers importing from `src/musubi_tuner/`)
+### All Root-Level Scripts (53 thin wrappers importing from `src/musubi_tuner/`)
 
 ```bash
 # WAN 2.1/2.2
@@ -171,6 +178,12 @@ zimage_train.py              # full fine-tune
 # Kandinsky 5
 kandinsky5_cache_latents.py | kandinsky5_cache_text_encoder_outputs.py | kandinsky5_train_network.py | kandinsky5_generate_video.py
 
+# Ideogram 4 (text-to-image)
+ideogram4_cache_latents.py | ideogram4_cache_text_encoder_outputs.py | ideogram4_train_network.py | ideogram4_generate_image.py
+
+# Krea 2 (text-to-image)
+krea2_cache_latents.py | krea2_cache_text_encoder_outputs.py | krea2_train_network.py | krea2_generate_image.py
+
 # Generic (architecture-agnostic wrappers)
 cache_latents.py | cache_text_encoder_outputs.py
 
@@ -198,6 +211,7 @@ blissful-tuner/
 │   │   ├── qwen_image/         # Qwen-Image
 │   │   ├── zimage/             # Z-Image-Turbo
 │   │   ├── kandinsky5/         # Kandinsky 5 (configs, models/, generation_utils)
+│   │   ├── krea2/              # Krea 2 (single-stream MMDiT, Qwen3-VL TE, Qwen-Image VAE)
 │   │   ├── gui/                # Gradio-based training GUI (i18n EN/JA)
 │   │   ├── optimizers/         # Custom optimizers (Muon with Newton-Schulz orthogonalization)
 │   │   ├── dataset/            # Dataset handling, config parsing, caching
@@ -263,7 +277,7 @@ blissful-tuner/
 ### Training Class Hierarchy
 
 - **`NetworkTrainer`** (`src/musubi_tuner/hv_train_network.py`): Base training class with the main `train()` loop, optimizer setup, checkpointing, and centralized mask loss application.
-- **LoRA trainers** (all inherit `NetworkTrainer`): `WanNetworkTrainer`, `Kandinsky5NetworkTrainer`, `Flux2NetworkTrainer`, `QwenImageNetworkTrainer`, `ZImageNetworkTrainer`, `FramePackNetworkTrainer`, `FluxKontextNetworkTrainer`, `HunyuanVideo15NetworkTrainer`.
+- **LoRA trainers** (all inherit `NetworkTrainer`): `WanNetworkTrainer`, `Kandinsky5NetworkTrainer`, `Flux2NetworkTrainer`, `QwenImageNetworkTrainer`, `ZImageNetworkTrainer`, `FramePackNetworkTrainer`, `FluxKontextNetworkTrainer`, `HunyuanVideo15NetworkTrainer`, `Ideogram4NetworkTrainer`, `Krea2NetworkTrainer`.
 - **Full fine-tune trainers**:
   - `QwenImageTrainer` → inherits `QwenImageNetworkTrainer` → `NetworkTrainer`
   - `ZImageTrainer` → inherits `ZImageNetworkTrainer` → `NetworkTrainer`
@@ -286,6 +300,45 @@ blissful-tuner/
 - **Task Families**: K5-Pro (SD/HD, T2V/I2V, 5s/10s), K5-Lite (standard, distilled, nocfg, pretrain)
 - **Example tasks**: `k5-pro-t2v-5s-sd`, `k5-lite-t2v-5s-sd`, `k5-lite-t2v-5s-distil-sd`, `k5-lite-t2v-5s-nocfg-sd`
 
+### Krea 2 (K2) Specifics
+
+Text-to-image model ported from upstream musubi-tuner (`57c0301`); blissful-grade training added on
+top. Integration survey + receipts: `docs/krea2.md`. 4-script pattern (`krea2_cache_latents.py`,
+`krea2_cache_text_encoder_outputs.py`, `krea2_train_network.py`, `krea2_generate_image.py`).
+
+- **Architecture**: single-stream MMDiT (~12.8B, 28 blocks, hidden 6144), **GQA 48 query / 12 kv
+  heads**, gated-sigmoid attention, QK-RMSNorm, 3D-axial RoPE. **Reuses components blissful already
+  has**: the **Qwen-Image VAE** (latent caching shared verbatim) and a **Qwen3-VL-4B** text encoder
+  (12 selected hidden-state layers stacked + cached raw; a trainable in-DiT `TextFusionTransformer`
+  fuses them — so the TE cache is a layer-stack, key `varlen_krea2_vl_embed_*`).
+- **RAW vs Turbo**: train LoRAs on the **RAW** DiT (`--dit`); they apply to the distilled **Turbo**
+  checkpoint directly (no merge). `--turbo_dit` swaps base weights to Turbo for sample previews
+  during training (block-swap-incompatible — asserts).
+- **Timestep sampling**: `--timestep_sampling krea2_shift` (flux-shift family, `get_lin_function(x1=256,
+  y1=0.5, x2=6400, y2=1.15)`). Added to `parser_common.py` + `trainer_base.py`.
+- **fp8**: `--fp8_base` requires `--fp8_scaled` (alone casts norms → breaks). **fp8 is incompatible
+  with fused attention** — `--fp8_scaled` + `--flash_attn`/`--xformers`/`--sage_attn`/`--flash3` is
+  rejected (fail-fast in BOTH `krea2_generate_image.py` and `Krea2NetworkTrainer.handle_model_specific_args`),
+  because fp8 feeds **fp32** activations to attention and only SDPA accepts fp32. **Use `--sdpa` with
+  fp8**, or a fused backend in bf16.
+- **GQA lives in the shared `modules/attention.py`** — do NOT "simplify away" the k/v
+  `repeat_interleave` on the SDPA/xformers paths: `enable_gqa=True` forces SDPA onto the ~7× slower
+  math kernel, so blissful expands k/v instead (numerically identical). flash/sage/CuTE group heads
+  natively (no repeat) but need `.view()`→`.reshape()` for K2's non-contiguous post-RoPE q/k/v.
+  Guarded by `tests/test_krea2_gqa_attention.py` (+ a divisibility check).
+- **LoRA/LoHa/LoKr**: `networks.lora_krea2` targets **all `nn.Linear`** (`KREA2_TARGET_REPLACE_MODULES
+  = None`; 264 Linears); modulation/RMSNorm are raw Parameters, never wrapped. Registered in
+  `network_arch.py` with `target_modules=None` so LoHa/LoKr resolve the all-Linear set.
+- **Mask loss + prior preservation** wired like Z-Image (`process_batch` → `masked_process_batch`).
+  See the mask matrix below.
+- **⚠ Training gotcha (env, not K2)**: training dies at the first dataloader iter with
+  `ConnectionResetError [Errno 104]` (Py3.14 forkserver + cutlass-DSL `torch` stub) unless
+  **`--max_data_loader_n_workers 0`** (free for cached-latent training). Inference is unaffected.
+- **Lesson (verbatim upstream copies still need a real run)**: `krea2_cache_text_encoder_outputs.py`
+  shipped calling blissful's diverged `process_text_encoder_batches` without the leading `args` — a
+  `TypeError` on every TE-cache run that unit tests missed and only the GPU smoke caught. When porting
+  upstream scripts, run cache+train end-to-end, not just `py_compile`.
+
 ### Generation Script Feature Matrix
 
 | Feature | WAN | HV | HV1.5 | FPack | Kontext | FLUX.2 | Qwen | ZImage | K5 |
@@ -299,6 +352,11 @@ blissful-tuner/
 | I2V | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | V2V | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Wildcards | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+**Krea 2 and Ideogram 4 are intentionally omitted from this matrix:** both use upstream-style
+generation (basic CFG via `--guidance_scale` only) and wire **none** of the blissful generation
+extensions above (no latent preview, CFG schedule, CFGZero*, NAG, perpendicular negative, RifleX,
+V2V, or wildcards). They are text-to-image only (no I2V).
 
 ### Loss Computation
 
@@ -325,6 +383,8 @@ Spatial mask-weighted loss is supported for selective region training (e.g., fac
 | Z-Image | ✅ | ✅ | - |
 | FLUX.2 | ✅ | ✅ | - |
 | Kandinsky 5 | ✅ | ✅ | - |
+| Ideogram 4 | ✅ | ✅ | - |
+| Krea 2 | ✅ | ✅ | - |
 | FLUX.1 Kontext | ❌ | ❌ | - |
 | FramePack | ❌ | ❌ | - |
 
@@ -333,6 +393,7 @@ Notes:
 - HunyuanVideo training supports applying `mask_weights` if present, but the default HV latent caching flow does not currently write `mask_weights_*` into cache files.
 - FLUX.2 supports `mask_directory` and `alpha_mask` for image datasets. Masks are baked into latent cache during `flux_2_cache_latents.py`.
 - Z-Image supports `mask_directory` and `alpha_mask` for image datasets. Masks are baked into latent cache during `zimage_cache_latents.py`.
+- Krea 2 supports `mask_directory` and `alpha_mask` for image datasets. Masks are downsampled to the /8 latent grid and baked into the latent cache during `krea2_cache_latents.py` (key `mask_weights_{F}x{H}x{W}_float16`). Both EMA and base prior-teacher modes work. The DLAY mask sets live at `/home/dustin/Pictures/DLAY/masks-150` (3-tier 0/100/255) and `weighted_masks_150` (smooth).
 
 **Dataset Config with Masks:**
 ```toml
@@ -441,8 +502,10 @@ frame_extraction = "head"
 | Qwen-Image | QwenImageTransformerBlock | networks.lora_qwen_image | networks.loha / networks.lokr |
 | Z-Image | ZImageTransformerBlock | networks.lora_zimage | networks.loha / networks.lokr |
 | Kandinsky 5 | TransformerEncoderBlock, TransformerDecoderBlock | networks.lora_kandinsky | networks.loha / networks.lokr |
+| Ideogram 4 | Ideogram4TransformerBlock | networks.lora_ideogram4 | networks.loha / networks.lokr |
+| Krea 2 | all `nn.Linear` (`KREA2_TARGET_REPLACE_MODULES = None`) | networks.lora_krea2 | networks.loha / networks.lokr |
 
-LoHa and LoKr use a shared architecture registry (`networks.network_arch`) for target modules and default exclude patterns. The registry defines 13 architecture variants (including FLUX.2 Klein 4B/9B, Qwen-Image Edit/Layered). LoKr v1 is Linear-only (Conv2d layers are skipped). Factor persistence is handled via `lokr_factor` buffer + `ss_lokr_factor` metadata.
+LoHa and LoKr use a shared architecture registry (`networks.network_arch`) for target modules and default exclude patterns. The registry defines 15 architecture variants (including FLUX.2 Klein 4B/9B, Qwen-Image Edit/Layered, Ideogram 4, Krea 2). LoKr v1 is Linear-only (Conv2d layers are skipped). Factor persistence is handled via `lokr_factor` buffer + `ss_lokr_factor` metadata. Krea 2's `None` target (wrap every `nn.Linear`) is accepted by both walkers (loha's "all modules" branch; lokr delegates to `lora.create_network`).
 
 Additional network utilities in `networks/`:
 - `lycoris.py` — LyCORIS adapter/bridge module
@@ -644,6 +707,8 @@ crash discovered on 2026-05-16.
 - `docs/qwen_image.md` - Qwen Image guide
 - `docs/zimage.md` - Z-Image-Turbo guide
 - `docs/kandinsky5.md` - Kandinsky 5 training and inference
+- `docs/ideogram4.md` - Ideogram 4 training and inference
+- `docs/krea2.md` - Krea 2 training and inference
 - `docs/wan_1f.md` - WAN 1-frame mode
 
 ### Training & Configuration
