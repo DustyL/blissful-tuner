@@ -34,6 +34,7 @@ from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
+from blissful_tuner.mask_loss_process_batch import masked_on_post_optimizer_step, masked_process_batch
 
 import logging
 
@@ -53,6 +54,65 @@ class Krea2NetworkTrainer(NetworkTrainer):
         self._turbo_stash = None
         self._raw_stash = None
 
+    def process_batch(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        dit_dtype,
+        network_dtype,
+        vae,
+        global_step,
+    ):
+        """Mask-aware override: dispatch to masked_process_batch when --use_mask_loss, else the vanilla base path.
+
+        Note: call_dit re-reads ``batch["latents"]`` for the flow-matching target rather than the
+        ``latents`` arg the base/masked loop passes in. That is correct only because K2's
+        ``scale_shift_latents`` is a no-op (``batch["latents"] == latents``). If a real scale-shift is
+        ever added, also thread the scaled ``latents`` into call_dit's target so it cannot desync from
+        ``noisy_model_input``.
+        """
+        if not getattr(args, "use_mask_loss", False):
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+        return masked_process_batch(
+            self,
+            args,
+            accelerator,
+            transformer,
+            network,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            dit_dtype,
+            network_dtype,
+            vae,
+            global_step,
+        )
+
+    def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step):
+        """Mask-aware override: EMA-teacher update (no-op unless prior preservation in EMA mode is active)."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        masked_on_post_optimizer_step(self, args, accelerator, network, sync_gradients)
+
     # region model specific
 
     @property
@@ -68,23 +128,34 @@ class Krea2NetworkTrainer(NetworkTrainer):
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = 1.0  # K2 t2i, not used at train time
-        # Phase 1: Krea 2 training does NOT yet wire Blissful's mask-weighted loss / prior
-        # preservation. Unlike Z-Image / Ideogram4, this trainer has no process_batch override,
-        # so it inherits the base vanilla-MSE compute_loss, and save_latent_cache_krea2 stores no
-        # mask payload. Without this guard, --use_mask_loss (and prior preservation, which requires
-        # it) would be silently ignored — a deceptively successful "masked" run that is actually
-        # plain MSE. Fail fast until the masked process_batch is ported (planned follow-up).
-        if getattr(args, "use_mask_loss", False):
-            raise ValueError(
-                "Krea 2 training does not yet support --use_mask_loss: mask-weighted loss and prior "
-                "preservation are not wired for this architecture (it would silently train plain MSE). "
-                "Re-run without --use_mask_loss; mask/prior support is planned for a later update."
-            )
         # self.blocks_to_swap is set by the base trainer (handle_model_specific_args runs first).
         # K2 fp8 supports only the scaled (dynamic) path; plain --fp8_base alone would cast the
         # whole DiT (incl. norms) to fp8, which breaks. Require --fp8_scaled with --fp8_base.
         if args.fp8_base and not args.fp8_scaled:
             raise ValueError("Krea 2 fp8 supports only scaled fp8: pass --fp8_scaled together with --fp8_base.")
+        # fp8 + fused attention is incompatible (verified at training time: fp8 feeds fp32 activations
+        # to attention, which the fused flash / xformers / sageattn / flash3 kernels reject — only
+        # torch/SDPA accepts fp32). Mirrors the generation-side guard; fail fast before the expensive
+        # training loop rather than crashing at the first call_dit. Use --sdpa with fp8, or a fused
+        # backend in bf16 (no --fp8_scaled).
+        if args.fp8_scaled:
+            fused_on = [
+                flag
+                for flag, on in (
+                    ("--flash_attn", getattr(args, "flash_attn", False)),
+                    ("--xformers", getattr(args, "xformers", False)),
+                    ("--sage_attn", getattr(args, "sage_attn", False)),
+                    ("--flash3", getattr(args, "flash3", False)),
+                )
+                if on
+            ]
+            if fused_on:
+                raise ValueError(
+                    f"--fp8_scaled is only compatible with --sdpa attention, not {', '.join(fused_on)}. "
+                    "Under fp8 the DiT feeds fp32 activations to attention, which the fused kernels reject "
+                    "(only SDPA/torch accepts fp32). Use --sdpa with --fp8_scaled, or drop --fp8_scaled to "
+                    "run a fused backend in bf16."
+                )
         # RAW-train / Turbo-sample: the recommended K2 LoRA workflow is to train on the RAW
         # checkpoint and run inference on the distilled Turbo. --turbo_dit makes sample
         # generation during training swap the base weights to Turbo (LoRA, hooked on the live

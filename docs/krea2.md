@@ -130,9 +130,19 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --output_dir path/to/output_dir --output_name name-of-lora
 ```
 
+> **Blissful Tuner — mask-weighted loss & prior preservation.** Krea 2 supports
+> spatial mask-weighted loss (e.g. face-focused persona training) and prior
+> preservation, the same as WAN / Z-Image / Ideogram-4. Add `mask_directory` (or
+> `alpha_mask = true`) to the dataset subset, **re-cache latents** (the mask is baked
+> into the latent cache by `krea2_cache_latents.py`), and pass `--use_mask_loss`
+> (plus the optional `--prior_preservation_weight` / `--prior_teacher_mode` family).
+> See `docs/MASKED_LOSS_TRAINING_GUIDE.md` for the full reference. The mask is
+> downsampled to the /8 latent grid and stored as the standard
+> `mask_weights_{F}x{H}x{W}_float16` key.
+
 - Uses `krea2_train_network.py`.
 - **Requires** specifying `--dit` (RAW model) and `--vae` (Qwen-Image VAE).
-- **Requires** specifying `--network_module networks.lora_krea2`.
+- The example above uses plain LoRA (`--network_module networks.lora_krea2`). LoHa / LoKr are also supported — pass `--network_module networks.loha` or `networks.lokr` (they resolve Krea 2's all-Linear target set via `architecture=kr2`); see [LoRA target layers](#lora-target-layers--loraの対象レイヤー) below.
 - `--text_encoder` is only needed if you generate sample images during training (it is not needed for the training step itself, because text encoder outputs are pre-cached).
 - Krea 2 uses flow matching. `--timestep_sampling shift` with `--discrete_flow_shift` is a reasonable starting point. The value `2.5` matches the K2 inference time-shift at 1024×1024 (the schedule is resolution-aware: it ranges from about `1.6` at 256×256 to `3.2` at 1280×1280, reaching ~`2.5` at 1024×1024). For varying-resolution training, `--timestep_sampling krea2_shift` reproduces the same resolution-aware schedule per sample, so each timestep is shifted exactly as K2 shifts it at inference (default resolution range 256–1280); no fixed `--discrete_flow_shift` is needed in that case. (`--timestep_sampling flux_shift` is similar but its high end saturates at 1024px instead of 1280px, giving a slightly stronger shift above 256px.) The optimal settings are not yet established; feedback is welcome.
 - `--network_dim` / `--network_alpha` of 32 reproduces the model authors' recommended default. See [LoRA target layers](#lora-target-layers--loraの対象レイヤー) below.
@@ -144,7 +154,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 - `krea2_train_network.py`を使用します。
 - `--dit`（RAWモデル）と`--vae`（Qwen-Image VAE）を指定する必要があります。
-- `--network_module networks.lora_krea2`を指定する必要があります。
+- 上記の例はプレーンLoRA（`--network_module networks.lora_krea2`）を使用しています。LoHa / LoKrもサポートされています（`--network_module networks.loha` または `networks.lokr`、`architecture=kr2`でKrea 2の全Linear対象を解決します）。下記の[LoRAの対象レイヤー](#lora-target-layers--loraの対象レイヤー)を参照してください。
 - `--text_encoder`は学習中にサンプル画像を生成する場合にのみ必要です（テキストエンコーダー出力は事前キャッシュされるため、学習ステップ自体には不要です）。
 - Krea 2はflow matchingを使用します。`--timestep_sampling shift`と`--discrete_flow_shift`の組み合わせが出発点として妥当です。値 `2.5` は1024×1024でのK2推論時のtime-shiftに一致します（このスケジュールは解像度依存で、256×256で約 `1.6`、1280×1280で約 `3.2`、1024×1024で約 `2.5` です）。解像度を変えて学習する場合は、`--timestep_sampling krea2_shift` を使うと同じ解像度依存スケジュールをサンプルごとに再現し、各タイムステップがK2推論時とまったく同じようにシフトされます（デフォルトの解像度レンジ256〜1280）。この場合は固定の `--discrete_flow_shift` は不要です。（`--timestep_sampling flux_shift` も類似ですが、高解像度側が1024px（K2は1280px）で飽和するため、256pxより上ではやや強いshiftになります。）最適な設定はまだ確立されていません。フィードバックをお待ちしています。
 - `--network_dim` / `--network_alpha` を32にすると、モデル作者が推奨するデフォルト設定を再現します。下記の[LoRAの対象レイヤー](#lora-target-layers--loraの対象レイヤー)を参照してください。
@@ -153,13 +163,11 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 ### LoRA target layers / LoRAの対象レイヤー
 
-> **Blissful Tuner note:** Krea 2 currently supports **plain LoRA only**
-> (`--network_module networks.lora_krea2`). LoHa / LoKr are **not yet wired** for
-> Krea 2 — its target set is "all Linear layers" rather than a transformer-block
-> class list, which the LoHa/LoKr architecture registry has not been verified
-> against. `--network_module networks.loha` / `networks.lokr` with Krea 2 will
-> raise an "unsupported architecture" error until that registration lands (planned
-> follow-up).
+> **Blissful Tuner note:** Krea 2 supports plain LoRA (`--network_module
+> networks.lora_krea2`) as well as **LoHa / LoKr** (`networks.loha` /
+> `networks.lokr`). All three wrap every `nn.Linear` in the DiT by default; narrow
+> the set with `--network_args "exclude_patterns=[...]"` as below. (LoKr v1 is
+> Linear-only, which matches K2 — there are no Conv2d targets.)
 
 By default, the Krea 2 LoRA targets **all Linear layers** in the DiT (264 layers: attention, MLP, the text-fusion transformer, and the projection MLPs). This matches the model authors' recommended default configuration (rank/alpha 32). The modulation and RMSNorm parameters are raw tensors (not Linear modules), so they are never wrapped — no exclusion is needed.
 

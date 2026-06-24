@@ -85,6 +85,7 @@ def main():
         encode_and_save_batch(encoder, batch)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
+        args,  # blissful's process_text_encoder_batches takes args first (diverged from upstream)
         args.num_workers,
         args.skip_existing,
         args.batch_size,

@@ -9,6 +9,7 @@ import logging
 from typing import List
 
 import torch
+import torch.nn.functional as F
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -28,7 +29,10 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
     for item in batch:
         content = item.content
         content = content[0] if isinstance(content, list) else content  # (H, W, C)
-        contents.append(torch.from_numpy(content))
+        content = torch.from_numpy(content)
+        if content.shape[-1] == 4:  # RGBA -> drop alpha (alpha may carry the mask, read separately from mask_content)
+            content = content[..., :3]
+        contents.append(content)
     contents = torch.stack(contents, dim=0)  # (B, H, W, C)
     contents = contents.permute(0, 3, 1, 2)  # (B, C, H, W)
     contents = contents.unsqueeze(2)  # (B, C, 1, H, W), Qwen-Image VAE needs F axis
@@ -39,8 +43,26 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
 
     for b, item in enumerate(batch):
         target_latent = latents[b]  # (C, 1, H, W)
-        print(f"Saving cache for item {item.item_key} at {item.latent_cache_path}, latents shape: {target_latent.shape}")
-        save_latent_cache_krea2(item_info=item, latent=target_latent)
+
+        # Mask weights (optional): downsample the bucket-resized mask to latent space for
+        # mask-weighted loss training. item.mask_content is (H, W) uint8 [0,255] at image res.
+        mask_weights = None
+        if item.mask_content is not None:
+            mask = torch.from_numpy(item.mask_content).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask = (mask.float() / 255.0).clamp_(0.0, 1.0)
+            mask = cache_latents.apply_cache_mask_transforms(
+                mask,
+                cache_mask_gamma=float(getattr(item, "cache_mask_gamma", 1.0) or 1.0),
+                cache_mask_min_weight=float(getattr(item, "cache_mask_min_weight", 0.0) or 0.0),
+            )
+            lat_h, lat_w = target_latent.shape[-2:]
+            mask_weights = F.interpolate(mask, size=(lat_h, lat_w), mode="area")  # (1, 1, lat_h, lat_w)
+
+        print(
+            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, latents shape: {target_latent.shape}"
+            f"{'' if mask_weights is None else f', mask: {tuple(mask_weights.shape)}'}"
+        )
+        save_latent_cache_krea2(item_info=item, latent=target_latent, mask_weights=mask_weights)
 
 
 def main():

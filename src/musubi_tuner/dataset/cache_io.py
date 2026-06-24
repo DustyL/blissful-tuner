@@ -267,18 +267,32 @@ def save_latent_cache_qwen_image(
     save_latent_cache_common(item_info, sd, architecture)
 
 
-def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor, mask_weights: Optional[torch.Tensor] = None):
     """Krea 2 (K2) architecture. Single image (F=1), Qwen-Image VAE latents (normalized).
 
     The latent uses the *same* normalization as the Qwen-Image VAE
     (`(raw - mean) / std`), which is exactly what K2's decoder inverts, so the
     Qwen-Image latent caching is reused as-is. No control latent for plain t2i.
+
+    ``mask_weights`` (optional, for mask-weighted loss training) is a latent-space
+    ``(1, 1, H, W)`` tensor in [0, 1] and is stored as the standard
+    ``mask_weights_{F}x{H}x{W}_float16`` key the shared bucket reader normalizes to
+    ``batch["mask_weights"]`` (cf. save_latent_cache_qwen_image / _ideogram4).
     """
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if mask_weights is not None:
+        # Enforce (1, 1, H, W) at the latent grid so a malformed mask can't broadcast unpredictably
+        # inside apply_masked_loss_with_prior. ValueError (not assert) so python -O can't strip the
+        # contract at this I/O boundary.
+        if tuple(mask_weights.shape) != (1, 1, H, W):
+            raise ValueError(f"Krea 2 mask_weights must be shape (1, 1, {H}, {W}), got {tuple(mask_weights.shape)}")
+        mask_dtype_str = dtype_to_str(torch.float16)
+        sd[f"mask_weights_{F}x{H}x{W}_{mask_dtype_str}"] = mask_weights.detach().to(device="cpu", dtype=torch.float16)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
