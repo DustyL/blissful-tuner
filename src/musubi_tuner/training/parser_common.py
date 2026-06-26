@@ -441,6 +441,7 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
             "flux_shift",
             "flux2_shift",
             "qwen_shift",
+            "krea2_shift",
             "logsnr",
             "qinglong_flux",
             "qinglong_qwen",

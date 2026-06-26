@@ -12,6 +12,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_IDEOGRAM4,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_KREA2,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
@@ -25,6 +26,7 @@ from musubi_tuner.networks.lora_framepack import FRAMEPACK_TARGET_REPLACE_MODULE
 from musubi_tuner.networks.lora_hv_1_5 import HV_1_5_IMAGE_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_ideogram4 import IDEOGRAM4_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_kandinsky import KANDINSKY5_TARGET_REPLACE_MODULES
+from musubi_tuner.networks.lora_krea2 import KREA2_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_qwen_image import QWEN_IMAGE_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_wan import WAN_TARGET_REPLACE_MODULES
 from musubi_tuner.networks.lora_zimage import ZIMAGE_TARGET_REPLACE_MODULES
@@ -79,6 +81,14 @@ ARCH_CONFIGS = {
         # Matches lora_ideogram4.create_arch_network's always-appended exclusion: adaln_modulation
         # is the per-block modulation Linear — training it destabilizes like norm/mod layers elsewhere.
         "exclude_patterns": [r".*adaln_modulation.*"],
+    },
+    ARCHITECTURE_KREA2: {
+        # None == wrap every nn.Linear, matching lora_krea2's plain-LoRA default (the loha walker's
+        # "all modules" branch and lokr's lora.create_network delegation both accept None). K2's
+        # modulation / RMSNorm are raw nn.Parameter tensors (never wrapped), so no exclusion is needed;
+        # users narrow the target set with --network_args exclude_patterns (see docs/krea2.md).
+        "target_modules": KREA2_TARGET_REPLACE_MODULES,
+        "exclude_patterns": [],
     },
     ARCHITECTURE_QWEN_IMAGE: {
         "target_modules": QWEN_IMAGE_TARGET_REPLACE_MODULES,
