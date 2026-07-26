@@ -243,6 +243,15 @@ Specify the project name with `--log_tracker_name` when using wandb.
 wandbを使用する場合は、`--log_tracker_name`でプロジェクト名を指定してください。
 </details>
 
+## Log gradient norm metrics / 勾配ノルムのメトリクスをログ出力
+
+The `--log_grad_metrics` option logs three pre-clipping gradient diagnostics to the active tracker (TensorBoard/wandb) each optimizer step: `grad/norm` (total L2 norm across all trainable parameters), `grad/mean_norm` (mean of the per-parameter L2 norms), and `grad/max` (largest absolute gradient element). These are measured *before* `--max_grad_norm` clipping, so they are useful for spotting gradient spikes or explosions — for example when a small mask concentrates the loss on few pixels. The flag is off by default and adds a small per-step GPU sync when enabled.
+
+<details>
+<summary>日本語</summary>
+`--log_grad_metrics`オプションを指定すると、オプティマイザのステップごとに勾配の診断値を3つトラッカー（TensorBoard/wandb）に出力します：`grad/norm`（全学習対象パラメータのL2ノルム合計）、`grad/mean_norm`（パラメータごとのL2ノルムの平均）、`grad/max`（勾配の絶対値の最大要素）。いずれも`--max_grad_norm`によるクリッピング前の値なので、勾配のスパイクや発散の検出に役立ちます（例：小さなマスクで損失が少数のピクセルに集中する場合など）。デフォルトは無効で、有効にするとステップごとにわずかなGPU同期のオーバーヘッドが発生します。
+</details>
+
 ## FP8 weight optimization for models / モデルの重みのFP8への最適化
 
 The `--fp8_scaled` option performs an offline optimization pass that rewrites selected Linear weights into FP8 (E4M3) with block-wise scaling. Compared with the legacy `--fp8` cast, it reduces VRAM usage while maintaining relatively high precision.
