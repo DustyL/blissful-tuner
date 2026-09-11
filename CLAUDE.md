@@ -795,6 +795,20 @@ training-time measurement.
 
 **Recorded results:**
 
+- **Krea 2 ConvRot int8** (`--convrot_int8`, 2026-09-11): **accepted**, opt-in. 3-condition gate on
+  DLAY subject-150 / 1024 / 300 steps / seed 42 (receipts:
+  `docs/plans/2026-09-11-krea2-convrot-int8-ab-gate.md`, artifacts `~/output/ab_gate_krea2_convrot/`).
+  fp8+sdpa 6.704 s/it @ 26,662 MiB -> convrot+sdpa 2.079 @ 24,332 -> convrot+flash 2.059 @ 24,228:
+  **3.26x faster, -2.4 GB peak, 0.08% loss parity**, same 224 patched Linears and same 794-key adapter
+  keyset as fp8. Mechanism (upstream's, confirmed): K2's fp8 path dequantizes to bf16 every forward
+  (no `scaled_mm`) while ConvRot runs a true int8 GEMM. **The attention backend is NOT the cause** —
+  flash buys only 1% over sdpa, so A being forced onto `--sdpa` by the fp8 guard is not what made it
+  slow. Convergence equivalence is NOT claimed: at 300 steps `lora_up` is still ~a no-op, and the
+  B-vs-C control (same quantizer, different attention kernel only) shows 1.20x magnitude / 0.937 cosine
+  spread on the learned side — so the A/B `lora_up` and `d*lr` spreads are intrinsic run variance, and
+  a bf16 reference condition would not adjudicate anything. Next gate is a production-length run on
+  samples, not another short condition.
+
 - **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
   was ~19% slower on Klein 9B with `compile=true`; safe-subset perf changes
   (in-place modulation, per-tensor `apply_rope`, deferred `single_block_mod`)
