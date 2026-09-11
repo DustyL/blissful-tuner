@@ -297,7 +297,48 @@ class ImageDirectoryDatasource(ImageDatasource):
         return fetcher
 
 
+def _is_numbered_variant(key: str, stem: str) -> bool:
+    """True for ``stem`` itself or ``stem_N`` (image_path_0, control_path_12, ...)."""
+    if key == stem:
+        return True
+    prefix = stem + "_"
+    return key.startswith(prefix) and key[len(prefix) :].isdigit()
+
+
+def _resolve_jsonl_relative_paths(records: list[dict], jsonl_file: str, path_key_stems: tuple[str, ...]) -> None:
+    """Rewrite relative path values in JSONL records to absolute paths, in place.
+
+    Relative paths are resolved against the working directory first (the historical behavior),
+    then against the JSONL's own directory, so a JSONL can be shipped next to its media and used
+    from any cwd. Whichever location matches is rewritten to an absolute path so downstream
+    consumers never re-resolve the value against a different base. A path found at neither
+    location is left untouched so the usual "file not found" error still names what was written.
+    Ported from upstream musubi-tuner #1020/#1023 (video JSONL only there); blissful applies it
+    to image JSONLs as well, including ``*_N`` numbered keys.
+    """
+    base_directory = os.path.dirname(os.path.abspath(jsonl_file))
+    for data in records:
+        for key, value in list(data.items()):
+            if not any(_is_numbered_variant(key, stem) for stem in path_key_stems):
+                continue
+            if not isinstance(value, str) or not value or os.path.isabs(value):
+                continue
+            jsonl_candidate = os.path.join(base_directory, value)
+            if os.path.exists(value):
+                data[key] = os.path.abspath(value)
+                if os.path.exists(jsonl_candidate) and not os.path.samefile(value, jsonl_candidate):
+                    logger.warning(
+                        f"{key} {value!r} exists both relative to the working directory and to the JSONL directory; "
+                        f"using the working-directory match {data[key]}"
+                    )
+            elif os.path.exists(jsonl_candidate):
+                data[key] = jsonl_candidate
+
+
 class ImageJsonlDatasource(ImageDatasource):
+    # path-valued keys (``image_path_N`` / ``control_path_N`` numbered variants included)
+    PATH_KEY_STEMS = ("image_path", "control_path")
+
     def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None, multiple_target: bool = False):
         super().__init__()
         self.image_jsonl_file = image_jsonl_file
@@ -323,6 +364,7 @@ class ImageJsonlDatasource(ImageDatasource):
 
                 self.data.append(data)
         logger.info(f"loaded {len(self.data)} images")
+        _resolve_jsonl_relative_paths(self.data, self.image_jsonl_file, ImageJsonlDatasource.PATH_KEY_STEMS)
 
         # Check for duplicate basenames (cache keys are basename-based)
         image_paths = [item.get("image_path", item.get("image_path_0")) for item in self.data]
@@ -644,6 +686,9 @@ class VideoDirectoryDatasource(VideoDatasource):
 
 
 class VideoJsonlDatasource(VideoDatasource):
+    # path-valued keys
+    PATH_KEY_STEMS = ("video_path", "control_path")
+
     def __init__(self, video_jsonl_file: str):
         super().__init__()
         self.video_jsonl_file = video_jsonl_file
@@ -667,6 +712,7 @@ class VideoJsonlDatasource(VideoDatasource):
 
                 self.data.append(data)
         logger.info(f"loaded {len(self.data)} videos")
+        _resolve_jsonl_relative_paths(self.data, self.video_jsonl_file, VideoJsonlDatasource.PATH_KEY_STEMS)
 
         # Check for duplicate basenames (cache keys are basename-based)
         video_paths = [item["video_path"] for item in self.data]
