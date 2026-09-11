@@ -115,6 +115,8 @@ JSONL file format for metadata:
 {"image_path": "/path/to/image2.jpg", "caption": "A caption for image2"}
 ```
 
+Relative paths in the JSONL (`image_path`, `control_path`, and their numbered `_N` variants; `video_path` / `control_path` for video JSONLs) are resolved against the working directory first (the historical behavior); when the file is not found there, they are resolved against the directory containing the JSONL file, so a JSONL can be kept next to its media and used from any working directory. If both locations contain the file, the working-directory match is used and a warning is logged.
+
 For Qwen-Image-Layered training, set `multiple_target = true`. Also, in the metadata JSONL file, for each "image to be trained + segmentation (layer) results" combination, specify the image paths with numbered attributes like `image_path_0`, `image_path_1`, etc.
 
 ```json
@@ -128,6 +130,8 @@ For Qwen-Image-Layered training, set `multiple_target = true`. Also, in the meta
 resolution, batch_size, num_repeats, enable_bucket, bucket_no_upscale は general または datasets のどちらかに設定してください。省略時は各項目のデフォルト値が使用されます。
 
 metadata jsonl ファイルを使用する場合、caption_extension は必要ありません。また、cache_directory は必須です。
+
+JSONL 内の相対パス（`image_path`、`control_path` とその `_N` 付きの番号付きキー、動画 JSONL では `video_path` / `control_path`）は、まず作業ディレクトリ基準で解決されます（従来どおりの挙動）。そこにファイルが存在しない場合は、JSONL ファイルのあるディレクトリ基準で解決されます。両方に存在する場合は作業ディレクトリ側が使用され、warning が出力されます。
 
 キャプションによるデータセットと同様に、複数のデータセットを追加できます。各データセットには異なる設定を持てます。
 

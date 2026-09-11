@@ -99,7 +99,9 @@ dev = [
   "matplotlib>=3.10.0",
   "pytest",
   "tensorboard",
-  "ruff",
+  # ruff 0.16.0 enabled many new lint rules by default, producing ~2500 new findings on this tree;
+  # pinned below 0.16 until those are triaged and resolved (mirrors upstream kohya-ss/musubi-tuner #1051)
+  "ruff>=0.12.10,<0.16",
 ]
 
 postprocess = [
