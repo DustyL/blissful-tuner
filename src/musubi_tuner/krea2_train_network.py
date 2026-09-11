@@ -123,6 +123,85 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def architecture_full_name(self) -> str:
         return ARCHITECTURE_KREA2_FULL
 
+    @staticmethod
+    def _reject_convrot_incompatible_adapters(args: argparse.Namespace) -> None:
+        """Reject adapter configurations that read the raw base weight, which ConvRot makes opaque.
+
+        Under ``--convrot_int8`` a target ``.weight`` holds Hadamard-ROTATED int8 codes. Consumers that
+        do true-weight-space math on it (DoRA's weight norm, PiSSA's SVD, a destructive merge) would
+        promote those codes to float and compute on lattice values -- no exception, silently wrong. The
+        runtime forward path is ConvRot-aware, so plain LoRA / LoHa / LoKr compose correctly.
+
+        ``networks/lora.py`` and ``networks/dora_utils.py`` carry the last-resort guards for every
+        entrypoint; this is the fail-fast one that reports before a 26 GB checkpoint is loaded.
+
+        Parsing MUST go through the same helpers the network factory uses (``parse_bool_arg``,
+        ``parse_init_lora_weights_arg``) -- a private copy silently drifts: an earlier hand-rolled
+        ``in ("true", "1")`` check missed ``use_dora=yes`` / ``on``, and ``== "pissa"`` missed
+        ``pissa_niter_<N>``. Guarded by tests/test_convrot_quantized_base_guards.py.
+        """
+        from musubi_tuner.networks.lora import parse_bool_arg, parse_init_lora_weights_arg
+
+        net_kwargs = {}
+        for net_arg in getattr(args, "network_args", None) or []:
+            key, _, value = net_arg.partition("=")
+            net_kwargs[key.strip()] = value.strip()
+
+        if parse_bool_arg(net_kwargs.get("use_dora"), default=False):
+            raise ValueError(
+                "--convrot_int8 is incompatible with DoRA (network_args use_dora): the DoRA weight norm reads the "
+                "raw base weight, which under ConvRot is int8 in the Hadamard-rotated basis. Use plain LoRA, LoHa "
+                "or LoKr, or train DoRA with --fp8_base --fp8_scaled instead."
+            )
+
+        init_weights = net_kwargs.get("init_lora_weights")
+        if init_weights is not None and parse_init_lora_weights_arg(init_weights).startswith("pissa"):
+            raise ValueError(
+                f"--convrot_int8 is incompatible with init_lora_weights={init_weights!r}: PiSSA SVDs the raw base "
+                "weight and writes a residual back into it, but under ConvRot that parameter holds rotated int8 "
+                "codes. Use init_lora_weights=kaiming or orthogonal."
+            )
+
+        if "lycoris" in (getattr(args, "network_module", "") or "").lower():
+            raise ValueError("--convrot_int8 is incompatible with the LyCORIS network bridge (reads raw base weights).")
+
+        # --base_weights merges adapters into the DiT *after* load_transformer has already quantized it
+        # (trainer_base.train: load_transformer -> base_weights merge), so the merge would land on rotated
+        # int8 codes. load_krea2_dit CAN merge adapters before quantization via its lora_weights hook, but
+        # the trainer's generic base_weights path does not use it.
+        if getattr(args, "base_weights", None):
+            raise ValueError(
+                "--convrot_int8 is incompatible with --base_weights: the merge runs after the DiT is quantized, so "
+                "it would write into rotated int8 codes and corrupt the base. Merge the base weights into a bf16 "
+                "checkpoint first (merge_lora.py) and pass that as --dit, or drop --convrot_int8."
+            )
+
+        # DoRA can also arrive from a checkpoint with no use_dora network arg at all:
+        # create_arch_network_from_weights infers it from use_dora_flag / dora_layer.weight keys.
+        for attr in ("dim_from_weights", "network_weights"):
+            path = getattr(args, attr, None)
+            if not path:
+                continue
+            try:
+                from safetensors.torch import safe_open
+
+                with safe_open(path, framework="pt") as f:
+                    keys = list(f.keys())
+                    has_dora = any("dora_layer.weight" in k for k in keys)
+                    if not has_dora and "use_dora_flag" in keys:
+                        has_dora = bool(f.get_tensor("use_dora_flag").item())
+            except ValueError:
+                raise
+            except Exception as e:  # unreadable/not-safetensors: let the normal loader report it
+                logger.warning(f"--convrot_int8: could not inspect --{attr} {path} for DoRA keys ({e}); continuing.")
+                continue
+            if has_dora:
+                raise ValueError(
+                    f"--convrot_int8 is incompatible with the DoRA adapter in --{attr} {path}: the network is built "
+                    "with DoRA inferred from its use_dora_flag / dora_layer.weight keys, and the DoRA weight norm "
+                    "reads the raw base weight (rotated int8 under ConvRot)."
+                )
+
     def handle_model_specific_args(self, args):
         self.dit_dtype = torch.bfloat16
         self._i2v_training = False
@@ -171,23 +250,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # PiSSA SVD would take ``W.float()`` of rotated lattice values — silently wrong, no crash.
         # (LoRA/LoHa/LoKr only call the module forward, which the ConvRot patch serves correctly.)
         if convrot_int8:
-            net_kwargs = {}
-            for net_arg in getattr(args, "network_args", None) or []:
-                key, _, value = net_arg.partition("=")
-                net_kwargs[key.strip()] = value.strip()
-            if net_kwargs.get("use_dora", "false").lower() in ("true", "1"):
-                raise ValueError(
-                    "--convrot_int8 is incompatible with DoRA (network_args use_dora=True): the DoRA weight norm "
-                    "reads the raw base weight, which is int8 in the rotated basis under ConvRot. Use plain LoRA, "
-                    "LoHa or LoKr, or train DoRA with --fp8_base --fp8_scaled instead."
-                )
-            if net_kwargs.get("init_lora_weights", "").lower() == "pissa":
-                raise ValueError(
-                    "--convrot_int8 is incompatible with init_lora_weights=pissa: PiSSA SVDs and rewrites the raw "
-                    "base weight, which is int8 in the rotated basis under ConvRot."
-                )
-            if "lycoris" in (getattr(args, "network_module", "") or "").lower():
-                raise ValueError("--convrot_int8 is incompatible with the LyCORIS network bridge (reads raw base weights).")
+            self._reject_convrot_incompatible_adapters(args)
         # RAW-train / Turbo-sample: the recommended K2 LoRA workflow is to train on the RAW
         # checkpoint and run inference on the distilled Turbo. --turbo_dit makes sample
         # generation during training swap the base weights to Turbo (LoRA, hooked on the live

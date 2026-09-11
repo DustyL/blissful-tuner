@@ -11,6 +11,38 @@ FP8_DTYPES = tuple(
 )
 
 
+def is_opaque_quantized_weight(weight: torch.Tensor) -> bool:
+    """True for a base weight whose stored values are NOT true weights and cannot be recovered by a scale.
+
+    fp8 weights are excluded: they are stored in true-value space up to a per-tensor/row/block scale,
+    so ``dequantize_fp8_weight`` recovers them and the DoRA/merge paths handle them explicitly.
+
+    The case this catches is a weight quantized into a *transformed basis* — currently ConvRot int8,
+    which stores Hadamard-ROTATED int8 codes plus a per-channel scale. Undoing that needs the inverse
+    rotation as well as the scale, which none of the true-space consumers (DoRA weight norm, PiSSA SVD,
+    destructive merge, pre_calculation) implement. Any integer dtype is treated as opaque: a float
+    consumer would silently promote the raw codes and compute on lattice values instead of weights.
+    """
+    return not weight.dtype.is_floating_point and not weight.dtype.is_complex
+
+
+def raise_if_opaque_quantized(weight: torch.Tensor, what: str, name: str = "") -> None:
+    """Refuse a true-weight-space operation on an opaquely-quantized base weight.
+
+    Fails loudly rather than computing on the raw codes, which produces no exception and no NaN --
+    just silently wrong magnitudes (see tests/test_convrot_quantized_base_guards.py).
+    """
+    if is_opaque_quantized_weight(weight):
+        where = f" ({name})" if name else ""
+        raise ValueError(
+            f"{what}: base weight{where} is quantized to {weight.dtype}, whose stored values are not true "
+            "weights (ConvRot stores Hadamard-rotated int8 codes). Recovering them needs the inverse "
+            "rotation, not just a scale, so this operation would compute on raw lattice values and be "
+            "silently wrong. Use the runtime forward path (which is ConvRot-aware), or run this against "
+            "a bf16 / fp8 base instead."
+        )
+
+
 def dequantize_fp8_weight(
     weight: torch.Tensor, scale_weight: torch.Tensor | None, compute_dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
@@ -71,6 +103,7 @@ def dora_weight_norm_materialized(
     is returned in the LoRA dtype — returning fp8 would re-poison the downstream
     ``magnitude / weight_norm`` division with the same promotion failure this path avoids.
     """
+    raise_if_opaque_quantized(weight, "DoRA weight norm")
     is_fp8 = weight.dtype in FP8_DTYPES
     if is_fp8:
         weight = dequantize_fp8_weight(weight, scale_weight)

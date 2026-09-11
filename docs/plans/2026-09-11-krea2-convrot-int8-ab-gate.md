@@ -52,16 +52,35 @@ Peak VRAM is the max of 1 Hz `nvidia-smi memory.used` over the whole run.
 
 ### Why the win is this large (upstream reports only ~1.2x on their Blackwell card)
 
-Upstream's own explanation, confirmed here: K2's fp8 path **dequantizes to bf16 on every forward**
-(no `scaled_mm`), so it pays a dequant per Linear and materializes a transient bf16 weight; ConvRot runs
-a true int8 GEMM and materializes nothing. That single mechanism explains the speed **and** the memory
-win together.
+K2's fp8 path **dequantizes on every forward** (`use_scaled_mm=False`, so
+`fp8_linear_forward_patch` takes its `F.linear`-on-a-dequantized-weight branch), paying a dequant per
+Linear and materializing a transient full-size weight; ConvRot's Triton forward runs a true int8 GEMM
+and materializes no dequantized weight. That is a real difference and plausibly the dominant one.
 
-**C falsifies the competing explanation.** A is *forced* onto `--sdpa` by blissful's fp8 + fused-attention
-guard, so the fp8 result could have been an attention handicap rather than a quantization one. It is not:
-C (flash) is only **1% faster** than B (sdpa), so the attention backend is nearly irrelevant at this shape
-and the whole 3.26x is attributable to the quantization path. (The freedom to use fused attention under
-ConvRot is therefore a correctness/ergonomics win, not a measurable speed win here.)
+**A single-mechanism attribution is NOT established, and an earlier revision of this file over-claimed
+it.** Two corrections:
+
+1. **A vs B changes more than the Linear implementation — it also changes the dtype flowing downstream.**
+   The fp8 dequant branch runs under `torch.autocast(enabled=False)` with `linear_dtype = x.dtype`, so it
+   **returns the input dtype**; ConvRot's forward explicitly casts to the autocast dtype. Measured on CPU
+   with a bf16 autocast active: an **fp32** input (which K2's fp32 modulation adds produce) yields **fp32**
+   out of fp8 and **bf16** out of ConvRot; a bf16 input yields bf16 from both. So condition A plausibly
+   feeds fp32 activations into attention where B and C feed bf16, and the 3.26x is a sum of the quantized
+   Linear *and* that precision change — not the Linear alone.
+2. **B vs C therefore does not isolate attention cost in A.** It measures flash-vs-sdpa **under ConvRot**,
+   i.e. at bf16. It says nothing about fp32-sdpa (what A actually runs) vs bf16-sdpa, so "the attention
+   backend is nearly irrelevant" holds only for the bf16 conditions. The earlier claim that C "falsifies"
+   an attention contribution in A was wrong.
+
+Also note ConvRot does **not** materialize nothing everywhere: the default `--convrot_int8_bwd bf16`
+backward explicitly builds `w_rot = wq.to(dtype) * scale`, and the no-Triton eager forward fallback
+dequantizes too. "Materializes nothing" is true only of the fused Triton forward.
+
+**What is safe to state:** the 3.26x and -2.4 GB are real, reproducible end-to-end differences between
+two *legal, production-shaped configurations* (fp8 cannot use fused attention here, so A+sdpa is the
+best available fp8 config). Isolating how much of it is the int8 GEMM versus the activation-precision
+change would need a further condition — e.g. fp8 with a forced bf16 output cast, or ConvRot with an fp32
+output cast — which has not been run.
 
 ## What the gate does NOT establish — and the control that bounds it
 
@@ -85,30 +104,44 @@ Direct adapter comparison (median over the 264 tensors of each role):
 
 ratios: A/B **2.22x**, A/C **1.85x**, **C/B 1.20x**
 
-**B vs C is the control, and it is the important row.** Those two runs share the quantizer, the seed and
-the data order, and differ only in the attention kernel's floating-point summation order — yet their
-learned side lands 1.20x apart in magnitude at only 0.937 median cosine, with individual tensors down to
-0.107. That is barely better than the A-vs-B figure (0.916) across *different* quantizers. So the
-`lora_up` spread is **intrinsic 300-step run variance, not a quantization-fidelity signal**, and the
-2.12x `d*lr` spread between A and B sits in the same band as the 1.38x that the kernel change alone
-produces. This independently reproduces the known local result that Prodigy `d*eff_lr` differences do
-not track sample quality (a prior DLAY A/B saw 22,000x with visually indistinguishable LoRAs).
+**B vs C is the informative row, but it does not license calling this "noise".** Those two runs share the
+quantizer, the seed and the data order and differ only in the attention kernel — yet their learned side
+lands 1.20x apart in magnitude at 0.937 median cosine, barely better than the A-vs-B figure (0.916)
+across *different* quantizers. What that supports is a **weakened inference**: a change unrelated to the
+quantizer moves the learned side by the same order as the quantizer change does, so the A-vs-B `lora_up`
+(2.22x) and `d*lr` (2.12x) spreads **cannot be attributed to quantizer fidelity** on this evidence.
 
-The `lora_down` column is the meaningful correctness read: the side dominated by its shared initialization
-is identical to ~2e-5 across every pair, i.e. base quantization is not structurally corrupting training.
+It does **not** establish a noise band. These are single runs per condition, and the attention backend is
+itself a systematic change (different kernels and summation order), not a repeated draw from a noise
+distribution. Separating run-to-run variance from a systematic quantizer effect would need repeats at
+fixed configuration, which were not run. An earlier revision of this file went too far in the other
+direction — first calling the A/B spread a meaningful trajectory difference, then calling it settled
+noise; **both were over-readings of n=1 per condition.** The supported statement is that quantizer
+effects on the learned updates are **unresolved**.
 
-**Consequence for follow-ups:** an unquantized bf16 reference condition (staged as
-`configs/D_bf16_swap.toml`, `blocks_to_swap=16` to fit 25.6 GB of bf16 weights) was considered and is
-**not worth running** — the B/C control shows it would land inside the same noise band and could not
-adjudicate which quantizer's gradients are "truer". The decisive test is a **production-length run**
-(the v3 recipe is 20 epochs / ~3000 steps) compared on samples, not another 300-step condition.
+The `lora_down` column (identical to ~2e-5 cosine across every pair) rules out *gross* corruption of the
+base or the gradient path, but it is dominated by the shared kaiming initialization, so it is weak
+evidence about the correctness of the learned updates specifically.
+
+**Consequence for follow-ups:** an unquantized bf16 reference condition is staged as
+`configs/D_bf16_swap.toml` (`blocks_to_swap=16` to fit 25.6 GB of bf16 weights) and was **not run**.
+Declining it is a cost judgement, not a prediction — its outcome cannot be forecast from these controls.
+The decisive test for production use remains a **production-length run** (the v3 recipe is 20 epochs /
+~3000 steps) compared on samples.
 
 ## Verdict
 
-Ship `--convrot_int8` as an opt-in flag. The performance claim is solid and mechanistically explained;
-structural correctness is verified (same 224 layers, same adapter keyset, `lora_down` parity). Convergence
-equivalence over a full run is **not** claimed and needs a production-length comparison before ConvRot
-replaces fp8 in a real DLAY recipe.
+Ship `--convrot_int8` as an opt-in flag. The performance measurement is solid (though its decomposition
+into int8-GEMM versus activation-precision effects is not); structural correctness is verified (same 224
+layers, same adapter keyset, no gross `lora_down` drift). Convergence equivalence over a full run is
+**not** claimed and needs a production-length comparison before ConvRot replaces fp8 in a real DLAY recipe.
+
+Adapters that read the raw base weight are rejected fail-fast, because under ConvRot `.weight` holds
+Hadamard-rotated int8 codes: DoRA, PiSSA init, the LyCORIS bridge, `--base_weights` (whose merge runs
+*after* quantization), and DoRA inferred from a `--network_weights` / `--dim_from_weights` checkpoint.
+`networks/dora_utils.raise_if_opaque_quantized` backs this up at the five true-weight-space consumers
+(both DoRA norms, `merge_to`, `pre_calculation`, PiSSA init) so non-trainer entrypoints are covered too.
+See `tests/test_convrot_quantized_base_guards.py`.
 
 Untested combinations, deliberately not claimed as supported:
 

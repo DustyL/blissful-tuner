@@ -800,14 +800,17 @@ training-time measurement.
   `docs/plans/2026-09-11-krea2-convrot-int8-ab-gate.md`, artifacts `~/output/ab_gate_krea2_convrot/`).
   fp8+sdpa 6.704 s/it @ 26,662 MiB -> convrot+sdpa 2.079 @ 24,332 -> convrot+flash 2.059 @ 24,228:
   **3.26x faster, -2.4 GB peak, 0.08% loss parity**, same 224 patched Linears and same 794-key adapter
-  keyset as fp8. Mechanism (upstream's, confirmed): K2's fp8 path dequantizes to bf16 every forward
-  (no `scaled_mm`) while ConvRot runs a true int8 GEMM. **The attention backend is NOT the cause** —
-  flash buys only 1% over sdpa, so A being forced onto `--sdpa` by the fp8 guard is not what made it
-  slow. Convergence equivalence is NOT claimed: at 300 steps `lora_up` is still ~a no-op, and the
-  B-vs-C control (same quantizer, different attention kernel only) shows 1.20x magnitude / 0.937 cosine
-  spread on the learned side — so the A/B `lora_up` and `d*lr` spreads are intrinsic run variance, and
-  a bf16 reference condition would not adjudicate anything. Next gate is a production-length run on
-  samples, not another short condition.
+  keyset as fp8. Partial mechanism: K2's fp8 path dequantizes every forward (`use_scaled_mm=False`)
+  while ConvRot runs a true int8 GEMM — but **a single-mechanism attribution is NOT established**. The
+  fp8 patch returns its *input* dtype under `autocast(enabled=False)`, so K2's fp32 modulation output
+  leaves fp8 Linears as fp32 while ConvRot casts to bf16 (verified): A vs B also changes the precision
+  reaching attention, and B vs C (flash 1% over sdpa) only bounds that at bf16, NOT for A's fp32-sdpa.
+  Convergence equivalence is NOT claimed and quantizer effects on learned updates are **unresolved**:
+  at 300 steps `lora_up` is ~a no-op, and B-vs-C (same quantizer, attention kernel only) spreads it
+  1.20x / 0.937 cos — which defeats attributing A/B's 2.22x to the quantizer, but with n=1 per condition
+  does NOT prove it is noise or predict an unrun bf16 condition. Next gate is a production-length run
+  on samples. **Two over-claims were corrected here after review — do not restate either direction as
+  settled from these runs.**
 
 - **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
   was ~19% slower on Klein 9B with `compile=true`; safe-subset perf changes

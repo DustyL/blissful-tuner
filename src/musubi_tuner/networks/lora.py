@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from blissful_tuner.blissful_logger import BlissfulLogger
-from musubi_tuner.networks.dora_utils import FP8_DTYPES, dequantize_fp8_weight
+from musubi_tuner.networks.dora_utils import FP8_DTYPES, dequantize_fp8_weight, raise_if_opaque_quantized
 from musubi_tuner.networks.dora_utils import dora_weight_norm_materialized as _dora_weight_norm_materialized
 
 if TYPE_CHECKING:
@@ -315,6 +315,7 @@ class DoRALayer(nn.Module):
         # yields quantization-lattice magnitudes (~200x off) — silently wrong norms, wrong DoRA scaling.
         # After dequant W is float32, so the .to(W.dtype) at the end also stays non-fp8 (an fp8 norm
         # would crash the downstream magnitude/norm division with the same Float8-promotion error).
+        raise_if_opaque_quantized(W, "DoRA weight norm")
         if W.dtype in FP8_DTYPES:
             W = dequantize_fp8_weight(W, scale_weight)
         Wf, Af, Bf = W.float(), A.float(), B.float()
@@ -452,6 +453,9 @@ class LoRAModule(torch.nn.Module):
 
             if is_pissa:
                 # PiSSA: SVD the base, residualize. Conv2d / split_dims / DoRA already rejected above.
+                # An opaquely-quantized base would be SVD'd in its rotated lattice space and the
+                # residual written back into the int8 parameter -- refuse rather than corrupt it.
+                raise_if_opaque_quantized(org_module.weight.data, "PiSSA init", self.lora_name)
                 residual = _init_pissa_lora_pair(
                     self.lora_down,
                     self.lora_up,
@@ -749,6 +753,9 @@ class LoRAInfModule(LoRAModule):
         # reads raw fp8 lattice values (silently ~1000x off without scale_weight), and writing merged
         # true-space values back as fp8 without inverse re-scaling (plus saturation handling) would
         # corrupt the checkpoint. Runtime LoRA application (LoRAInfModule.forward) IS fp8-aware; use it.
+        # Opaquely-quantized base (ConvRot int8): the float cast below would read raw ROTATED codes and
+        # write the merged values straight back into the int8 parameter -- no exception, corrupt base.
+        raise_if_opaque_quantized(weight, "merge_to", self.lora_name)
         if weight.dtype in FP8_DTYPES:
             raise ValueError(
                 f"merge_to: cannot merge LoRA into fp8-prequantized base weights ({self.lora_name}, {weight.dtype}). "
@@ -1692,6 +1699,7 @@ class LoRANetwork(torch.nn.Module):
             # scale_weight), but this consumer would anchor it to the raw fp8 lattice values and re-store
             # as fp8 without re-scaling — numerically inconsistent. Refuse loudly; the runtime forward
             # path handles fp8 correctly without pre-calculation.
+            raise_if_opaque_quantized(org_weight, "pre_calculation", lora.lora_name)
             if org_weight.dtype in FP8_DTYPES:
                 raise ValueError(
                     f"pre_calculation: cannot bake LoRA into fp8-prequantized base weights ({lora.lora_name}, "
