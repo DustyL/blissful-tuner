@@ -9,6 +9,7 @@ import torch
 from tqdm import tqdm
 
 from musubi_tuner.utils.device_utils import synchronize_device
+from musubi_tuner.networks.dora_utils import raise_if_opaque_quantized
 from musubi_tuner.utils.safetensors_utils import (
     MemoryEfficientSafeOpen,
     TensorWeightAdapter,
@@ -152,6 +153,7 @@ def load_safetensors_with_lora_and_fp8(
     quantization_mode: str = "block",
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    quantizer=None,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -167,6 +169,9 @@ def load_safetensors_with_lora_and_fp8(
         exclude_keys (Optional[List[str]]): Keys to exclude from optimization.
         disable_numpy_memmap (bool): Whether to disable numpy memmap when loading safetensors.
         weight_transform_hooks (Optional[WeightTransformHooks]): Hooks for transforming weights during loading.
+        quantizer: Optional quantization strategy object with its own streaming loader
+            (e.g. ConvRotInt8Quantizer). Mutually exclusive with fp8_optimization. The LoRA
+            merge weight_hook is passed through, so LoRA is merged before quantization.
     """
 
     # if the file name ends with 00001-of-00004 etc, we need to load the files with the same prefix
@@ -255,6 +260,7 @@ def load_safetensors_with_lora_and_fp8(
         quantization_mode=quantization_mode,
         disable_numpy_memmap=disable_numpy_memmap,
         weight_transform_hooks=weight_transform_hooks,
+        quantizer=quantizer,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -278,10 +284,23 @@ def load_safetensors_with_fp8_optimization_and_hook(
     quantization_mode: str = "block",
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    quantizer=None,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
     """
+    if quantizer is not None:
+        assert not fp8_optimization, "quantizer and fp8_optimization are mutually exclusive"
+        logger.info(f"Loading state dict with {type(quantizer).__name__}. Hook enabled: {weight_hook is not None}")
+        return quantizer.load_and_quantize(
+            model_files,
+            calc_device,
+            move_to_device=move_to_device,
+            weight_hook=weight_hook,
+            disable_numpy_memmap=disable_numpy_memmap,
+            weight_transform_hooks=weight_transform_hooks,
+        )
+
     if fp8_optimization:
         logger.info(
             f"Loading state dict with FP8 optimization. Dtype of weight: {dit_weight_dtype}, hook enabled: {weight_hook is not None}"
@@ -348,6 +367,12 @@ def lora_merge_weights_to_tensor(
 
     if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
         return model_weight
+
+    # Opaque-int only, not fp8: this helper gets a bare tensor with no visible scale_weight, and
+    # plain fp8 merging is supported (test_merge_hybrid.py::test_fp8_cast). BEFORE the cast below: that cast maps any 1-byte dtype (int8 included) to
+    # float16, which would erase the evidence and defeat a guard placed further down -- including
+    # the one inside the DoRA weight norm this function calls.
+    raise_if_opaque_quantized(model_weight, "LoRA merge_weights_to_tensor", lora_name)
 
     def get_bool_flag(*keys: str) -> bool:
         for key in keys:

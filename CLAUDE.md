@@ -795,6 +795,36 @@ training-time measurement.
 
 **Recorded results:**
 
+- **Krea 2 ConvRot int8** (`--convrot_int8`, 2026-09-11): **accepted**, opt-in. 3-condition gate on
+  DLAY subject-150 / 1024 / 300 steps / seed 42 (receipts:
+  `docs/plans/2026-09-11-krea2-convrot-int8-ab-gate.md`, artifacts `~/output/ab_gate_krea2_convrot/`).
+  fp8+sdpa 6.704 s/it @ 26,662 MiB -> convrot+sdpa 2.079 @ 24,332 -> convrot+flash 2.059 @ 24,228:
+  **3.26x faster, -2.4 GB peak, 0.08% loss parity**, same 224 patched Linears and same 794-key adapter
+  keyset as fp8. Partial mechanism: K2's fp8 path dequantizes every forward (`use_scaled_mm=False`)
+  while ConvRot runs a true int8 GEMM — but **a single-mechanism attribution is NOT established**. The
+  fp8 patch returns its *input* dtype under `autocast(enabled=False)`, so K2's fp32 modulation output
+  leaves fp8 Linears as fp32 while ConvRot casts to bf16 (verified): A vs B also changes the precision
+  reaching attention, and B vs C (flash 1% over sdpa) only bounds that at bf16, NOT for A's fp32-sdpa.
+  Convergence equivalence is NOT claimed and quantizer effects on learned updates are **unresolved**:
+  at 300 steps `lora_up` is ~a no-op, and B-vs-C (same quantizer, attention kernel only) spreads it
+  1.20x / 0.937 cos — which defeats attributing A/B's 2.22x to the quantizer, but with n=1 per condition
+  does NOT prove it is noise or predict an unrun bf16 condition. Next gate is a production-length run
+  on samples. **Two over-claims were corrected here after review — do not restate either direction as
+  settled from these runs.** `lora_down` similarity is init-dominated and validates nothing on its own
+  (a disconnected gradient path would look the same).
+
+- **ConvRot merge guards (2026-09-11, after two review rounds)**: a destructive merge into a
+  ConvRot base is silent corruption, and there are **six** mergers, not one —
+  `LoRA/LoHa/LoKr *InfModule.merge_to` plus the three tensor helpers behind `merge_nonlora_to_model`.
+  Round 1 guarded only the LoRA module path; review found LoHa (8,056 codes), LoKr (333) and the shared
+  dispatcher (8,062) still corrupting, with `safe_merge=True` no help (it checks finiteness, and wrong-
+  representation arithmetic is finite). Guard at the DTYPE via
+  `dora_utils.raise_if_unmergeable_base`, placed **before any cast** — `lora_merge_weights_to_tensor`'s
+  `compute_dtype = float16 if itemsize == 1` erases int8-ness and defeats a later check — and **after**
+  the no-matching-key early return, since `merge_nonlora_to_model` calls all three helpers for every
+  parameter. LoHa/LoKr silently corrupted an **fp8** base too (LoRA already refused); fixed in the same
+  pass.
+
 - **xzuyn-optimizations + Liger fused kernels** (2026-05-13): rejected. Liger
   was ~19% slower on Klein 9B with `compile=true`; safe-subset perf changes
   (in-place modulation, per-tensor `apply_rope`, deferred `single_block_mod`)
