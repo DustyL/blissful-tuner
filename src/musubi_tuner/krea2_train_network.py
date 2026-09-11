@@ -156,6 +156,38 @@ class Krea2NetworkTrainer(NetworkTrainer):
                     "(only SDPA/torch accepts fp32). Use --sdpa with --fp8_scaled, or drop --fp8_scaled to "
                     "run a fused backend in bf16."
                 )
+        # ConvRot int8 is an alternative base-weight quantization; one quantization at a time.
+        convrot_int8 = getattr(args, "convrot_int8", False)
+        if convrot_int8 and (args.fp8_base or args.fp8_scaled):
+            raise ValueError("--convrot_int8 cannot be combined with --fp8_base/--fp8_scaled: choose one quantization.")
+        # Turbo sampling would need the ConvRot quantizer threaded through the Turbo/RAW weight
+        # stashes (load_krea2_dit_state_dict); not wired up yet.
+        if convrot_int8 and args.turbo_dit:
+            raise ValueError("--convrot_int8 is not supported together with --turbo_dit yet; omit one of them.")
+        if getattr(args, "convrot_int8_bwd", "bf16") == "int8" and not convrot_int8:
+            raise ValueError("--convrot_int8_bwd int8 requires --convrot_int8.")
+        # Adapters that read the raw base weight cannot see through ConvRot: ``.weight`` is int8 in
+        # the Hadamard-ROTATED basis, and int8 is not an fp8 dtype, so the DoRA weight-norm and the
+        # PiSSA SVD would take ``W.float()`` of rotated lattice values — silently wrong, no crash.
+        # (LoRA/LoHa/LoKr only call the module forward, which the ConvRot patch serves correctly.)
+        if convrot_int8:
+            net_kwargs = {}
+            for net_arg in getattr(args, "network_args", None) or []:
+                key, _, value = net_arg.partition("=")
+                net_kwargs[key.strip()] = value.strip()
+            if net_kwargs.get("use_dora", "false").lower() in ("true", "1"):
+                raise ValueError(
+                    "--convrot_int8 is incompatible with DoRA (network_args use_dora=True): the DoRA weight norm "
+                    "reads the raw base weight, which is int8 in the rotated basis under ConvRot. Use plain LoRA, "
+                    "LoHa or LoKr, or train DoRA with --fp8_base --fp8_scaled instead."
+                )
+            if net_kwargs.get("init_lora_weights", "").lower() == "pissa":
+                raise ValueError(
+                    "--convrot_int8 is incompatible with init_lora_weights=pissa: PiSSA SVDs and rewrites the raw "
+                    "base weight, which is int8 in the rotated basis under ConvRot."
+                )
+            if "lycoris" in (getattr(args, "network_module", "") or "").lower():
+                raise ValueError("--convrot_int8 is incompatible with the LyCORIS network bridge (reads raw base weights).")
         # RAW-train / Turbo-sample: the recommended K2 LoRA workflow is to train on the RAW
         # checkpoint and run inference on the distilled Turbo. --turbo_dit makes sample
         # generation during training swap the base weights to Turbo (LoRA, hooked on the live
@@ -465,12 +497,20 @@ class Krea2NetworkTrainer(NetworkTrainer):
     ):
         # For fp8_scaled, dit_weight_dtype is None (the base trainer skips the post-load cast);
         # the fp8 path ignores dtype and keeps non-target weights in their checkpoint dtype.
+        # For convrot_int8, dit_weight_dtype equals dit_dtype (bf16), so the post-load cast is
+        # a no-op; nn.Module.to would not touch the int8 weights anyway.
         dtype = dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
         model = krea2_utils.load_krea2_dit(
             dit_path,
-            device=loading_device,
+            # device is the calc device for quantization / LoRA merge; under block swap
+            # loading_device is "cpu" and the weights are returned there, but the per-tensor
+            # computation should still run on the GPU (CPU quantization is extremely slow,
+            # especially the ConvRot rotation matmuls).
+            device=accelerator.device,
             dtype=dtype,
             fp8_scaled=args.fp8_scaled,
+            convrot_int8=getattr(args, "convrot_int8", False),
+            convrot_int8_bwd=getattr(args, "convrot_int8_bwd", "bf16"),
             loading_device=loading_device,
             attn_mode=attn_mode,
             split_attn=split_attn,
@@ -482,7 +522,10 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # Compile the per-block SingleStreamBlocks (the heavy, repeated compute). The forward
         # already pads the combined sequence to a multiple of 256 to keep kernel shapes stable.
         # When block swap is on, exclude the swap blocks' Linears from compile (cf. zimage/qwen_image).
-        return model_utils.compile_transformer(args, model, [model.blocks], disable_linear=self.blocks_to_swap > 0)
+        # ConvRot int8 Linears are also excluded: the custom autograd.Function + autotuned Triton
+        # kernels are not dynamo-traceable.
+        disable_linear = self.blocks_to_swap > 0 or getattr(args, "convrot_int8", False)
+        return model_utils.compile_transformer(args, model, [model.blocks], disable_linear=disable_linear)
 
     def scale_shift_latents(self, latents):
         # K2 latents are already normalized by the Qwen-Image VAE caching ((raw-mean)/std).
@@ -566,6 +609,23 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "--fp8_scaled",
         action="store_true",
         help="use dynamic scaled fp8 for the DiT (requires --fp8_base). Quantizes per-block Linears at load time.",
+    )
+    parser.add_argument(
+        "--convrot_int8",
+        action="store_true",
+        help="use ConvRot int8 for the DiT base weights (alternative to fp8; cannot be combined with "
+        "--fp8_base/--fp8_scaled, --turbo_dit, DoRA, PiSSA init or LyCORIS). Quantizes per-block Linears at load "
+        "time with Hadamard rotation + int8; forward runs a fused Triton int8 GEMM (falls back to a slower "
+        "dequantized bf16 matmul without triton). Unlike fp8, activations leave the Linear in the autocast "
+        "dtype, so fused attention backends are not excluded.",
+    )
+    parser.add_argument(
+        "--convrot_int8_bwd",
+        type=str,
+        default="bf16",
+        choices=["bf16", "int8"],
+        help="backward mode for --convrot_int8. bf16 (default): transient dequantized matmul, most accurate. "
+        "int8: reuse the fused int8 GEMM for grad_x (faster, quantizes gradients slightly, requires triton).",
     )
     parser.add_argument(
         "--text_encoder",
