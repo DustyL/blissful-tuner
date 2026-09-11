@@ -230,6 +230,12 @@ Reference speed (rough 20-step measurement; LoRA training, 1024x1024, batch size
 
 Loss curves match the fp8/bf16 baselines closely (both backward modes). `--convrot_int8_bwd int8` shows no measurable step-time gain under gradient checkpointing (the backward is dominated by the forward recomputation); it is mainly useful on pre-fp8 GPUs without checkpointing. fp8 is slower than bf16 here because the K2 fp8 path dequantizes to bf16 per forward (no scaled_mm); ConvRot runs a true int8 GEMM, which is why it wins on GPUs without fp8 support.
 
+**blissful-tuner specifics (on top of the upstream port):**
+
+- **Fused attention is allowed with ConvRot.** Unlike `--fp8_scaled` (which feeds fp32 activations to attention and is therefore restricted to `--sdpa`), the ConvRot forward casts its output to the autocast dtype, so `--flash_attn` / `--xformers` / `--sage_attn` work as in bf16.
+- **Rejected combinations (fail fast in `handle_model_specific_args`):** `--fp8_base`/`--fp8_scaled`, `--turbo_dit`, `--convrot_int8_bwd int8` without `--convrot_int8`, DoRA (`network_args use_dora=True`), PiSSA init (`init_lora_weights=pissa`) and the LyCORIS bridge. The last three read the raw base weight, which under ConvRot is int8 in the **rotated** basis — int8 is not an fp8 dtype, so the DoRA weight norm / PiSSA SVD would silently use rotated lattice values. Plain LoRA, LoHa and LoKr only call the module forward and compose correctly.
+- Quantization runs on the accelerator device even under `--blocks_to_swap` (weights are returned to CPU afterwards); the CPU rotation matmuls are far too slow otherwise.
+
 <details>
 <summary>日本語</summary>
 
