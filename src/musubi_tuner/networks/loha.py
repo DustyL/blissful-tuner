@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Note: logging.basicConfig removed to avoid conflicts with BlissfulLogger - configure at entry points
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
+from musubi_tuner.networks.dora_utils import raise_if_opaque_quantized, raise_if_unmergeable_base
 from musubi_tuner.networks.network_arch import get_arch_config
 
 if TYPE_CHECKING:
@@ -172,6 +173,8 @@ class LoHaModule(torch.nn.Module):
     def merge_to(self, sd, dtype, device, non_blocking=False):
         org_sd = self.org_module.state_dict()
         weight = org_sd["weight"]
+        # Refuse before any conversion: ConvRot int8 (rotated codes) and fp8 are both unmergeable.
+        raise_if_unmergeable_base(weight, "LoHa merge_to", self.lora_name)
         org_dtype = weight.dtype
         org_device = weight.device
         merge_device = org_device if device is None else device
@@ -809,6 +812,15 @@ def merge_weights_to_tensor(
 
     if w1a_key not in lora_weight_keys:
         return model_weight
+
+    # Only the opaque-int case is refused here, NOT fp8: this helper is handed a bare tensor by
+    # merge_nonlora_to_model (iterating named_parameters), so it cannot see a sibling scale_weight
+    # buffer -- a plain fp8 tensor's stored values ARE its true weights and merging it is supported.
+    # int8 codes are never true weights, with or without a visible scale. The module-level
+    # merge_to above CAN see scale_weight, so it uses the stricter guard, matching LoRA's policy.
+    # Guarded only AFTER the no-matching-key early return, so a no-op call on a quantized module
+    # (this helper is invoked for every parameter by merge_nonlora_to_model) stays a no-op.
+    raise_if_opaque_quantized(model_weight, "LoHa merge_weights_to_tensor", lora_name)
 
     w1a = lora_sd[w1a_key].to(calc_device)
     w1b = lora_sd[w1b_key].to(calc_device)

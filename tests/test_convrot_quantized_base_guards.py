@@ -245,3 +245,160 @@ def test_guards_are_inert_without_convrot():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+# --------------------------------- layer 1b: the OTHER destructive mergers
+#
+# LoRAInfModule.merge_to is not the only merger. LoHa and LoKr have wholly independent
+# implementations, and merge_nonlora_to_model dispatches to three separate tensor-merging
+# helpers. A review found all of these still corrupting ConvRot weights after the first
+# round of guards, so each one is pinned here.
+#
+# These use the STRICTER raise_if_unmergeable_base, which also refuses fp8: a merge has to
+# write its result back, and re-quantizing into fp8 needs inverse scaling these mergers do
+# not implement. (LoHa/LoKr previously accepted an fp8 base and corrupted it too -- verified
+# at 502/16384 and 13956/16384 codes changed before this guard.)
+
+
+def _loha_sd():
+    return {
+        "hada_w1_a": torch.randn(N, R) * 0.05,
+        "hada_w1_b": torch.randn(R, K) * 0.05,
+        "hada_w2_a": torch.randn(N, R) * 0.05,
+        "hada_w2_b": torch.randn(R, K) * 0.05,
+        "alpha": torch.tensor(float(R)),
+    }
+
+
+def _lokr_sd():
+    return {"lokr_w1": torch.randn(8, 8) * 0.05, "lokr_w2": torch.randn(N // 8, K // 8) * 0.05, "alpha": torch.tensor(float(R))}
+
+
+def _lora_tensor_sd(prefix="lora_unet_l"):
+    return {
+        f"{prefix}.lora_down.weight": torch.randn(R, K) * 0.05,
+        f"{prefix}.lora_up.weight": torch.randn(N, R) * 0.05,
+        f"{prefix}.alpha": torch.tensor(float(R)),
+    }
+
+
+def test_loha_module_merge_refuses_convrot_base_without_mutating():
+    from musubi_tuner.networks.loha import LoHaInfModule
+
+    m = _convrot_linear()
+    before = m.l.weight.data.clone()
+    mod = LoHaInfModule("l", m.l, multiplier=1.0, lora_dim=R, alpha=R)
+    with pytest.raises(ValueError, match="LoHa merge_to"):
+        mod.merge_to(_loha_sd(), None, "cpu")
+    assert torch.equal(m.l.weight.data, before)
+
+
+def test_lokr_module_merge_refuses_convrot_base_without_mutating():
+    from musubi_tuner.networks.lokr import LoKrInfModule
+
+    m = _convrot_linear()
+    before = m.l.weight.data.clone()
+    mod = LoKrInfModule("l", m.l, multiplier=1.0, lora_dim=R, alpha=R)
+    with pytest.raises(ValueError, match="LoKr merge_to"):
+        mod.merge_to(_lokr_sd(), None, "cpu")
+    assert torch.equal(m.l.weight.data, before)
+
+
+def test_shared_dispatcher_refuses_convrot_base_even_with_safe_merge():
+    """safe_merge only checks finiteness; arithmetic in the wrong representation is finite."""
+    from musubi_tuner.utils.lora_utils import merge_nonlora_to_model
+
+    m = _convrot_linear()
+    before = m.l.weight.data.clone()
+    with pytest.raises(ValueError, match="merge_weights_to_tensor"):
+        merge_nonlora_to_model(m, _lora_tensor_sd(), multiplier=1.0, device="cpu", safe_merge=True)
+    assert torch.equal(m.l.weight.data, before)
+
+
+@pytest.mark.parametrize("which", ["loha", "lokr", "lora"])
+def test_tensor_helpers_refuse_int8_when_keys_match(which):
+    from musubi_tuner.networks.loha import merge_weights_to_tensor as loha_merge
+    from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
+    from musubi_tuner.utils.lora_utils import lora_merge_weights_to_tensor
+
+    wq, _ = quantize_weight_convrot("w", torch.randn(N, K) * 0.02, CONVROT_GROUPSIZE)
+    fn, sd = {
+        "loha": (loha_merge, {f"lora_unet_l.{k}": v for k, v in _loha_sd().items()}),
+        "lokr": (lokr_merge, {f"lora_unet_l.{k}": v for k, v in _lokr_sd().items()}),
+        "lora": (lora_merge_weights_to_tensor, _lora_tensor_sd()),
+    }[which]
+    keys = set(sd.keys())
+    n_before = len(keys)
+    before = wq.clone()
+
+    with pytest.raises(ValueError, match="merge_weights_to_tensor"):
+        fn(wq, "lora_unet_l", sd, keys, 1.0, "cpu")
+
+    # the reviewer's explicit requirements: refuse without touching weights OR key bookkeeping
+    assert torch.equal(wq, before), "must not mutate the base weight"
+    assert len(keys) == n_before, "must not consume adapter keys when refusing"
+
+
+@pytest.mark.parametrize("which", ["loha", "lokr", "lora"])
+def test_tensor_helpers_stay_noops_on_int8_when_no_keys_match(which):
+    """merge_nonlora_to_model calls all three helpers for EVERY parameter, so a helper with no
+    matching keys must stay a silent no-op even on a quantized weight -- otherwise merging a
+    LoRA would fail with a misleading LoHa error."""
+    from musubi_tuner.networks.loha import merge_weights_to_tensor as loha_merge
+    from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
+    from musubi_tuner.utils.lora_utils import lora_merge_weights_to_tensor
+
+    fn = {"loha": loha_merge, "lokr": lokr_merge, "lora": lora_merge_weights_to_tensor}[which]
+    wq, _ = quantize_weight_convrot("w", torch.randn(N, K) * 0.02, CONVROT_GROUPSIZE)
+    keys: set = set()
+    out = fn(wq, "lora_unet_nomatch", {}, keys, 1.0, "cpu")
+    assert out is wq
+    assert keys == set()
+
+
+@pytest.mark.parametrize("which", ["loha", "lokr", "lora"])
+def test_tensor_helpers_still_merge_a_float_base(which):
+    """The guards must not block the supported path."""
+    from musubi_tuner.networks.loha import merge_weights_to_tensor as loha_merge
+    from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
+    from musubi_tuner.utils.lora_utils import lora_merge_weights_to_tensor
+
+    fn, sd = {
+        "loha": (loha_merge, {f"lora_unet_l.{k}": v for k, v in _loha_sd().items()}),
+        "lokr": (lokr_merge, {f"lora_unet_l.{k}": v for k, v in _lokr_sd().items()}),
+        "lora": (lora_merge_weights_to_tensor, _lora_tensor_sd()),
+    }[which]
+    w = torch.randn(N, K) * 0.02
+    keys = set(sd.keys())
+    out = fn(w.clone(), "lora_unet_l", sd, keys, 1.0, "cpu")
+    assert not torch.equal(out, w), "a matching adapter must actually be merged"
+    assert torch.isfinite(out).all()
+    assert len(keys) < len(sd), "consumed keys must be removed on the success path"
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="fp8 dtype unavailable")
+def test_loha_and_lokr_merge_also_refuse_fp8_matching_lora_policy():
+    """Pre-existing gap closed alongside: LoRA refused fp8 merges, LoHa/LoKr silently corrupted them."""
+    from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+    from musubi_tuner.networks.loha import LoHaInfModule
+    from musubi_tuner.networks.lokr import LoKrInfModule
+
+    for cls, sd_fn, pattern in ((LoHaInfModule, _loha_sd, "LoHa merge_to"), (LoKrInfModule, _lokr_sd, "LoKr merge_to")):
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l = nn.Linear(K, N, bias=False)
+
+            def forward(self, x):
+                return self.l(x)
+
+        m = M()
+        sd8 = optimize_state_dict_with_fp8({"l.weight": (torch.randn(N, K) * 0.02)}, None, ["l."], None)
+        apply_fp8_monkey_patch(m, sd8, use_scaled_mm=False)
+        m.load_state_dict(sd8, strict=True, assign=True)
+        before = m.l.weight.data.clone()
+        mod = cls("l", m.l, multiplier=1.0, lora_dim=R, alpha=R)
+        with pytest.raises(ValueError, match=pattern):
+            mod.merge_to(sd_fn(), None, "cpu")
+        assert torch.equal(m.l.weight.data, before)

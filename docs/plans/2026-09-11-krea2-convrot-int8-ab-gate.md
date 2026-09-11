@@ -119,9 +119,11 @@ direction — first calling the A/B spread a meaningful trajectory difference, t
 noise; **both were over-readings of n=1 per condition.** The supported statement is that quantizer
 effects on the learned updates are **unresolved**.
 
-The `lora_down` column (identical to ~2e-5 cosine across every pair) rules out *gross* corruption of the
-base or the gradient path, but it is dominated by the shared kaiming initialization, so it is weak
-evidence about the correctness of the learned updates specifically.
+The `lora_down` tensors remain close across conditions (~2e-5 cosine), largely reflecting shared
+initialization. **This does not independently validate the base computation or the gradient path** — a
+gradient path that was disconnected entirely would leave `lora_down` sitting at exactly that shared
+initialization and so would look identical. Structural correctness rests on the layer/keyset counts above
+and on the unit tests, not on this column.
 
 **Consequence for follow-ups:** an unquantized bf16 reference condition is staged as
 `configs/D_bf16_swap.toml` (`blocks_to_swap=16` to fit 25.6 GB of bf16 weights) and was **not run**.
@@ -139,9 +141,15 @@ layers, same adapter keyset, no gross `lora_down` drift). Convergence equivalenc
 Adapters that read the raw base weight are rejected fail-fast, because under ConvRot `.weight` holds
 Hadamard-rotated int8 codes: DoRA, PiSSA init, the LyCORIS bridge, `--base_weights` (whose merge runs
 *after* quantization), and DoRA inferred from a `--network_weights` / `--dim_from_weights` checkpoint.
-`networks/dora_utils.raise_if_opaque_quantized` backs this up at the five true-weight-space consumers
-(both DoRA norms, `merge_to`, `pre_calculation`, PiSSA init) so non-trainer entrypoints are covered too.
-See `tests/test_convrot_quantized_base_guards.py`.
+Two dtype-level guards in `networks/dora_utils.py` back this up so non-trainer callers are covered too:
+`raise_if_opaque_quantized` at the read-only true-weight-space consumers (both DoRA weight norms,
+`pre_calculation`, PiSSA init), and the stricter `raise_if_unmergeable_base` — which refuses fp8 as well,
+since a merge must write its result back — at **every** destructive merger: `LoRAInfModule.merge_to`,
+`LoHaModule.merge_to`, `LoKrInfModule.merge_to`, and all three tensor helpers behind
+`merge_nonlora_to_model` (LoRA/LoHa/LoKr). The LoRA tensor helper is guarded *before* its
+`compute_dtype = float16 if itemsize == 1` cast, which would otherwise erase the int8 evidence.
+Each guard refuses without mutating the weight or consuming adapter keys, and stays a no-op when no
+adapter key matches. See `tests/test_convrot_quantized_base_guards.py` (46 tests).
 
 Untested combinations, deliberately not claimed as supported:
 

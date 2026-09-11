@@ -9,6 +9,7 @@ import torch
 from tqdm import tqdm
 
 from musubi_tuner.utils.device_utils import synchronize_device
+from musubi_tuner.networks.dora_utils import raise_if_opaque_quantized
 from musubi_tuner.utils.safetensors_utils import (
     MemoryEfficientSafeOpen,
     TensorWeightAdapter,
@@ -366,6 +367,12 @@ def lora_merge_weights_to_tensor(
 
     if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
         return model_weight
+
+    # Opaque-int only, not fp8: this helper gets a bare tensor with no visible scale_weight, and
+    # plain fp8 merging is supported (test_merge_hybrid.py::test_fp8_cast). BEFORE the cast below: that cast maps any 1-byte dtype (int8 included) to
+    # float16, which would erase the evidence and defeat a guard placed further down -- including
+    # the one inside the DoRA weight norm this function calls.
+    raise_if_opaque_quantized(model_weight, "LoRA merge_weights_to_tensor", lora_name)
 
     def get_bool_flag(*keys: str) -> bool:
         for key in keys:
