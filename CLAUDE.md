@@ -41,6 +41,12 @@ ruff format src tests
 
 Avoid broad refactors/formatting in Ruff-excluded upstream model directories (see `pyproject.toml` `tool.ruff.extend-exclude`).
 
+**Do not delete the root `conftest.py` or `tools/__init__.py`.** Together they stop the editable
+PyTorch install's own `tools` package (`~/pytorch/tools/__init__.py`, on `sys.path` via the editable
+torch install) from shadowing this repo's `tools/`. Without BOTH, `from tools import ...` resolves to
+PyTorch's package and two test modules fail at *collection*, which aborts the entire pytest run.
+Each file documents why its half is necessary.
+
 ## Python Environment
 
 - **Sole active venv**: `/home/dustin/blissful-tuner/venv314` — Python 3.14.4
@@ -107,6 +113,8 @@ If torch ever does need to be rebuilt: `bash ~/pytorch/daily_build.sh ~/blissful
 ```bash
 # Run all tests (use `find tests -maxdepth 1 -name 'test_*.py' | wc -l` for current count)
 pytest tests/
+# Hide CUDA to run the suite without competing for VRAM with a training run (CUDA tests skip):
+CUDA_VISIBLE_DEVICES="" pytest tests/
 
 # Run a specific test file
 pytest tests/test_mask_loss.py
