@@ -117,9 +117,12 @@ class LoKrModule(nn.Module):
 
         self.register_buffer("alpha", torch.tensor(alpha))
 
-        # Initialize weights
+        # Initialize weights. The adapter must start as an identity (ΔW == 0): w1 is random, so the
+        # zero must live in w2 — the full matrix itself, or w2_b when factored. This mirrors LyCORIS's
+        # weight_gen (constant_(w2, 0)); a kaiming-initialised full w2 produced a random step-0 delta
+        # of ~25% of the base weight at dim 64 / alpha 32 on Wan 5120² Linears (tests/test_lokr_zero_init.py).
         if self.lokr_w2 is not None:
-            nn.init.kaiming_uniform_(self.lokr_w2, a=math.sqrt(5))
+            nn.init.zeros_(self.lokr_w2)
         else:
             nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
             nn.init.zeros_(self.lokr_w2_b)

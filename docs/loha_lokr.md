@@ -142,6 +142,34 @@ python wan_generate_video.py \
 
 Note: `--lycoris` is a deprecated alias for `--prefer_lycoris` and will be removed in a future version.
 
+## Training through the LyCORIS library (`network_module = "networks.lycoris"`)
+
+`networks.lycoris` is a bridge to `lycoris.kohya.create_network`; the native `networks.lokr` /
+`networks.loha` modules never import LyCORIS. Since LyCORIS 4.0 (fused Triton/TileLang kernels,
+reviewed in `docs/plans/2026-09-13-lycoris-4.0-review.md`) a few things are worth knowing:
+
+- **Under `compile = true` the fused kernels never run.** LyCORIS's per-call dispatch returns the
+  plain PyTorch body whenever an enclosing `torch.compile` is tracing, and blissful applies the
+  network before compiling each block. Measured at Wan 2.2 shapes the Inductor-compiled body is
+  faster and lighter than the Triton path anyway (17.0 ms / 765 MiB vs 21.2 ms / 1410 MiB per
+  block pair), so this is not a loss. Kernels engage only where blissful leaves Linears eager —
+  block-swapped blocks, `compile = false`, and `--prefer_lycoris` merges on a CUDA-resident model.
+- **Pin `LYCORIS_KERNEL_BACKEND=torch` for parity.** When a kernel does engage the arithmetic order
+  changes (ULP-level, not a precision loss). Set the variable before any A/B against a pre-4.0 run
+  or a pre-4.0 `--prefer_lycoris` merged output. The bridge logs the LyCORIS version and resolved
+  backend at network creation so a run log records which arithmetic it used.
+- **`bypass_mode=True` and `dora_wd=True` are mutually exclusive.** LyCORIS's bypass forward has no
+  weight-decompose branch and the library does not check, so DoRA would be silently dropped. The
+  bridge refuses the combination. Bypass without DoRA is ~2x faster than the DoRA rebuild path at
+  Wan shapes; treat switching as a recipe A/B, not a free win.
+- **An fp8 base (`--fp8_base` / `--fp8_scaled`) requires `bypass_mode=True`.** LyCORIS only
+  recognises weight-only fp8 as a `Fp8Linear` class; blissful's fp8-scaled Linears are plain
+  `nn.Linear`, so the rebuild path would add the adapter delta into the raw unscaled fp8 weight. The
+  bridge refuses this too.
+- **`full_matrix=True` ignores `network_dim` and `network_alpha`.** With both Kronecker halves full,
+  LyCORIS forces `alpha = dim` (scale 1); the values in the config are inert.
+- `rank_dropout` still builds its mask on CPU inside LyCORIS and is incompatible with `compile = true`.
+
 ## Conversion
 
 LoHa and LoKr weights are supported by the format converters:
