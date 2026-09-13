@@ -42,6 +42,71 @@ def _convert_value(value):
     return value
 
 
+def describe_lycoris_runtime() -> str:
+    """One line naming the LyCORIS build and the kernel backend it will dispatch to.
+
+    Since LyCORIS 4.0 the same network_args can run through eager PyTorch, Inductor or the fused
+    Triton/TileLang kernels depending on how the host wraps the module (``choose()`` returns
+    ``torch`` under an enclosing ``torch.compile``), so a run log that only names the algo cannot
+    say which arithmetic produced the weights. Pin with ``LYCORIS_KERNEL_BACKEND=torch`` for parity.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        ver = version("lycoris_lora")
+    except PackageNotFoundError:
+        ver = "unknown"
+    try:
+        from lycoris.kernels import available_backends, resolve_backend
+
+        backend = f"kernel backend {resolve_backend()} (available: {', '.join(available_backends())})"
+    except Exception:  # pre-4.0 LyCORIS has no kernels package
+        backend = "no fused-kernel dispatch (pre-4.0)"
+    return f"LyCORIS {ver}, {backend}"
+
+
+def _raise_if_silently_unsupported(unet: Optional[nn.Module], network_args: dict) -> None:
+    """Refuse the two LyCORIS configurations that train something other than what was asked.
+
+    Both are parsed with LyCORIS's own ``str_bool`` (``"false"`` is the only false spelling) so the
+    guard agrees with what ``lycoris.kohya.create_network`` will actually do with the same strings.
+
+    * ``bypass_mode`` + ``dora_wd``: every LyCORIS ``bypass_forward`` (LoKr/LoHa/LoCon) is
+      ``org_forward(x) + diff(x)`` with no weight-decompose branch, and ``kohya.create_network`` has
+      no guard, so DoRA is silently dropped and a plain adapter trains under a DoRA config.
+    * fp8 base without ``bypass_mode``: LyCORIS recognises weight-only fp8 only as class ``Fp8Linear``
+      with a ``weight_scale`` attr; blissful's ``--fp8_base/--fp8_scaled`` Linears stay ``nn.Linear``
+      with ``scale_weight``. The rebuild path then reads the raw, unscaled fp8 tensor via
+      ``_current_weight()`` and does ``base_weight + diff_weight.to(fp8)`` — fails or corrupts. Only
+      bypass mode never touches the base weight's representation. (ConvRot int8 has the equivalent
+      guard in ``krea2_train_network.py``.)
+    """
+    from lycoris.utils import str_bool
+
+    from musubi_tuner.networks.dora_utils import FP8_DTYPES
+
+    bypass_mode = "bypass_mode" in network_args and str_bool(network_args["bypass_mode"])
+    dora_wd = "dora_wd" in network_args and str_bool(network_args["dora_wd"])
+
+    if bypass_mode and dora_wd:
+        raise ValueError(
+            "LyCORIS bypass_mode=True with dora_wd=True: LyCORIS's bypass forward has no weight-decompose "
+            "branch, so DoRA would be silently dropped and a plain adapter trained. Drop dora_wd (bypass is "
+            "~2x faster than the DoRA rebuild path) or drop bypass_mode."
+        )
+
+    if unet is not None and not bypass_mode:
+        fp8_params = [n for n, p in unet.named_parameters() if p.dtype in FP8_DTYPES]
+        if fp8_params:
+            raise ValueError(
+                f"LyCORIS network on an fp8 base ({len(fp8_params)} fp8 parameters, e.g. {fp8_params[0]}) "
+                "requires network_args bypass_mode=True. LyCORIS does not recognise blissful's fp8-scaled "
+                "nn.Linear (it keys on class Fp8Linear/weight_scale), so its rebuild path would add the adapter "
+                "delta into the raw unscaled fp8 weight. Add bypass_mode=True (without dora_wd) or train on a "
+                "bf16 base."
+            )
+
+
 def create_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -105,7 +170,10 @@ def create_network(
     # Extract algorithm from kwargs, default to 'lora' if not specified
     algo = kwargs.get("algo", "lora")
 
+    _raise_if_silently_unsupported(unet, kwargs)
+
     # Log the configuration
+    logger.info(describe_lycoris_runtime())
     logger.info(f"Creating LyCORIS network with algorithm: {algo}")
     logger.info(f"Network config - dim: {network_dim}, alpha: {network_alpha}, multiplier: {multiplier}")
 

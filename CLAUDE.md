@@ -72,7 +72,7 @@ Each file documents why its half is necessary.
 | `diffusers` 0.38.0.dev0 | `~/diffusers` | |
 | `datasets` 4.8.5.dev0 | `~/datasets` | |
 | `peft` 0.19.2.dev0 | `~/peft` | |
-| `lycoris_lora` 3.4.0 | `~/LyCORIS` | LyCORIS backend (`--prefer_lycoris`) |
+| `lycoris_lora` 4.0.0 | `~/LyCORIS` | LyCORIS backend (`--prefer_lycoris`, `networks.lycoris`); 4.0 fused kernels are inert under `compile=true` — see `docs/loha_lokr.md` |
 | `bitsandbytes` 0.50.0.dev0 | `~/bitsandbytes` | |
 | `nvidia-cutlass` 4.2.0.0 | `~/cutlass` | Headers used by FA4/CuTE |
 | `numba` / `llvmlite` | `~/numba`, `~/llvmlite` | Required for cp314 ABI |
